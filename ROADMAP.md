@@ -93,9 +93,9 @@ Cada fase es **un commit + un push**.
 
 ### v2.0 — Esqueleto + host base
 
-- [ ] `bootstrap.sh`, `lib/`, `ui/menu.sh` con plugin system por metadatos `# HLI-*`.
-- [ ] Registro de servicios declarativo (fuente única para dashboard, healthcheck y backup).
-- [ ] Módulos de host: base, power, wol, storage (auto-expandir LVM), datadisk (pool multi-disco
+- [x] `bootstrap.sh`, `lib/`, `ui/menu.sh` con plugin system por metadatos `# HLI-*`.
+- [x] Registro de servicios declarativo (fuente única para dashboard, healthcheck y backup).
+- [x] Módulos de host: base, power, wol, storage (auto-expandir LVM), datadisk (pool multi-disco
       `/srv/mediaN`), samba.
 
 ### v2.1 — Plataforma
