@@ -26,7 +26,7 @@ _disks_under() {
 # y falla cerrado.
 root_disk() {
   local src
-  src="$(findmnt -no SOURCE / 2>/dev/null | sed 's/\[.*//')"
+  src="$(findmnt -no SOURCE / 2>/dev/null | sed 's/\[.*//')" || true
   _disks_under "$src" | head -n1
 }
 

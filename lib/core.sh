@@ -77,6 +77,16 @@ input_box() {
   dialog --title "$title" --inputbox "$prompt" 10 76 "$default" 3>&1 1>&2 2>&3
 }
 
+# Como input_box(), pero con entrada oculta (--passwordbox, sin eco en
+# pantalla): usarla para tokens/contraseñas (ej. token de la API de
+# Dokploy). '--insecure' hace que dialog muestre '*' mientras se tipea, en
+# vez de nada — más usable, no reduce la ocultación real del valor final.
+password_box() {
+  local title="$1"
+  local prompt="$2"
+  dialog --title "$title" --insecure --passwordbox "$prompt" 10 76 3>&1 1>&2 2>&3
+}
+
 # --- Docker con privilegios (única puerta de entrada) ---
 
 # Corre 'docker' con privilegios, SIN pedir contraseña. bootstrap.sh cachea
@@ -214,3 +224,8 @@ run_module_quiet() {
 source "$SCRIPT_DIR/lib/storage.sh"
 source "$SCRIPT_DIR/lib/hw.sh"
 source "$SCRIPT_DIR/lib/services.sh"
+source "$SCRIPT_DIR/lib/dns.sh"
+source "$SCRIPT_DIR/lib/dokploy_api.sh"
+source "$SCRIPT_DIR/lib/compose.sh"
+source "$SCRIPT_DIR/lib/importer.sh"
+source "$SCRIPT_DIR/lib/canary.sh"

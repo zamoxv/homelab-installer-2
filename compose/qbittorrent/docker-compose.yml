@@ -1,0 +1,24 @@
+# Plantilla renderizada por lib/compose.sh (compose_render_qbittorrent).
+#
+# Layout de datos de lscr.io/linuxserver/qbittorrent (verificado 2026-09-29,
+# docs.linuxserver.io + fuentes de la comunidad): todo bajo /config, con
+# /config/qBittorrent/qBittorrent.conf y /config/qBittorrent/BT_backup/*.fastresume
+# (el contenedor NO separa XDG_CONFIG_HOME de XDG_DATA_HOME como en una
+# instalación nativa de v1: ambos quedan unificados bajo /config/qBittorrent).
+services:
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent
+    container_name: qbittorrent
+    restart: unless-stopped
+    environment:
+      - PUID=__UID__
+      - PGID=__GID__
+      - TZ=__TZ__
+      - WEBUI_PORT=__PORT__
+    ports:
+      - "__PORT__:__PORT__"
+      - "6881:6881"
+      - "6881:6881/udp"
+    volumes:
+      - __APPDATA__/qbittorrent/config:/config
+__MEDIA_VOLUMES__

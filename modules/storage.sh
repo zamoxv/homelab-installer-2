@@ -30,8 +30,10 @@ expand_lvm_root() {
   done)" || true
   [[ -n "$lv_path" ]] || return 0   # la raíz no está sobre LVM
 
-  vg="$(sudo lvs --noheadings -o vg_name "$lv_path" 2>/dev/null | tr -d ' ')"
-  free_g="$(sudo vgs --noheadings --nosuffix --units g -o vg_free "$vg" 2>/dev/null | tr -d ' <' | cut -d. -f1)"
+  # '|| true' en ambas: mismo motivo que lv_path más arriba (pipefail
+  # propaga el código de lvs/vgs aunque tr/cut salgan bien).
+  vg="$(sudo lvs --noheadings -o vg_name "$lv_path" 2>/dev/null | tr -d ' ')" || true
+  free_g="$(sudo vgs --noheadings --nosuffix --units g -o vg_free "$vg" 2>/dev/null | tr -d ' <' | cut -d. -f1)" || true
   [[ -n "$free_g" && "$free_g" -gt 0 ]] || return 0   # sin espacio libre
 
   if confirm "Se detectó espacio libre en el LVM.\n\nVG       : $vg\nLibre    : ${free_g} GB\nLV raíz  : $lv_path\n\n¿Extender el sistema de archivos a todo el disco?"; then

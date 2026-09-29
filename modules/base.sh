@@ -16,7 +16,7 @@ sudo apt upgrade -y
 sudo apt install -y \
   curl wget git nano vim htop btop rsync unzip dialog \
   ethtool smartmontools lm-sensors ca-certificates gnupg \
-  net-tools lsof ncdu
+  net-tools lsof ncdu jq
 
 sudo mkdir -p "$BACKUP_ROOT" "$APPDATA_ROOT"
 sudo chown "$SERVER_USER:$SERVER_USER" "$BACKUP_ROOT" "$APPDATA_ROOT" 2>/dev/null || true

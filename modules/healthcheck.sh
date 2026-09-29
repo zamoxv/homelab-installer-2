@@ -52,7 +52,11 @@ REPORT=/tmp/hli2-healthcheck.txt
   echo "== SMART discos =="
   if command -v smartctl >/dev/null 2>&1; then
     for d in $(lsblk -dno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
-      health="$(sudo smartctl -H "/dev/$d" 2>/dev/null | grep -i 'overall-health' | sed 's/.*: //')"
+      # '|| true': smartctl devuelve códigos de salida no-cero por diseño
+      # (son flags de estado del disco, no solo "falló el comando"); bajo
+      # pipefail eso abortaría el healthcheck completo en el primer disco
+      # con cualquier bit de advertencia, antes de imprimir nada del resto.
+      health="$(sudo smartctl -H "/dev/$d" 2>/dev/null | grep -i 'overall-health' | sed 's/.*: //')" || true
       printf "  /dev/%-6s %s\n" "$d" "${health:-sin datos}"
     done
   else

@@ -1,0 +1,25 @@
+# Plantilla renderizada por lib/compose.sh (compose_render_jellyfin).
+# Los marcadores entre guiones bajos dobles se sustituyen en tiempo de
+# despliegue; no editar a mano para un servidor puntual, editar el registro
+# (services/jellyfin.conf) o config/default.conf.
+#
+# Layout de datos de la imagen oficial jellyfin/jellyfin (verificado
+# 2026-09-29): JELLYFIN_DATA_DIR=/config, JELLYFIN_CACHE_DIR=/cache,
+# JELLYFIN_CONFIG_DIR=/config/config (subcarpeta DENTRO de /config, no un
+# volumen aparte). El importador (lib/importer.sh) copia el /var/lib/jellyfin
+# nativo de v1 a APPDATA/jellyfin/config/ (raíz del volumen /config) y el
+# /etc/jellyfin nativo a APPDATA/jellyfin/config/config/.
+services:
+  jellyfin:
+    image: jellyfin/jellyfin
+    container_name: jellyfin
+    restart: unless-stopped
+    user: "__UID__:__GID__"
+__GROUPADD_BLOCK__
+    ports:
+      - "__PORT__:8096"
+__DEVICES_BLOCK__
+    volumes:
+      - __APPDATA__/jellyfin/config:/config
+      - __APPDATA__/jellyfin/cache:/cache
+__MEDIA_VOLUMES__

@@ -26,7 +26,7 @@ sudo systemctl restart systemd-logind
 #    preguntar si de todos modos se quiere conservar la hibernación (no
 #    recomendado en un servidor 24/7).
 if [[ -n "$(swapon --show=NAME --noheadings 2>/dev/null)" ]]; then
-  swap_size="$(free -h | awk '/Swap:/ {print $2}')"
+  swap_size="$(free -h | awk '/Swap:/ {print $2}')" || true
   if confirm "Swap detectada ($swap_size).\n\n¿Desea MANTENER la hibernación?\n(No recomendado para un servidor 24/7)"; then
     sudo systemctl unmask hibernate.target hybrid-sleep.target
   fi

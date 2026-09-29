@@ -1,0 +1,20 @@
+# Plantilla renderizada por lib/compose.sh (compose_render_adguard).
+# network_mode: host es OBLIGATORIO (AdGuard necesita escuchar DNS en el
+# puerto 53 del host, no publicado vía Docker). Por eso este compose usa
+# composeType "docker-compose" (no "stack": Swarm no soporta network_mode:
+# host de forma directa/predecible).
+#
+# El panel web debe quedar en 3053 (el 3000 es de Dokploy): se logra
+# sembrando/normalizando http.address en AdGuardHome.yaml ANTES del primer
+# arranque (ver modules/adguard.sh y lib/importer.sh
+# adguard_yaml_set_http_address/adguard_yaml_set_dns_bind), no acá: la imagen
+# no expone un puerto configurable por variable de entorno.
+services:
+  adguard:
+    image: adguard/adguardhome
+    container_name: adguard
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - __APPDATA__/adguard/conf:/opt/adguardhome/conf
+      - __APPDATA__/adguard/work:/opt/adguardhome/work

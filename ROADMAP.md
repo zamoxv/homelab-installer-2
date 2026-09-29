@@ -116,10 +116,57 @@ en vez de dejar que el instalador oficial elija a ciegas.
 
 ### v2.2 — Servicios actuales en contenedores
 
-- [ ] Compose de Jellyfin, qBittorrent y AdGuard.
-- [ ] Importador de config desde el tar de backup del HLI v1 (`jellyfin/`, `qbittorrent/`,
-      `adguard/`, `samba/`, `hli/`, `ssh/`) hacia `/srv/appdata/*`.
-- [ ] Validar el mapeo del layout nativo de Jellyfin/qBittorrent a las imágenes elegidas.
+- [x] Cliente de la API de Dokploy (`lib/dokploy_api.sh`): auth `x-api-key` (token guardado en
+      `/etc/hli2/dokploy.env`, root-only 0600, nunca se loguea ni se imprime), `project.all` /
+      `project.create` / `environment.byProjectId` / `compose.create` / `compose.update` /
+      `compose.deploy` / `compose.one` / `compose.delete`. Idempotente: encuentra o crea el
+      proyecto "homelab" y el compose por `appName` antes de crear (nunca duplica).
+- [x] Validación canaria obligatoria antes del primer despliegue real
+      (`lib/canary.sh`, `dokploy_preflight`): compose descartable con un bind mount de prueba,
+      dos redeploys vía la API, confirma que el archivo centinela sobrevive intacto. Si falla,
+      aborta v2.2 sin tocar ningún servicio real. Se corre una sola vez (queda en el estado
+      persistente).
+- [x] Compose de Jellyfin, qBittorrent y AdGuard (`compose/<servicio>/docker-compose.yml`,
+      renderizados por `lib/compose.sh`), desplegados vía la API (`composeType: docker-compose`,
+      no `stack`, porque AdGuard necesita `network_mode: host`). `container_name` explícito en
+      los tres (ver `services/*.conf`).
+- [x] Importador de config desde el tar de backup del HLI v1 (`lib/importer.sh`): `jellyfin/`,
+      `qbittorrent/`, `adguard/` hacia `/srv/appdata/*` (con reescritura de rutas absolutas
+      viejas en la config de Jellyfin y normalización del YAML de AdGuard a 0.0.0.0:3053), más
+      fusión de `ssh/authorized_keys` y `samba/smb.conf` como referencia (nunca se aplica: Samba
+      lo genera el módulo `samba` de v2.0). Disponible como módulo standalone
+      (`modules/import-v1.sh`) y como paso opcional dentro de cada módulo de servicio. Solo
+      corre con el contenedor destino detenido/ausente (fail-closed ante "activo"/"desconocido").
+- [x] Mapeo del layout nativo de Jellyfin/qBittorrent a las imágenes elegidas, verificado contra
+      la documentación de cada imagen (2026-09-29): Jellyfin oficial usa
+      `JELLYFIN_DATA_DIR=/config` (antes `/var/lib/jellyfin`) y
+      `JELLYFIN_CONFIG_DIR=/config/config` (antes `/etc/jellyfin`, subcarpeta DENTRO del mismo
+      volumen, no un mount aparte); linuxserver/qbittorrent unifica `~/.config/qBittorrent` y
+      `~/.local/share/qBittorrent` (BT_backup incluido) bajo `/config/qBittorrent`.
+
+**Pendiente de validar en un servidor real** (no se pudo probar contra un Dokploy real desde
+acá): la forma exacta de la respuesta JSON de `project.all`/`project.create`/`compose.one` (la
+documentación pública no la renderiza completa) — el cliente resuelve el `environmentId` con
+`environment.byProjectId` (sí documentado) y guarda el `composeId` en estado local para no
+depender de un endpoint de listado de composes no confirmado; si `compose.one` devolviera un
+`composeId` que Dokploy ya no reconoce, se trata como "no existe" y se vuelve a crear. También
+falta confirmar en un AdGuard real si un `AdGuardHome.yaml` "sembrado" a mano (solo
+`http.address`/`dns.bind_hosts`) evita del todo el asistente de instalación o si igual pide crear
+el usuario admin (esperable, no es un bug) — y correr la validación canaria una vez contra el
+Dokploy real antes de desplegar Jellyfin/qBittorrent/AdGuard de verdad.
+
+**Revisión de seguridad (post-implementación)**: se corrigieron 3 hallazgos críticos — el token de
+la API viajaba en el argv de `curl` (visible por `ps`/`/proc/<pid>/cmdline` para cualquier usuario
+local; ahora va por stdin vía `curl -K -`), `/etc/hli2/dokploy.env` tenía una ventana
+mundialmente-legible entre crearse y aplicársele `chmod 0600` (ahora se crea ya con el modo final
+vía `install -m 0600`), y la validación canaria quedaba marcada "válida" de forma global sin
+importar a qué Dokploy apuntara (ahora la clave incluye la URL y la versión de la imagen de
+Dokploy: un servidor nuevo o una actualización de Dokploy vuelven a disparar la validación). Además
+se endureció el import del tar de v1 contra miembros no seguros (rutas absolutas, `..`,
+symlinks/hardlinks — se rechaza el tar ENTERO antes de extraer nada) y el cambio de DNS del host
+para AdGuard ahora se aplica lo más tarde posible (justo antes del deploy) y se revierte solo
+(`restore_dns_port()`) ante cualquier fallo posterior, nunca dejando el host sin resolución DNS.
+Detalle completo en Engram (`hli2/v2.2`).
 
 ### v2.3 — Servicios nuevos
 

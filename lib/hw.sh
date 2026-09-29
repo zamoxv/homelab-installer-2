@@ -28,8 +28,8 @@ hw_disk() {
   # effort), seguir con "N/D" en vez de abortar el dashboard.
   disk="$(root_disk)" || true
   [[ -z "$disk" ]] && { echo "N/D"; return; }
-  size="$(lsblk -dno SIZE "$disk" 2>/dev/null | head -n1)"
-  rota="$(lsblk -dno ROTA "$disk" 2>/dev/null | head -n1)"
+  size="$(lsblk -dno SIZE "$disk" 2>/dev/null | head -n1)" || true
+  rota="$(lsblk -dno ROTA "$disk" 2>/dev/null | head -n1)" || true
   [[ "$rota" == "0" ]] && typ="SSD" || typ="HDD"
   echo "$disk ${size:-?} ($typ)"
 }

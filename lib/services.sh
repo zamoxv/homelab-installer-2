@@ -152,6 +152,21 @@ service_state() {
   esac
 }
 
+# Espera hasta $2 segundos (default 120) a que service_state($1) devuelva
+# "activo". Usada tras un despliegue (compose.deploy vía la API de Dokploy)
+# para confirmar que el contenedor arrancó antes de mostrar la URL final.
+# Best-effort: si se agota el tiempo, devuelve 1 pero no es un error fatal
+# para el módulo llamador (el contenedor puede seguir iniciando).
+service_wait_active() {
+  local id="$1" timeout="${2:-120}" waited=0
+  while [[ "$waited" -lt "$timeout" ]]; do
+    [[ "$(service_state "$id")" == "activo" ]] && return 0
+    sleep 5
+    waited=$((waited + 5))
+  done
+  return 1
+}
+
 # URL de acceso del servicio $1 (vacío si no expone una). Única fuente de
 # puertos/URLs: la usan el dashboard, status y healthcheck.
 service_url() {
