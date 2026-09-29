@@ -6,9 +6,11 @@
 #
 # Campos de un services/<id>.conf:
 #   SERVICE_NAME         Nombre para mostrar.
-#   SERVICE_KIND         "native" (unidad systemd) o "container" (Docker).
+#   SERVICE_KIND         "native" (unidad systemd), "container" (Docker) o
+#                        "swarm" (servicio de Docker Swarm).
 #   SERVICE_UNIT         Unidad systemd (solo si KIND=native).
-#   SERVICE_CONTAINER    Nombre del contenedor (solo si KIND=container).
+#   SERVICE_CONTAINER    Nombre del contenedor (KIND=container) o del
+#                        servicio de swarm (KIND=swarm).
 #   SERVICE_PORT         Puerto de acceso, o vacío si no expone uno directo.
 #   SERVICE_URL_SCHEME   Esquema de la URL (http, smb...), vacío si no aplica.
 #   SERVICE_DATA         Array de rutas de datos persistentes bajo APPDATA_ROOT.
@@ -71,33 +73,81 @@ _service_state_systemd() {
   fi
 }
 
-# Estado de un contenedor Docker. Si Docker no está instalado (v2.0 no lo
-# instala: eso es v2.1), lo informa en vez de fallar.
+# Estado de un contenedor Docker. Usa hli_docker_presence/hli_docker (sudo -n
+# docker), nunca 'command -v docker' pelado: root puede ver el binario
+# aunque el usuario que corre HLI 2 no lo tenga en su PATH (snap,
+# secure_path distinto...), y un 'docker' sin privilegios devuelve
+# "permission denied" cuando el usuario no está en el grupo docker (el caso
+# normal acá) — ninguna de las dos cosas es lo mismo que "no instalado", así
+# que se informan como "desconocido" para no mentirle al dashboard. Si
+# Docker está genuinamente ausente, se informa aparte.
 _service_state_container() {
-  local name="$1"
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "docker no disponible"
+  local name="$1" presence
+  presence="$(hli_docker_presence)"
+  case "$presence" in
+    absent) echo "docker no disponible"; return ;;
+    unknown) echo "desconocido"; return ;;
+  esac
+  if ! hli_docker info >/dev/null 2>&1; then
+    echo "desconocido"
     return
   fi
-  if ! docker inspect "$name" >/dev/null 2>&1; then
+  if ! hli_docker inspect "$name" >/dev/null 2>&1; then
     echo "no instalado"
     return
   fi
-  if [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" == "true" ]]; then
+  if [[ "$(hli_docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" == "true" ]]; then
     echo "activo"
   else
     echo "detenido"
   fi
 }
 
-# Estado del servicio $1: activo | inactivo | detenido | no instalado |
-# docker no disponible | desconocido.
+# Estado de un servicio de Docker Swarm. A diferencia de un contenedor
+# suelto, 'docker inspect <nombre>' no sirve acá: con swarm el contenedor
+# real se llama "<servicio>.<slot>.<id>" (nombre generado, distinto en cada
+# tarea). Se consulta el SERVICIO con 'docker service ls', que ya da
+# directamente las réplicas listas (ej. "1/1"). Usa hli_docker_presence/
+# hli_docker (sudo -n docker), nunca 'command -v docker' pelado (ver
+# _service_state_container: mismo motivo, PATH del usuario vs. de root).
+_service_state_swarm() {
+  local name="$1" replicas presence
+  presence="$(hli_docker_presence)"
+  case "$presence" in
+    absent) echo "docker no disponible"; return ;;
+    unknown) echo "desconocido"; return ;;
+  esac
+  if ! hli_docker info >/dev/null 2>&1; then
+    echo "desconocido"
+    return
+  fi
+  replicas="$(hli_docker service ls --filter "name=$name" --format '{{.Replicas}}' 2>/dev/null | head -n1)" || true
+  if [[ -z "$replicas" ]]; then
+    echo "no instalado"
+    return
+  fi
+  if [[ "$replicas" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+    if [[ "${BASH_REMATCH[1]}" == "0" ]]; then
+      echo "detenido"
+    elif [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]]; then
+      echo "activo"
+    else
+      echo "parcial ($replicas)"
+    fi
+  else
+    echo "desconocido"
+  fi
+}
+
+# Estado del servicio $1: activo | inactivo | detenido | parcial (N/M) |
+# no instalado | docker no disponible | desconocido.
 service_state() {
   local id="$1"
   _service_load "$id" || { echo "desconocido"; return; }
   case "$SERVICE_KIND" in
     native) _service_state_systemd "$SERVICE_UNIT" ;;
     container) _service_state_container "$SERVICE_CONTAINER" ;;
+    swarm) _service_state_swarm "$SERVICE_CONTAINER" ;;
     *) echo "desconocido" ;;
   esac
 }

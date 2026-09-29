@@ -77,6 +77,70 @@ input_box() {
   dialog --title "$title" --inputbox "$prompt" 10 76 "$default" 3>&1 1>&2 2>&3
 }
 
+# --- Docker con privilegios (única puerta de entrada) ---
+
+# Corre 'docker' con privilegios, SIN pedir contraseña. bootstrap.sh cachea
+# sudo con un keepalive de fondo, así que '-n' (non-interactive) alcanza: si
+# por lo que sea sudo no tiene la contraseña cacheada, esto falla rápido en
+# vez de colgarse pidiéndola en medio de un diálogo.
+#
+# Por qué existe: el usuario que corre el bootstrap normalmente NO está en
+# el grupo 'docker' (nada lo agrega ahí), así que un 'docker info' sin sudo
+# devuelve "permission denied" -> salida vacía -> un chequeo de seguridad
+# descuidado puede leer eso como "no hay nada corriendo" y dejar pasar una
+# operación destructiva (ver modules/dokploy.sh: el instalador oficial de
+# Dokploy hace 'docker swarm leave --force' sin preguntar). TODA decisión de
+# seguridad basada en el estado real de Docker (¿hay un swarm ajeno?, ¿está
+# Dokploy corriendo?) tiene que pasar por acá, nunca por un 'docker' pelado.
+hli_docker() {
+  sudo -n docker "$@"
+}
+
+# Rutas/unidad que delatan una instalación de Docker aunque no se pueda
+# resolver el binario. Variable (no constante): así un test puede apuntarla
+# a un archivo de prueba en vez de tocar rutas reales del sistema.
+HLI_DOCKER_FOOTPRINT_PATHS=(/var/run/docker.sock /run/docker.sock /var/lib/docker /etc/docker /snap/bin/docker)
+
+_hli_docker_footprint_exists() {
+  local f
+  for f in "${HLI_DOCKER_FOOTPRINT_PATHS[@]}"; do
+    [[ -e "$f" ]] && return 0
+  done
+  systemctl cat docker.service >/dev/null 2>&1
+}
+
+# Presencia del binario 'docker', vista CON privilegios. Por qué hace falta
+# además de hli_docker(): el usuario que corre el bootstrap puede tener un
+# PATH sin docker mientras que root sí lo ve (instalado vía snap, con
+# secure_path distinto, etc.) — un 'command -v docker' sin privilegios daría
+# "ausente" en ese caso, aunque Docker esté instalado y corriendo. Tres
+# valores por stdout:
+#   present  sudo puede resolver el binario 'docker'.
+#   absent   Ni el binario (con privilegios) ni ningún rastro de Docker
+#            (socket, /var/lib/docker, /etc/docker, unidad systemd...).
+#   unknown  No se pudo confirmar ni lo uno ni lo otro con certeza: sudo -n
+#            no funciona (sin sesión cacheada, "sudo -v" no corrió o
+#            expiró), o hay ALGÚN rastro de Docker pero no se pudo resolver
+#            el binario. NUNCA tratar esto como "absent": una máquina con
+#            restos de Docker (o cuyo estado no se puede confirmar) no es
+#            una máquina limpia, y asumir que sí fue justamente el bug que
+#            dejaba correr el instalador destructivo de Dokploy sobre un
+#            swarm ajeno sin detectarlo.
+hli_docker_presence() {
+  sudo -n true 2>/dev/null || { echo "unknown"; return; }
+
+  if sudo -n sh -c 'command -v docker' >/dev/null 2>&1; then
+    echo "present"
+    return
+  fi
+
+  if _hli_docker_footprint_exists; then
+    echo "unknown"
+  else
+    echo "absent"
+  fi
+}
+
 # --- Plugin system: descubrimiento y ejecución de módulos ---
 
 # Valor de una clave de metadata (# HLI-<KEY>: valor) del módulo $1.

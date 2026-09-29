@@ -100,8 +100,19 @@ Cada fase es **un commit + un push**.
 
 ### v2.1 — Plataforma
 
-- [ ] Módulo `dokploy`: verifica 80/443/3000 libres, advierte si el SO no está soportado, instala
+- [x] Módulo `dokploy`: verifica 80/443/3000 libres, advierte si el SO no está soportado, instala
       Docker + Dokploy, crea `/srv/appdata`.
+
+**Riesgos conocidos**: el instalador oficial de Dokploy (`https://dokploy.com/install.sh`) es
+**destructivo en una re-ejecución** — hace `docker swarm leave --force` y
+`docker network rm -f dokploy-network` de forma incondicional, sin preguntar, lo que borraría todo
+lo desplegado si se lo corre dos veces sobre un servidor ya instalado. El módulo `dokploy` de HLI 2
+nunca deja que esto pase: si detecta una instalación existente (`docker service inspect dokploy` o
+`/etc/dokploy`), jamás vuelve a correr el instalador — solo ofrece `update` (ruta no destructiva:
+`docker pull` + `docker service update`) o no hacer nada. También aborta si el nodo ya pertenece a
+un Swarm activo que no es de Dokploy (evita destruir un swarm ajeno). El pool de direcciones de
+Swarm/Docker se elige evitando colisión con la LAN (10.0.0.0/8, 172.17.0.0/16) antes de instalar,
+en vez de dejar que el instalador oficial elija a ciegas.
 
 ### v2.2 — Servicios actuales en contenedores
 
