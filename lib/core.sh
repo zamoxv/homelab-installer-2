@@ -65,6 +65,19 @@ ensure_runtime() {
   fi
 }
 
+# apt siempre sin preguntas. 'sudo' descarta las variables de entorno
+# (env_reset), así que exportar DEBIAN_FRONTEND en bootstrap.sh NO llega a
+# apt: hay que pasarla a través de sudo con 'env'. La entrada se cierra
+# (</dev/null) para que ningún prompt pueda quedar esperando teclado en un
+# módulo que corre en segundo plano bajo la barra de progreso.
+hli_apt() {
+  sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+    apt-get -y \
+    -o Dpkg::Options::=--force-confdef \
+    -o Dpkg::Options::=--force-confold \
+    "$@" </dev/null
+}
+
 log() {
   local msg="$1"
   echo "[$(date '+%F %T')] $msg" | sudo tee -a "$LOG_DIR/install.log" >/dev/null

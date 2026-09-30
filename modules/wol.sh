@@ -20,7 +20,7 @@ if [[ -z "$IFACE" ]]; then
   exit 1
 fi
 
-sudo apt install -y ethtool
+hli_apt install ethtool
 
 sudo tee /etc/systemd/system/hli2-wol.service > /dev/null <<EOF
 [Unit]

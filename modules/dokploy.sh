@@ -320,7 +320,7 @@ _dokploy_update() {
 
   log "Actualizando Dokploy a versión $version"
   rc=0
-  sudo env DOKPLOY_VERSION="$version" bash "$tmp" update 2>&1 | sudo tee -a "$LOG_DIR/dokploy.log" || rc=$?
+  sudo env DEBIAN_FRONTEND=noninteractive DOKPLOY_VERSION="$version" bash "$tmp" update 2>&1 | sudo tee -a "$LOG_DIR/dokploy.log" || rc=$?
   rm -f "$tmp"
 
   if [[ $rc -ne 0 ]]; then
@@ -584,7 +584,7 @@ _dokploy_main() {
 
   log "Instalando Dokploy $DOKPLOY_VERSION (ADVERTISE_ADDR=$ADVERTISE_ADDR, DOCKER_SWARM_INIT_ARGS=${DOCKER_SWARM_INIT_ARGS:-<vacío>})"
   local rc=0
-  sudo env DOKPLOY_VERSION="$DOKPLOY_VERSION" ADVERTISE_ADDR="$ADVERTISE_ADDR" DOCKER_SWARM_INIT_ARGS="$DOCKER_SWARM_INIT_ARGS" \
+  sudo env DEBIAN_FRONTEND=noninteractive DOKPLOY_VERSION="$DOKPLOY_VERSION" ADVERTISE_ADDR="$ADVERTISE_ADDR" DOCKER_SWARM_INIT_ARGS="$DOCKER_SWARM_INIT_ARGS" \
     bash "$tmp" 2>&1 | sudo tee -a "$LOG_DIR/dokploy.log" || rc=$?
   rm -f "$tmp"
 

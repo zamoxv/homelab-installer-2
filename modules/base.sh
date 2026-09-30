@@ -10,10 +10,10 @@
 set -euo pipefail
 source "$(dirname "$0")/../lib/core.sh"
 
-sudo apt update
-sudo apt upgrade -y
+hli_apt update
+hli_apt upgrade --with-new-pkgs
 
-sudo apt install -y \
+hli_apt install \
   curl wget git nano vim htop btop rsync unzip dialog \
   ethtool smartmontools lm-sensors ca-certificates gnupg \
   net-tools lsof ncdu jq

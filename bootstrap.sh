@@ -16,8 +16,9 @@ trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true; tput sgr0 2>/dev/null; cle
 
 if ! command -v dialog >/dev/null 2>&1; then
   echo "Instalando dialog..."
-  sudo apt update
-  sudo apt install -y dialog
+  # lib/core.sh (hli_apt) todavía no está cargado acá: mismo criterio a mano.
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get update </dev/null
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y dialog </dev/null
 fi
 
 source "$SCRIPT_DIR/lib/core.sh"

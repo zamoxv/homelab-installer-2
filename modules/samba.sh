@@ -82,7 +82,7 @@ _samba_write_shares() {
   fi
 }
 
-sudo apt install -y samba
+hli_apt install samba
 
 sudo smbpasswd -a "$SERVER_USER" || true
 sudo systemctl enable smbd
