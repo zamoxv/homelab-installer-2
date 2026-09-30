@@ -156,7 +156,7 @@ dokploy_api_setup() {
 
 _dokploy_require_jq() {
   command -v jq >/dev/null 2>&1 || {
-    echo "ERROR: falta 'jq' (necesario para hablar con la API de Dokploy). Instalelo (el módulo 'base' lo instala) e intente de nuevo." >&2
+    _dokploy_err "falta 'jq' (necesario para hablar con la API de Dokploy). Instalelo (el módulo 'base' lo instala) e intente de nuevo."
     return 1
   }
 }
@@ -192,13 +192,25 @@ _dokploy_require_jq() {
 # equivocado (o nunca) según qué se haya llamado en el medio. Mismo motivo
 # ya documentado en modules/jellyfin.sh sobre por qué IMPORT_WORK_DIR usa un
 # trap EXIT a nivel de módulo en vez de un 'trap ... RETURN' por función.
+# Error del cliente de la API: siempre a stderr (lo ve el usuario) y además
+# al log de instalación, porque en los módulos interactivos la siguiente
+# ventana de dialog tapa el mensaje. $1 va al log; $2 (opcional, p. ej. el
+# cuerpo de la respuesta) SOLO a stderr: puede contener secretos (el campo
+# "env" de un compose) y el log no es root-only.
+_dokploy_err() {
+  local message="$1"
+  local detail="${2:-}"
+  _dokploy_err "${message}${detail:+ $detail}"
+  log "ERROR API Dokploy: ${message}" 2>/dev/null || true
+}
+
 dokploy_api_call() {
   local method="$1" path="$2" body="${3:-}"
   local base token url resp http_code out curl_args=() body_file=""
 
   _dokploy_require_jq || return 1
-  base="$(_dokploy_api_base)" || { echo "ERROR: la API de Dokploy no está configurada (falta $DOKPLOY_ENV_FILE). Corra la configuración primero." >&2; return 1; }
-  token="$(_dokploy_api_token)" || { echo "ERROR: falta el token de la API de Dokploy en $DOKPLOY_ENV_FILE, o tiene un formato no válido. Vuelva a configurar la API." >&2; return 1; }
+  base="$(_dokploy_api_base)" || { _dokploy_err "la API de Dokploy no está configurada (falta $DOKPLOY_ENV_FILE). Corra la configuración primero."; return 1; }
+  token="$(_dokploy_api_token)" || { _dokploy_err "falta el token de la API de Dokploy en $DOKPLOY_ENV_FILE, o tiene un formato no válido. Vuelva a configurar la API."; return 1; }
   url="${base}/${path}"
 
   curl_args=(-sS --connect-timeout 10 --max-time 60 -w $'\n%{http_code}' -K - -X "$method")
@@ -210,7 +222,7 @@ dokploy_api_call() {
 
   if ! resp="$(curl "${curl_args[@]}" "$url" <<<"header = \"x-api-key: ${token}\"" 2>/dev/null)"; then
     rm -f "$body_file"
-    echo "ERROR: fallo de red llamando a Dokploy ($method $path)." >&2
+    _dokploy_err "fallo de red llamando a Dokploy ($method $path)."
     return 1
   fi
   rm -f "$body_file"
@@ -219,7 +231,7 @@ dokploy_api_call() {
   out="${resp%$'\n'*}"
 
   if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
-    echo "ERROR: Dokploy respondió HTTP ${http_code:-desconocido} en $method $path: ${out:0:500}" >&2
+    _dokploy_err "Dokploy respondió HTTP ${http_code:-desconocido} en $method $path." "Respuesta: ${out:0:500}"
     return 1
   fi
 
@@ -230,7 +242,7 @@ dokploy_api_call() {
   # abajo con un mensaje confuso o (peor) extraiga 'null'/vacío en silencio.
   # Un cuerpo vacío (204 sin contenido) es válido y no se valida como JSON.
   if [[ -n "$out" ]] && ! jq -e . >/dev/null 2>&1 <<<"$out"; then
-    echo "ERROR: Dokploy devolvió un cuerpo que no es JSON válido en $method $path: ${out:0:300}" >&2
+    _dokploy_err "Dokploy devolvió un cuerpo que no es JSON válido en $method $path." "Respuesta: ${out:0:300}"
     return 1
   fi
 
@@ -259,7 +271,12 @@ dokploy_project_find_or_create() {
 
   local body
   body="$(jq -n --arg name "$DOKPLOY_PROJECT_NAME" --arg desc "Servicios de HLI 2 (homelab)" '{name: $name, description: $desc}')"
-  dokploy_api_post "project.create" "$body"
+  local created
+  created="$(dokploy_api_post "project.create" "$body")" || return 1
+  # project.create devuelve { project: {...}, environment: {...} } (router
+  # project.ts de Dokploy): se devuelve la fila del proyecto, con la misma
+  # forma plana que entrega project.all.
+  jq -e '.project // .' <<<"$created" || { _dokploy_err "project.create devolvió una respuesta sin proyecto."; return 1; }
 }
 
 # environmentId por defecto de un proyecto (primer ambiente que devuelva
@@ -269,12 +286,12 @@ dokploy_project_find_or_create() {
 dokploy_environment_default_id() {
   local project_json="$1" project_id envs id
   project_id="$(jq -r '.projectId // .id // empty' <<<"$project_json" 2>/dev/null)" || project_id=""
-  [[ -n "$project_id" ]] || { echo "ERROR: no se pudo leer el projectId del proyecto 'homelab'." >&2; return 1; }
+  [[ -n "$project_id" ]] || { _dokploy_err "no se pudo leer el projectId del proyecto 'homelab'."; return 1; }
 
   envs="$(dokploy_api_get "environment.byProjectId?projectId=${project_id}")" || return 1
   id="$(jq -r '(.[0].environmentId // .[0].id) // empty' <<<"$envs" 2>/dev/null)" || id=""
   if [[ -z "$id" ]]; then
-    echo "ERROR: el proyecto 'homelab' (projectId=$project_id) no tiene ningún ambiente (environment.byProjectId vino vacío). No se puede crear el compose sin environmentId." >&2
+    _dokploy_err "el proyecto 'homelab' (projectId=$project_id) no tiene ningún ambiente (environment.byProjectId vino vacío). No se puede crear el compose sin environmentId."
     return 1
   fi
   printf '%s' "$id"
@@ -333,7 +350,7 @@ dokploy_compose_create_or_update() {
   local environment_id="$1" app_name="$2" compose_file="$3" env_content="${4:-}"
   local compose_content composeId body resp env_file rc=0
 
-  [[ -f "$compose_file" ]] || { echo "ERROR: no existe el compose renderizado: $compose_file" >&2; return 1; }
+  [[ -f "$compose_file" ]] || { _dokploy_err "no existe el compose renderizado: $compose_file"; return 1; }
   compose_content="$(cat "$compose_file")"
 
   # 'env_content' puede traer un secreto (ADMIN_TOKEN, INITIAL_ADMIN_PASSWORD...):
@@ -362,7 +379,7 @@ dokploy_compose_create_or_update() {
     if resp="$(dokploy_api_post "compose.create" "$body")"; then
       composeId="$(jq -r '.composeId // .id // empty' <<<"$resp" 2>/dev/null)" || composeId=""
       if [[ -z "$composeId" ]]; then
-        echo "ERROR: compose.create no devolvió composeId para '$app_name'. Respuesta: ${resp:0:300}" >&2
+        _dokploy_err "compose.create no devolvió composeId para '$app_name'." "Respuesta: ${resp:0:300}"
         rc=1
       else
         _dokploy_compose_state_set "$app_name" "$composeId"
@@ -395,6 +412,11 @@ dokploy_compose_deploy() {
 # despliega en un paso. Imprime el composeId.
 dokploy_compose_deploy_full() {
   local environment_id="$1" app_name="$2" compose_file="$3" env_content="${4:-}" composeId
+  if [[ "$app_name" == "${CANARY_APP_NAME:-hli2-canary}" ]]; then
+    hli_busy "Prueba de persistencia: verificando que Dokploy conserve los datos de /srv/appdata entre despliegues (se despliega 3 veces un contenedor de prueba)..."
+  else
+    hli_busy "Desplegando ${app_name} en Dokploy..."
+  fi
   composeId="$(dokploy_compose_create_or_update "$environment_id" "$app_name" "$compose_file" "$env_content")" || return 1
   dokploy_compose_deploy "$composeId" || return 1
   printf '%s' "$composeId"

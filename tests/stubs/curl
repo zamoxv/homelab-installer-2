@@ -60,13 +60,21 @@ resp="{}"
 
 case "$url" in
   *project.all*)
-    resp='[{"name":"homelab","projectId":"proj-1"}]'
+    # STUB_DOKPLOY_NO_PROJECT=1 simula un Dokploy recién instalado (sin el
+    # proyecto "homelab"), para ejercitar el camino de project.create.
+    if [[ -n "${STUB_DOKPLOY_NO_PROJECT:-}" ]]; then
+      resp='[]'
+    else
+      resp='[{"name":"homelab","projectId":"proj-1"}]'
+    fi
     ;;
   *environment.byProjectId*)
     resp='[{"environmentId":"env-1"}]'
     ;;
   *project.create)
-    resp='{"projectId":"proj-1"}'
+    # Forma REAL (router project.ts de Dokploy): devuelve el proyecto
+    # ANIDADO junto al ambiente por defecto, no la fila plana.
+    resp='{"project":{"name":"homelab","projectId":"proj-1"},"environment":{"environmentId":"env-1","name":"production"}}'
     ;;
   *compose.one*)
     http_code=404

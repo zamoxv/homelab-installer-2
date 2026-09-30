@@ -93,13 +93,33 @@ is_done() {
   grep -qxF "$module" "$STATE_FILE" 2>/dev/null
 }
 
+# Aviso de "trabajando" para esperas largas (despliegues, validación
+# canaria): sin esto la pantalla queda quieta varios minutos, parece colgada
+# y las teclas que se presionan se imprimen como basura (^[[A...). Muestra un
+# cuadro sin botones y apaga el eco del teclado hasta la próxima
+# interacción (msg/confirm/input_box/password_box lo reactivan). Escribe
+# directo a /dev/tty: funciona aunque se llame dentro de $(...). Sin
+# terminal (tests, ejecución en segundo plano) no hace nada.
+hli_busy() {
+  { : >/dev/tty; } 2>/dev/null || return 0
+  stty -echo </dev/tty 2>/dev/null || true
+  dialog --title "HLI 2" --infobox "$1\n\nPuede tardar unos minutos. No es necesario presionar teclas." 9 70 >/dev/tty 2>/dev/null || true
+}
+
+hli_busy_end() {
+  { : >/dev/tty; } 2>/dev/null || return 0
+  stty echo </dev/tty 2>/dev/null || true
+}
+
 msg() {
+  hli_busy_end
   # Puramente informativo (un botón "Aceptar"): ESC o un fallo de dialog no
   # deben abortar el módulo que llamó a msg(), así que nunca propaga error.
   dialog --title "HLI 2" --msgbox "$1" 12 76 || true
 }
 
 confirm() {
+  hli_busy_end
   dialog --title "Confirmar" --yesno "$1" 12 76
 }
 
@@ -107,6 +127,7 @@ input_box() {
   local title="$1"
   local prompt="$2"
   local default="${3:-}"
+  hli_busy_end
   dialog --title "$title" --inputbox "$prompt" 10 76 "$default" 3>&1 1>&2 2>&3
 }
 
@@ -117,6 +138,7 @@ input_box() {
 password_box() {
   local title="$1"
   local prompt="$2"
+  hli_busy_end
   dialog --title "$title" --insecure --passwordbox "$prompt" 10 76 3>&1 1>&2 2>&3
 }
 
@@ -237,6 +259,7 @@ run_module() {
   log "Iniciando módulo: $module"
   if [[ "$(module_meta "$module" TUI)" == "yes" ]]; then
     bash "$path" || rc=$?
+    hli_busy_end   # red de seguridad: eco del teclado siempre de vuelta
   else
     bash "$path" 2>&1 | sudo tee -a "$LOG_DIR/$module.log" || rc=$?
   fi

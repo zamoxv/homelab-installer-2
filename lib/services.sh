@@ -159,6 +159,7 @@ service_state() {
 # para el módulo llamador (el contenedor puede seguir iniciando).
 service_wait_active() {
   local id="$1" timeout="${2:-120}" waited=0
+  hli_busy "Esperando que $(service_get "$id" NAME 2>/dev/null || echo "$id") quede activo..."
   while [[ "$waited" -lt "$timeout" ]]; do
     [[ "$(service_state "$id")" == "activo" ]] && return 0
     sleep 5

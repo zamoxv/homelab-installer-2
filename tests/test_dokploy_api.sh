@@ -78,3 +78,18 @@ test_dokploy_env_file_unreadable_plain_but_configured_detects_it() {
     [[ "$url" == "http://test-dokploy:3000" ]] || { echo "URL leída no coincide: [$url]"; exit 1; }
   ) || return 1
 }
+
+# Bug real encontrado en la X230: en un Dokploy recién instalado (sin el
+# proyecto "homelab"), project.create devuelve { project: {...},
+# environment: {...} } (proyecto ANIDADO). El HLI buscaba .projectId en la
+# raíz, no lo encontraba y fallaba, aunque el proyecto sí se había creado
+# (el reintento funcionaba porque project.all ya lo encontraba).
+test_dokploy_project_create_on_fresh_dokploy() {
+  ( set -euo pipefail
+    export STUB_DOKPLOY_NO_PROJECT=1
+    source "$REPO_ROOT/lib/core.sh"
+    project="$(dokploy_project_find_or_create)"
+    env_id="$(dokploy_environment_default_id "$project")"
+    [[ "$env_id" == "env-1" ]] || { echo "environmentId inesperado: [$env_id]"; exit 1; }
+  ) || { fail "no se pudo resolver el ambiente tras crear el proyecto en un Dokploy vacío"; return 1; }
+}
