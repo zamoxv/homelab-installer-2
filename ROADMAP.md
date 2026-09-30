@@ -345,6 +345,15 @@ Dokploy real desde acá):
 - [ ] **Open WebUI** (opcional, última tarea): interfaz tipo ChatGPT conectada al API server de
       Hermes, solo LAN.
 
+## Limitaciones conocidas
+
+- **Huella de discos en `datadisk`**: se compone de tamaño, serie, WWN, modelo
+  y PARTUUID (más serie/modelo del disco padre en particiones). Discos que no
+  informan serie ni WWN (discos virtuales `virtio` sin `serial=`, algunas
+  carcasas USB) quedan identificados solo por tamaño: un cambio por otro disco
+  del mismo tamaño mientras el diálogo está abierto no se detectaría. Las tres
+  confirmaciones muestran dispositivo, tamaño y modelo como última defensa.
+
 ## Riesgos a validar primero
 
 - Dokploy sobre Ubuntu 26.04 (no soportado oficialmente).
