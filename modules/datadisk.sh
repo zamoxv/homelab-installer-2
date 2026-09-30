@@ -66,7 +66,9 @@ for l in "${lines[@]}"; do
   dev="$(cut -f1 <<<"$l")"
   size="$(cut -f2 <<<"$l")"
   fs="$(lsblk -dno FSTYPE "$dev" 2>/dev/null)" || fs=""
-  nparts="$(lsblk -rpno TYPE "$dev" 2>/dev/null | grep -c '^part$')" || nparts=0
+  # tail -n +2: la primera línea es el propio dispositivo (en una partición,
+  # contarla a ella misma mostraba "con 1 partición(es)").
+  nparts="$(lsblk -rpno TYPE "$dev" 2>/dev/null | tail -n +2 | grep -c '^part$')" || nparts=0
   if [[ -z "$fs" && "${nparts:-0}" -gt 0 ]]; then
     fs="con ${nparts} partición(es)"
   fi
@@ -120,9 +122,12 @@ if [[ "$(lsblk -dno TYPE "$DEV" 2>/dev/null)" == "disk" ]]; then
   children="$(lsblk -rpno NAME,FSTYPE,SIZE "$DEV" 2>/dev/null | tail -n +2)" || _abort_dev_gone
 fi
 
+# dialog no respeta saltos de línea reales en el texto: necesita '\n'.
+children_msg="${children//$'\n'/\\n}"
+
 if [[ -z "$fstype" && -n "$children" ]]; then
   action=$(dialog --clear --title "Disco de datos" \
-    --menu "ATENCIÓN: $DEV es un disco entero que ya tiene particiones:\n\n${children}\n\nPara usar una partición existente, cancele y elija la partición en la lista.\nFormatear el disco entero BORRA TODAS esas particiones.\n\n¿Qué desea hacer?" \
+    --menu "ATENCIÓN: $DEV es un disco entero que ya tiene particiones:\n\n${children_msg}\n\nPara usar una partición existente, cancele y elija la partición en la lista.\nFormatear el disco entero BORRA TODAS esas particiones.\n\n¿Qué desea hacer?" \
     20 78 2 \
     cancelar "No hacer nada" \
     formatear "Formatear el disco entero en ext4 (BORRA TODO)" \
@@ -141,10 +146,18 @@ fi
 
 # Punto de montaje por defecto inteligente: si MEDIA_ROOT ya está ocupado
 # (montado o con datos), sugerir el primer /srv/mediaN libre (media2, media3...).
+# ¿Punto de montaje libre? No montado y sin archivos (puede tener carpetas
+# vacías: la estructura que crea 'storage' en /srv/media no cuenta como
+# contenido; así, el primer disco de datos se sugiere en /srv/media).
+_mp_free() {
+  ! mountpoint -q "$1" 2>/dev/null \
+    && [[ -z "$(find "$1" -mindepth 1 -type f -print -quit 2>/dev/null)" ]]
+}
+
 default_mp="$MEDIA_ROOT"
-if mountpoint -q "$MEDIA_ROOT" 2>/dev/null || [[ -n "$(ls -A "$MEDIA_ROOT" 2>/dev/null)" ]]; then
+if ! _mp_free "$MEDIA_ROOT"; then
   n=2
-  while mountpoint -q "${MEDIA_ROOT}${n}" 2>/dev/null || [[ -n "$(ls -A "${MEDIA_ROOT}${n}" 2>/dev/null)" ]]; do
+  while ! _mp_free "${MEDIA_ROOT}${n}"; do
     n=$((n + 1))
   done
   default_mp="${MEDIA_ROOT}${n}"
@@ -166,7 +179,7 @@ if [[ "$action" == "formatear" ]]; then
   sudo mkfs.ext4 -F "$DEV"
 fi
 
-if [[ -d "$MP" && -n "$(ls -A "$MP" 2>/dev/null)" ]]; then
+if [[ -d "$MP" ]] && ! _mp_free "$MP"; then
   confirm "OJO: $MP ya tiene contenido.\n\nAl montar el disco ahí, ese contenido queda OCULTO (no se borra, pero no se ve hasta desmontar el disco).\n\n¿Continuar igual?" || exit 0
 fi
 
