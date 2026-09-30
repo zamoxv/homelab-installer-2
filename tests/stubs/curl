@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Stub de 'curl' para tests: nunca sale a la red. Simula las respuestas de
+# la API de Dokploy que necesitan los módulos de v2.3 (proyecto/ambiente ya
+# existentes, compose.create/update/deploy, domain.byComposeId/create).
+#
+# Reproduce el formato exacto que espera dokploy_api_call() (lib/dokploy_api.sh):
+# '-w $'\n%{http_code}'' -> imprime el cuerpo, un '\n', y el código HTTP al
+# final; dokploy_api_call separa con "${resp%$'\n'*}"/"${resp##*$'\n'}".
+#
+# El body real (que puede traer un secreto, ver dokploy_compose_create_or_update)
+# SOLO llega acá como '--data @<archivo>': el argv de curl nunca contiene el
+# secreto en sí (por eso log_call, que registra el argv completo, es seguro
+# de usar para el assert "el secreto nunca aparece en ningún log de stub" —
+# acá solo se loguea la RUTA del archivo temporal, nunca su contenido).
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call curl "$@"
+
+method="GET"
+data_file=""
+url=""
+args=("$@")
+i=0
+n=${#args[@]}
+while [[ $i -lt $n ]]; do
+  case "${args[$i]}" in
+    -X)
+      i=$((i + 1))
+      method="${args[$i]}"
+      ;;
+    --data)
+      i=$((i + 1))
+      data_file="${args[$i]#@}"
+      ;;
+  esac
+  i=$((i + 1))
+done
+# El último argumento posicional (no-flag, no valor de una flag) es la URL:
+# en dokploy_api_call siempre se pasa al final ("$url" después de las
+# opciones), así que alcanza con el último elemento del array.
+url="${args[$((n - 1))]}"
+
+body=""
+if [[ -n "$data_file" && -f "$data_file" ]]; then
+  body="$(cat "$data_file")"
+fi
+
+# Log APARTE del de argv (STUB_CALL_LOG): acá SÍ se registra el CONTENIDO
+# del body (leído del archivo, nunca del argv) para que los tests puedan
+# comprobar que un secreto llegó al campo correcto del JSON (ej. "env":
+# "ADMIN_TOKEN=...") — el chequeo de "nunca en argv" se hace aparte, sobre
+# STUB_CALL_LOG, que nunca contiene el body en sí (solo la ruta del
+# archivo temporal, ver --data "@archivo" en dokploy_api_call).
+if [[ -n "${STUB_HTTP_BODIES_LOG:-}" ]]; then
+  { printf '>>> %s %s\n' "$method" "$url"; printf '%s\n' "$body"; printf '<<<\n'; } >> "$STUB_HTTP_BODIES_LOG"
+fi
+
+http_code=200
+resp="{}"
+
+case "$url" in
+  *project.all*)
+    resp='[{"name":"homelab","projectId":"proj-1"}]'
+    ;;
+  *environment.byProjectId*)
+    resp='[{"environmentId":"env-1"}]'
+    ;;
+  *project.create)
+    resp='{"projectId":"proj-1"}'
+    ;;
+  *compose.one*)
+    http_code=404
+    resp=""
+    ;;
+  *compose.create)
+    name="$(printf '%s' "$body" | jq -r '.appName // .name // "unknown"' 2>/dev/null)" || name="unknown"
+    resp="$(jq -n --arg id "cid-${name}" '{composeId: $id}')"
+    ;;
+  *compose.update)
+    resp='{}'
+    ;;
+  *compose.deploy)
+    resp='{}'
+    ;;
+  *compose.delete)
+    resp='{}'
+    ;;
+  *domain.byComposeId*)
+    resp='[]'
+    ;;
+  *domain.create)
+    resp='{"domainId":"dom-1"}'
+    ;;
+  *)
+    http_code=404
+    resp='{"error":"ruta no reconocida por el stub de curl"}'
+    ;;
+esac
+
+printf '%s\n%s' "$resp" "$http_code"

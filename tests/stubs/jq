@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Wrapper de 'jq' para tests: NO es un stub falso — delega al 'jq' real del
+# sistema (necesario para validar de verdad que el JSON armado por
+# lib/dokploy_api.sh tiene la forma correcta), pero antes registra su propio
+# argv completo con log_call. Esto es lo que permite a los tests afirmar "el
+# secreto (ADMIN_TOKEN/INITIAL_ADMIN_PASSWORD) NUNCA apareció como argumento
+# de un proceso real": dokploy_compose_create_or_update pasa el secreto con
+# '--rawfile env <archivo>' (nunca '--arg ... "$secreto"'), así que el argv
+# logueado acá solo debe contener la RUTA del archivo temporal, nunca el
+# valor.
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call jq "$@"
+
+real_jq="$(command -v -p jq)" || real_jq="/usr/bin/jq"
+exec "$real_jq" "$@"

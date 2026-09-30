@@ -4,16 +4,20 @@
 # referencia de solo lectura, nunca se sourcea ni se importa desde ahí.
 set -euo pipefail
 
-# ':=' en TODAS las rutas de sistema (no solo el estado): permite que un
-# test apunte esto a rutas de un scratch dir en vez de tocar
-# /etc/resolv.conf o systemd-resolved de la máquina real (igual que
-# DOKPLOY_ENV_FILE en lib/dokploy_api.sh). En producción, sin overrides,
-# resuelven a las rutas reales de siempre.
-: "${DNS_PORT_DROPIN:=/etc/systemd/resolved.conf.d/99-hli2.conf}"
-: "${DNS_PORT_RESOLVED_CONFD_DIR:=/etc/systemd/resolved.conf.d}"
-: "${DNS_PORT_RESOLV_CONF:=/etc/resolv.conf}"
-: "${DNS_PORT_STUB_RESOLV_CONF:=/run/systemd/resolve/resolv.conf}"
-: "${DNS_PORT_STATE_DIR:=$STATE_DIR}"
+# Namespaced con el prefijo 'HLI2_' en TODAS las rutas de sistema (no solo
+# el estado): permite que un test apunte esto a rutas de un scratch dir en
+# vez de tocar /etc/resolv.conf o systemd-resolved de la máquina real, sin
+# arriesgar que una variable ambiental genérica ("DNS_PORT_DROPIN" podría
+# existir por casualidad en el entorno de quien corre bootstrap.sh)
+# secuestre en silencio estas rutas en producción — mismo criterio que
+# LOG_DIR/STATE_DIR en lib/core.sh y DOKPLOY_ENV_FILE en
+# lib/dokploy_api.sh. En producción, sin overrides HLI2_*, resuelven a las
+# rutas reales de siempre.
+DNS_PORT_DROPIN="${HLI2_DNS_PORT_DROPIN:-/etc/systemd/resolved.conf.d/99-hli2.conf}"
+DNS_PORT_RESOLVED_CONFD_DIR="${HLI2_DNS_PORT_RESOLVED_CONFD_DIR:-/etc/systemd/resolved.conf.d}"
+DNS_PORT_RESOLV_CONF="${HLI2_DNS_PORT_RESOLV_CONF:-/etc/resolv.conf}"
+DNS_PORT_STUB_RESOLV_CONF="${HLI2_DNS_PORT_STUB_RESOLV_CONF:-/run/systemd/resolve/resolv.conf}"
+DNS_PORT_STATE_DIR="${HLI2_DNS_PORT_STATE_DIR:-$STATE_DIR}"
 DNS_PORT_PREV_KIND_FILE="$DNS_PORT_STATE_DIR/dns-port-prev-kind"
 DNS_PORT_PREV_TARGET_FILE="$DNS_PORT_STATE_DIR/dns-port-prev-target"
 DNS_PORT_PREV_CONTENT_FILE="$DNS_PORT_STATE_DIR/dns-port-prev-resolv.conf"

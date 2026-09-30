@@ -1,0 +1,47 @@
+# Plantilla renderizada por lib/compose.sh (compose_render_vaultwarden).
+# Imagen oficial vaultwarden/server (verificado 2026-09-29,
+# github.com/dani-garcia/vaultwarden/wiki/Using-Docker-Compose): un único
+# volumen de datos en /data (SQLite + attachments + config del propio
+# Vaultwarden). SIGNUPS_ALLOWED=false (decisión fija de v2.3): el primer
+# usuario se crea desde el panel de administración (/admin, con ADMIN_TOKEN),
+# usando "Invite User" — no hace falta habilitar el registro público ni
+# siquiera para la cuenta inicial
+# (github.com/dani-garcia/vaultwarden/wiki/Enabling-admin-page).
+#
+# ADMIN_TOKEN: referencia "${ADMIN_TOKEN}" (sustitución de Dokploy vía su
+# campo "env", ver dokploy_compose_create_or_update en lib/dokploy_api.sh) en
+# vez de un valor literal: el hash Argon2id PHC nunca queda en este archivo
+# versionado. Lo genera el módulo con la propia CLI de Vaultwarden
+# ('vaultwarden hash', ver modules/vaultwarden.sh) y lo guarda además en
+# /etc/hli2/vaultwarden.env (root-only 0600, lib/secrets.sh) para poder
+# re-desplegar sin volver a pedirlo.
+#
+# Sin "ports": no se publica ningún puerto del host (decisión de v2.3: nada
+# de Vaultwarden se expone a Internet todavía, eso es v2.4/Cloudflare
+# Tunnel). El acceso es SOLO vía Traefik (red "dokploy-network", que Dokploy
+# ya crea) con el dominio configurado por el módulo
+# (dokploy_domain_ensure en lib/dokploy_api.sh) — alcanzable desde la LAN
+# apuntando ese dominio a la IP del servidor (por ejemplo con una
+# reescritura DNS en AdGuard Home).
+#
+# INCERTIDUMBRE (marcar para validar en el servidor real): la red
+# "dokploy-network" y el campo "env" de compose.create/update no se pudieron
+# probar contra un Dokploy real desde acá (ver comentarios en
+# lib/dokploy_api.sh).
+services:
+  vaultwarden:
+    image: vaultwarden/server
+    container_name: vaultwarden
+    restart: unless-stopped
+    environment:
+      - SIGNUPS_ALLOWED=false
+      - DOMAIN=https://__DOMAIN__
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+    volumes:
+      - __APPDATA__/vaultwarden/data:/data
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true

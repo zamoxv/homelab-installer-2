@@ -69,6 +69,20 @@ compose_render_jellyfin() {
     | _compose_subst "__MEDIA_VOLUMES__" "$media_lines"
 }
 
+# Zona horaria del host, en formato IANA (ej. "America/Argentina/Cordoba").
+# 'timedatectl' es lo habitual en Ubuntu; /etc/timezone es el respaldo. Si
+# ninguno da algo con forma válida, UTC (nunca un valor vacío o corrupto en
+# el compose). La usan qBittorrent y Home Assistant.
+_compose_tz() {
+  local tz
+  tz="$(timedatectl show -p Timezone --value 2>/dev/null)" || tz=""
+  if [[ -z "$tz" ]]; then
+    tz="$(cat /etc/timezone 2>/dev/null)" || tz=""
+  fi
+  [[ "$tz" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || tz="UTC"
+  printf '%s' "$tz"
+}
+
 # --- qBittorrent ---------------------------------------------------------------
 
 compose_render_qbittorrent() {
@@ -84,11 +98,7 @@ compose_render_qbittorrent() {
   [[ -n "$gid" ]] || { echo "ERROR: no existe el grupo '$MEDIA_GROUP'." >&2; return 1; }
   port="$(service_get qbittorrent PORT)"
   appdata="$APPDATA_ROOT"
-  tz="$(timedatectl show -p Timezone --value 2>/dev/null)" || tz=""
-  if [[ -z "$tz" ]]; then
-    tz="$(cat /etc/timezone 2>/dev/null)" || tz=""
-  fi
-  [[ "$tz" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || tz="UTC"
+  tz="$(_compose_tz)"
 
   local media_lines
   media_lines="$(_compose_media_volume_lines "      ")"
@@ -108,4 +118,61 @@ compose_render_adguard() {
   local template="$SCRIPT_DIR/compose/adguard/docker-compose.yml"
   [[ -f "$template" ]] || { echo "ERROR: falta $template" >&2; return 1; }
   cat "$template" | _compose_subst "__APPDATA__" "$APPDATA_ROOT"
+}
+
+# --- Vaultwarden -------------------------------------------------------------
+
+# $1 = dominio (sin esquema, ej. "vault.midominio.com"). El ADMIN_TOKEN
+# NUNCA pasa por acá: el template ya trae "${ADMIN_TOKEN}" literal (lo
+# sustituye Dokploy vía su campo "env", ver dokploy_compose_create_or_update
+# y modules/vaultwarden.sh).
+compose_render_vaultwarden() {
+  local template="$SCRIPT_DIR/compose/vaultwarden/docker-compose.yml" domain="$1"
+  [[ -f "$template" ]] || { echo "ERROR: falta $template" >&2; return 1; }
+  [[ -n "$domain" ]] || { echo "ERROR: compose_render_vaultwarden necesita un dominio." >&2; return 1; }
+  cat "$template" \
+    | _compose_subst "__APPDATA__" "$APPDATA_ROOT" \
+    | _compose_subst "__DOMAIN__" "$domain"
+}
+
+# --- Home Assistant ----------------------------------------------------------
+
+compose_render_homeassistant() {
+  local template="$SCRIPT_DIR/compose/homeassistant/docker-compose.yml"
+  [[ -f "$template" ]] || { echo "ERROR: falta $template" >&2; return 1; }
+
+  local tz dbus_block=""
+  tz="$(_compose_tz)"
+  # /run/dbus: SOLO si existe en el host (ver comentario del template sobre
+  # por qué no se usa "privileged" ni se monta siempre).
+  if [[ -e /run/dbus ]]; then
+    dbus_block="      - /run/dbus:/run/dbus:ro"
+  fi
+
+  cat "$template" \
+    | _compose_subst "__APPDATA__" "$APPDATA_ROOT" \
+    | _compose_subst "__TZ__" "$tz" \
+    | _compose_subst "__DBUS_BLOCK__" "$dbus_block"
+}
+
+# --- OpenCloud -----------------------------------------------------------------
+
+# $1 = dominio público futuro (sin esquema). El INITIAL_ADMIN_PASSWORD
+# NUNCA pasa por acá: el template ya trae "${INITIAL_ADMIN_PASSWORD}"
+# literal (lo sustituye Dokploy vía su campo "env", ver
+# dokploy_compose_create_or_update y modules/opencloud.sh).
+compose_render_opencloud() {
+  local template="$SCRIPT_DIR/compose/opencloud/docker-compose.yml" domain="$1"
+  [[ -f "$template" ]] || { echo "ERROR: falta $template" >&2; return 1; }
+  [[ -n "$domain" ]] || { echo "ERROR: compose_render_opencloud necesita un dominio." >&2; return 1; }
+
+  local uid gid
+  uid="$(id -u "$SERVER_USER")" || { echo "ERROR: no existe el usuario '$SERVER_USER'." >&2; return 1; }
+  gid="$(id -g "$SERVER_USER")" || { echo "ERROR: no se pudo resolver el grupo primario de '$SERVER_USER'." >&2; return 1; }
+
+  cat "$template" \
+    | _compose_subst "__APPDATA__" "$APPDATA_ROOT" \
+    | _compose_subst "__UID__" "$uid" \
+    | _compose_subst "__GID__" "$gid" \
+    | _compose_subst "__DOMAIN__" "$domain"
 }

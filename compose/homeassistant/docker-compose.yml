@@ -1,0 +1,39 @@
+# Plantilla renderizada por lib/compose.sh (compose_render_homeassistant).
+# Imagen oficial ghcr.io/home-assistant/home-assistant:stable, modo
+# "Container" (sin add-ons/supervisor) — decisión del roadmap #7: el uso
+# previsto son integraciones Xiaomi y Samsung, que no necesitan add-ons.
+#
+# network_mode: host (verificado 2026-09-29,
+# www.home-assistant.io/installation/linux): recomendado por el propio
+# proyecto porque muchas integraciones dependen de mDNS/SSDP/UPnP para
+# descubrir dispositivos en la LAN, que no atraviesan una red bridge de
+# Docker sin reenvío de puertos multicast. Coincide con la decisión #5 del
+# roadmap.
+#
+# A DIFERENCIA del docker-compose de ejemplo oficial (que usa
+# "privileged: true" + monta /run/dbus para Bluetooth), este compose NO usa
+# "privileged" ni monta dispositivos: el uso previsto (Xiaomi, Samsung) es
+# por red local (mDNS/SSDP/API en la nube), no por Bluetooth/USB del host,
+# así que no hace falta ese acceso ampliado. /run/dbus SOLO se monta si
+# existe en el host (ver __DBUS_BLOCK__, lib/compose.sh): sin él, algunas
+# integraciones de Bluetooth no funcionarían, pero ninguna prevista acá lo
+# necesita.
+#
+# NOTA para más adelante (no aplica todavía, v2.3 es solo LAN vía el puerto
+# 8123 del host): si en el futuro Home Assistant se sirve detrás de un
+# reverse proxy (Traefik u otro), su 'configuration.yaml' necesitará el
+# bloque 'http.use_x_forwarded_for'/'http.trusted_proxies' apuntando a la IP
+# del proxy, o rechazará las conexiones. No se escribe ahora porque no hace
+# falta (acceso directo por IP:8123 en la LAN).
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: homeassistant
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - TZ=__TZ__
+    volumes:
+      - __APPDATA__/homeassistant/config:/config
+      - /etc/localtime:/etc/localtime:ro
+__DBUS_BLOCK__

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Stub de 'lsblk' para el test end-to-end de modules/datadisk.sh. Switch
+# sobre "$*" (los argumentos completos), como se especificó. El disco de
+# sistema NO se hardcodea a "/dev/sda": se toma de $LSBLK_SYSDISK (lo fija
+# tests/test_datadisk.sh a partir del lsblk REAL del host, vía 'command -p',
+# antes de que este stub quede primero en el PATH) — así el test no depende
+# de que el disco de arranque de la máquina que lo corre se llame justo
+# "/dev/sda" (podría ser /dev/vda, /dev/nvme0n1...).
+#
+# El disco candidato ("nuevo", a sumar al pool de media) SÍ está fijo como
+# "/dev/sdz": nunca necesita ser un block device real (system_disks(), la
+# única función que exige "[[ -b ]]" sobre un disco, solo se llama con los
+# discos de SISTEMA, nunca con el candidato).
+#
+# La huella (fingerprint) de /dev/sdz es la única respuesta con estado:
+# usa un contador FILE-BASED (un proceso nuevo por invocación, así que el
+# contador tiene que sobrevivir en un archivo) para poder simular, si
+# LSBLK_FP_CHANGE_AFTER_FIRST=1, que el disco "cambió" entre la primera
+# lectura y una revalidación posterior (escenario "disco swapeado a mitad
+# de diálogo").
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call lsblk "$@"
+
+: "${LSBLK_SYSDISK:=/dev/sda}"
+: "${LSBLK_FP_COUNTER_FILE:=${STUB_SAFE_ROOT:-/tmp}/.lsblk-fp-counter}"
+: "${LSBLK_FP_CHANGE_AFTER_FIRST:=0}"
+sysdisk_part="${LSBLK_SYSDISK}1"
+
+case "$*" in
+  "-srnpo NAME,TYPE ${sysdisk_part}")
+    printf '%s part\n%s disk\n' "$sysdisk_part" "$LSBLK_SYSDISK"
+    ;;
+  "-rpno NAME,TYPE,SIZE,PKNAME")
+    printf '%s disk 100G \n%s part 100G %s\n/dev/sdz disk 1T \n' \
+      "$LSBLK_SYSDISK" "$sysdisk_part" "$LSBLK_SYSDISK"
+    ;;
+  "-dnbo SIZE,SERIAL,WWN,MODEL,PARTUUID /dev/sdz")
+    n=0
+    [[ -f "$LSBLK_FP_COUNTER_FILE" ]] && n="$(cat "$LSBLK_FP_COUNTER_FILE")"
+    n=$((n + 1))
+    echo "$n" > "$LSBLK_FP_COUNTER_FILE"
+    if [[ "$LSBLK_FP_CHANGE_AFTER_FIRST" == "1" && "$n" -gt 1 ]]; then
+      printf '1099511627776  WWN-CHANGED MODEL-CHANGED \n'
+    else
+      printf '1099511627776 SERIAL123 WWN123 ModeloTest \n'
+    fi
+    ;;
+  "-dno TYPE /dev/sdz")
+    echo "disk"
+    ;;
+  "-dno FSTYPE /dev/sdz")
+    echo ""
+    ;;
+  "-dno MODEL /dev/sdz")
+    echo "ModeloTest"
+    ;;
+  "-dno SIZE /dev/sdz")
+    echo "1T"
+    ;;
+  "-rpno TYPE /dev/sdz")
+    printf ''
+    ;;
+  "-rpno NAME,FSTYPE,SIZE /dev/sdz")
+    # Un disco entero SIN particiones: una sola línea (el propio disco), sin
+    # encabezado ('-n'). El llamador hace 'tail -n +2' para quedarse solo
+    # con las particiones, así que acá alcanza con esa única línea.
+    printf '/dev/sdz  1T\n'
+    ;;
+  "-dnpo NAME")
+    echo "$LSBLK_SYSDISK"
+    ;;
+  *)
+    exit 0
+    ;;
+esac

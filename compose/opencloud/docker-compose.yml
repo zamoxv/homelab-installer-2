@@ -1,0 +1,67 @@
+# Plantilla renderizada por lib/compose.sh (compose_render_opencloud).
+# Imagen y variables de entorno tomadas de la plantilla oficial
+# opencloud-eu/opencloud-compose (verificado 2026-09-29,
+# raw.githubusercontent.com/opencloud-eu/opencloud-compose/main/docker-compose.yml):
+#   image: opencloudeu/opencloud-rolling:8.0.1
+#   entrypoint: /bin/sh; command: ["-c", "opencloud init || true; opencloud server"]
+#     ('opencloud init' genera la config con secretos aleatorios la primera
+#     vez; falla en corridas siguientes porque el archivo ya existe, por eso
+#     "|| true" — el propio proyecto lo documenta así.)
+#   OC_URL, PROXY_TLS, OC_INSECURE, IDM_ADMIN_PASSWORD, IDM_CREATE_DEMO_USERS
+#   volúmenes: /etc/opencloud (config) y /var/lib/opencloud (data)
+#
+# RECORTADO respecto de la plantilla oficial (a propósito, para mantener el
+# módulo simple en v2.3): se omiten csp.yaml/apps.yaml/banned-password-list
+# (características opcionales — política de contraseñas personalizada, lista
+# de apps, CSP custom) y las variables de SMTP/políticas de contraseña
+# (quedan en los valores por defecto de la imagen). Se puede ampliar más
+# adelante sin romper compatibilidad (son variables opcionales adicionales).
+#
+# IDM_ADMIN_PASSWORD: referencia "${INITIAL_ADMIN_PASSWORD}" (sustitución de
+# Dokploy vía su campo "env", ver dokploy_compose_create_or_update en
+# lib/dokploy_api.sh) en vez de un valor literal — igual que ADMIN_TOKEN en
+# compose/vaultwarden/docker-compose.yml. OJO (documentado por OpenCloud):
+# esta contraseña solo se aplica en el PRIMER arranque ('opencloud init');
+# cambiar la variable después no tiene efecto sin reinicializar el volumen
+# de config, así que modules/opencloud.sh no vuelve a pedirla en
+# redespliegues si ya hay una guardada (ver /etc/hli2/opencloud.env).
+#
+# user "__UID__:__GID__" (uid/gid de SERVER_USER, no del grupo de media: los
+# datos de OpenCloud no son media) y almacenamiento POSIX plano bajo
+# __APPDATA__/opencloud/data (sin named volumes de Docker) para que los
+# archivos queden legibles/respaldables desde el host, como pide el roadmap.
+#
+# Sin "ports": igual que Vaultwarden, el acceso es solo vía Traefik (red
+# "dokploy-network") con el dominio configurado por el módulo — no expuesto
+# a Internet todavía (eso es v2.4). OC_INSECURE=true porque, mientras no
+# haya un dominio público resoluble (v2.4), no hay certificado real que
+# validar entre Traefik y el navegador; el login solo funcionará una vez que
+# el dominio/TLS estén en su lugar (ver mensaje del módulo).
+#
+# INCERTIDUMBRE (marcar para validar en el servidor real): igual que
+# Vaultwarden, "dokploy-network" y el campo "env" no se probaron contra un
+# Dokploy real desde acá.
+services:
+  opencloud:
+    image: opencloudeu/opencloud-rolling:8.0.1
+    container_name: opencloud
+    restart: unless-stopped
+    user: "__UID__:__GID__"
+    entrypoint:
+      - /bin/sh
+    command: ["-c", "opencloud init || true; opencloud server"]
+    environment:
+      - OC_URL=https://__DOMAIN__
+      - PROXY_TLS=false
+      - OC_INSECURE=true
+      - IDM_CREATE_DEMO_USERS=false
+      - IDM_ADMIN_PASSWORD=${INITIAL_ADMIN_PASSWORD}
+    volumes:
+      - __APPDATA__/opencloud/config:/etc/opencloud
+      - __APPDATA__/opencloud/data:/var/lib/opencloud
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true

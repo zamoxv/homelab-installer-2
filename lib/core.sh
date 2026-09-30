@@ -7,7 +7,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-CONFIG_FILE="$SCRIPT_DIR/config/default.conf"
+# 'HLI2_CONFIG_FILE': permite a los tests apuntar esto a /dev/null (que
+# '[[ -f ]]' ve como "no es un archivo regular", así que no se sourcea
+# nada) en vez de al config/default.conf real del repo — sin esto, los
+# tests que exportan APPDATA_ROOT/MEDIA_ROOT/BACKUP_ROOT/MEDIA_GROUP a un
+# scratch dir los verían PISADOS por las asignaciones de config/default.conf
+# (que son incondicionales: no usan '${VAR:-...}'), un hallazgo real de la
+# ronda 2 de tests (ver tests/lib/harness.sh). En producción, sin override,
+# sigue leyendo el config/default.conf real de siempre.
+CONFIG_FILE="${HLI2_CONFIG_FILE:-$SCRIPT_DIR/config/default.conf}"
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
 SERVER_USER="${SERVER_USER:-$USER}"
@@ -24,9 +32,21 @@ if [[ -z "${MEDIA_FOLDERS+x}" ]]; then
   MEDIA_FOLDERS=(peliculas series musica libros fotos videos downloads transcode)
 fi
 
-LOG_DIR="/var/log/hli2"
-STATE_DIR="/var/lib/hli2"
-STATE_FILE="$STATE_DIR/state"
+# Namespaced con el prefijo 'HLI2_' (nunca 'LOG_DIR'/'STATE_DIR' pelados): un
+# nombre genérico como "STATE_DIR" puede existir por casualidad en el
+# entorno de quien corre bootstrap.sh (herencia de otra herramienta, de su
+# shell, de un 'source' de algún dotfile) y secuestrar en silencio dónde
+# vive el estado/los logs REALES de HLI 2 en un servidor de producción —
+# hallazgo de una revisión de seguridad posterior a la primera versión de
+# v2.3. Un prefijo específico del proyecto ('HLI2_...') no colisiona con
+# nada genérico. Los tests (tests/run.sh) apuntan esto a un directorio de
+# scratch exportando las variables HLI2_*; sin ellas, quedan las rutas
+# reales de siempre. Mismo criterio en DOKPLOY_ENV_FILE/DOKPLOY_STATE_FILE
+# (lib/dokploy_api.sh), SECRETS_DIR (lib/secrets.sh) y DNS_PORT_*
+# (lib/dns.sh).
+LOG_DIR="${HLI2_LOG_DIR:-/var/log/hli2}"
+STATE_DIR="${HLI2_STATE_DIR:-/var/lib/hli2}"
+STATE_FILE="${HLI2_STATE_FILE:-$STATE_DIR/state}"
 
 # Crea los directorios de runtime (log/estado) y deja apt/needrestart en modo
 # no interactivo, imprescindible para módulos que corren en segundo plano bajo
@@ -85,6 +105,19 @@ password_box() {
   local title="$1"
   local prompt="$2"
   dialog --title "$title" --insecure --passwordbox "$prompt" 10 76 3>&1 1>&2 2>&3
+}
+
+# Valida la FORMA de un nombre de dominio (nunca su resolución real):
+# etiquetas separadas por '.', cada una con caracteres [A-Za-z0-9-], sin
+# guion al principio ni al final, 1-63 caracteres por etiqueta, al menos dos
+# etiquetas (un FQDN de verdad, no "localhost" ni una palabra suelta) y
+# largo total <=253. La usan los módulos que piden un dominio por TUI
+# (vaultwarden, opencloud) para rechazar de entrada algo que claramente no
+# es un nombre de dominio, antes de mandarlo a Traefik/Dokploy.
+hli2_valid_hostname() {
+  local host="$1"
+  [[ -n "$host" && "${#host}" -le 253 ]] || return 1
+  [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
 }
 
 # --- Docker con privilegios (única puerta de entrada) ---
@@ -225,6 +258,7 @@ source "$SCRIPT_DIR/lib/storage.sh"
 source "$SCRIPT_DIR/lib/hw.sh"
 source "$SCRIPT_DIR/lib/services.sh"
 source "$SCRIPT_DIR/lib/dns.sh"
+source "$SCRIPT_DIR/lib/secrets.sh"
 source "$SCRIPT_DIR/lib/dokploy_api.sh"
 source "$SCRIPT_DIR/lib/compose.sh"
 source "$SCRIPT_DIR/lib/importer.sh"

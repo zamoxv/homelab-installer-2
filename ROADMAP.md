@@ -170,9 +170,158 @@ Detalle completo en Engram (`hli2/v2.2`).
 
 ### v2.3 — Servicios nuevos
 
-- [ ] Vaultwarden (`SIGNUPS_ALLOWED=false`, `ADMIN_TOKEN` como secreto).
-- [ ] Home Assistant (Container, red del host).
-- [ ] OpenCloud (validar clientes desktop/móvil y consumo de RAM).
+- [x] Vaultwarden (`SIGNUPS_ALLOWED=false`, `ADMIN_TOKEN` como secreto): imagen
+      oficial `vaultwarden/server`, un solo volumen de datos
+      (`/srv/appdata/vaultwarden/data` → `/data`), `DOMAIN=https://<dominio
+      pedido al usuario>`. `ADMIN_TOKEN` se genera como hash Argon2id PHC con
+      la propia CLI de Vaultwarden (`vaultwarden hash --preset owasp`,
+      corrida con `docker run --rm -it`, heredando la terminal del módulo:
+      esa CLI exige una TTY real, entra en pánico con stdin sin tty — ver
+      `modules/vaultwarden.sh`) y se guarda en `/etc/hli2/vaultwarden.env`
+      (root-only 0600). Todavía no se expone a Internet (eso es v2.4): se
+      despliega en la red `dokploy-network` con un dominio propio enrutado
+      por el Traefik de Dokploy (`dokploy_domain_ensure`,
+      `lib/dokploy_api.sh`), alcanzable solo desde la LAN.
+- [x] Home Assistant (Container, red del host): imagen oficial
+      `ghcr.io/home-assistant/home-assistant:stable`, `network_mode: host`
+      (necesario para mDNS/SSDP). A diferencia del compose de ejemplo
+      oficial, sin `privileged` ni dispositivos montados: el uso previsto
+      (Xiaomi, Samsung) es por red local, no por Bluetooth/USB del host.
+      Sin importación desde el HLI v1 (no lo tenía).
+- [x] OpenCloud (validar clientes desktop/móvil y consumo de RAM): imagen
+      `opencloudeu/opencloud-rolling:8.0.1` (plantilla oficial
+      `opencloud-eu/opencloud-compose`, recortada a lo esencial para v2.3:
+      sin CSP/apps/lista de contraseñas prohibidas ni SMTP). `OC_URL` exige
+      un dominio público fijo para funcionar del todo (cookies/login), pero
+      la exposición real es v2.4: el módulo pide igual el dominio futuro,
+      despliega con la contraseña guardada localmente como
+      `INITIAL_ADMIN_PASSWORD` (`/etc/hli2/opencloud.env`, la clave que usa
+      `secret_file_write`/`secret_get`) — el compose la referencia como
+      `${INITIAL_ADMIN_PASSWORD}` y la mapea a la variable que en verdad lee
+      OpenCloud, `IDM_ADMIN_PASSWORD=${INITIAL_ADMIN_PASSWORD}` (ver
+      `compose/opencloud/docker-compose.yml`) — y avisa que el login completo (y los
+      clientes de escritorio/móvil) solo funcionan una vez que el dominio
+      resuelva de verdad y tenga TLS. Almacenamiento POSIX plano bajo
+      `/srv/appdata/opencloud/{config,data}` (no named volumes de Docker),
+      con `user: "<uid>:<gid>"` de `SERVER_USER` para que quede legible desde
+      el host.
+- [x] Canal de secretos hacia Dokploy: `dokploy_compose_create_or_update`
+      (`lib/dokploy_api.sh`) ahora acepta un cuarto parámetro opcional
+      (`env_content`) que va al campo `env` de `compose.create`/
+      `compose.update` — el compose versionado solo referencia `${ADMIN_TOKEN}`
+      / `${INITIAL_ADMIN_PASSWORD}` (sintaxis de sustitución de Dokploy),
+      nunca el valor real. Revisión de seguridad propia (ver más abajo):
+      tanto el body de `dokploy_api_call` como este `env` pasan a `curl`/`jq`
+      por archivo temporal (`--data @archivo` / `--rawfile`), nunca por argv.
+- [x] Dominios vía Traefik: `dokploy_domain_ensure` (`lib/dokploy_api.sh`,
+      `domain.create`/`domain.byComposeId`) para enrutar Vaultwarden y
+      OpenCloud por nombre de dominio dentro de la red `dokploy-network`,
+      sin publicar ningún puerto de host — idempotente por
+      (composeId, serviceName, host).
+
+**Revisión de seguridad (post-implementación, propia de v2.3)**: al sumar el
+campo `env` de Dokploy (canal de secretos) se encontraron y corrigieron 2
+fugas antes de que llegaran a ejecutarse contra un servidor real: (1) el
+body de `dokploy_api_call` viajaba en el argv de `curl` (`-d "$body"`) —
+mismo problema que ya se había corregido para el token de la API en v2.2,
+pero reintroducido acá porque ahora el body puede contener un secreto
+(`ADMIN_TOKEN`/`INITIAL_ADMIN_PASSWORD`); se corrigió pasándolo por
+`--data @<archivo temporal>`. (2) el `env_content` se armaba con
+`jq --arg env "$valor"`, que pone el valor directo en el argv del proceso
+`jq`; se corrigió con `jq --rawfile env <archivo temporal>`. Además se
+confirmó A MANO (no solo por lectura de código) que `trap ... RETURN` en
+bash NO es local a la función donde se define — es un trap único y GLOBAL
+del shell que una función anidada que arme su propio `trap ... RETURN` pisa
+sin avisar — así que la limpieza de esos archivos temporales de secretos se
+hizo con `rm -f` explícito en cada punto de salida de la función, nunca con
+ese trap (se había intentado primero y se revirtió tras la prueba).
+
+**Revisión de seguridad — ronda 2 (fresh review posterior)**: encontró y se
+corrigieron 2 críticos más un hallazgo de endurecimiento, ninguno detectado
+por la ronda 1 porque el harness de tests de esa ronda no podía verlos
+estructuralmente (los tests se corrigieron junto con el código, ver
+`tests/`):
+1. **Secretos ilegibles por el usuario que invoca**: `/etc/hli2` se crea
+   0700 root:root, pero `secret_get`/`secret_file_exists`
+   (`lib/secrets.sh`) y `_dokploy_env_get`/`dokploy_api_configured`
+   (`lib/dokploy_api.sh`, mismo patrón desde v2.2 para
+   `DOKPLOY_ENV_FILE`) leían con `[[ -f ]]`/`sed` SIN privilegios —
+   `bootstrap.sh` corre como usuario normal, así que esas lecturas
+   fallaban siempre (permiso denegado para ATRAVESAR el directorio, no
+   por el modo del archivo en sí), y "reutilizar el token/credencial
+   existente" nunca funcionaba de verdad. Corregido: toda lectura de estos
+   archivos pasa por `priv_file_exists`/`priv_file_read`
+   (`lib/secrets.sh`, nuevas), que usan `sudo -n test -f --`/`sudo -n cat
+   --` y fallan cerrado (con mensaje claro por stderr) si `sudo -n` en sí
+   no funciona — nunca asumen "no existe" cuando en realidad "no se pudo
+   preguntar". De paso, el parseo de `CLAVE=valor` dejó de usar `sed`
+   con la clave interpolada en una regex: ahora es un `case` con
+   comparación EXACTA de la clave y valor = todo lo que sigue al PRIMER
+   `=`, nunca `source` del archivo. `secret_file_write` además rechaza
+   (sin escribir nada) cualquier línea que no tenga forma `CLAVE=valor`.
+2. **`\r` colado en el ADMIN_TOKEN** (`modules/vaultwarden.sh`): `docker
+   run -it` asigna una pty; con ONLCR cada `\n` que imprime `vaultwarden
+   hash` sale como `\r\n`, así que la línea capturada por
+   `tee`/`grep` (que solo parten por `\n`) terminaba con un `\r` de
+   sobra. La validación anterior solo anclaba el PRINCIPIO de la regex
+   (`^\$argon2id\$`), así que ese `\r` pasaba, se guardaba y se
+   desplegaba tal cual — el login de `/admin` habría fallado siempre
+   contra un Vaultwarden real (el hash real nunca coincide con uno con un
+   byte de más). Corregido: `tr -d '\r'` sobre la salida capturada, y una
+   regex ANCLADA A AMBOS LADOS (`^\$argon2id\$v=[0-9]+\$m=[0-9]+,t=[0-9]+,p=[0-9]+\$[A-Za-z0-9+/]+\$[A-Za-z0-9+/]+$`)
+   contra la forma completa de un PHC Argon2id, no solo el prefijo.
+3. **Namespacing de rutas overridables** (endurecimiento, no un bug
+   explotado): `LOG_DIR`/`STATE_DIR`/`STATE_FILE` (`lib/core.sh`),
+   `SECRETS_DIR` (`lib/secrets.sh`), `DOKPLOY_ENV_FILE`/
+   `DOKPLOY_STATE_FILE` (`lib/dokploy_api.sh`) y `DNS_PORT_*`
+   (`lib/dns.sh`) se overrideaban con nombres genéricos
+   (`: "${STATE_DIR:=...}"`) que una variable de entorno ambiental
+   cualquiera (heredada por casualidad en la sesión de quien corre
+   `bootstrap.sh`) podría secuestrar en silencio. Ahora el override real
+   requiere el prefijo `HLI2_` (ej. `HLI2_STATE_DIR`); sin él, se usa
+   siempre la ruta real de producción.
+4. **Dominios sin validar** (mejora, no crítico): `modules/vaultwarden.sh`
+   y `modules/opencloud.sh` ahora validan la FORMA del dominio pedido
+   (`hli2_valid_hostname`, `lib/core.sh`: etiquetas `[A-Za-z0-9-]`, sin
+   guion al principio/final, ≥2 etiquetas, largo total ≤253) antes de
+   usarlo, en vez de aceptar cualquier texto no vacío.
+
+Los tests `tests/test_secrets.sh` (lectura root-only simulada con un área
+0000 que solo el stub de `sudo` puede "desbloquear" temporalmente) y
+`tests/test_vaultwarden.sh` (docker stub emitiendo `\r\n` como una pty
+real) prueban que ambos críticos fallaban antes de estos cambios y pasan
+después — ver `tests/lib/harness.sh` (`STUB_ROOT_AREA`) y
+`tests/stubs/sudo`/`tests/stubs/docker`.
+
+**Pendiente de validar en un servidor real** (no se pudo probar contra un
+Dokploy real desde acá):
+- El campo `env` de `compose.create`/`compose.update` (documentado para
+  `compose.update`, asumido también en `compose.create`) y si Dokploy
+  sustituye `${CLAVE}` en el compose exactamente como un `.env` de Docker
+  Compose.
+- Que Dokploy escriba el campo `env` al `.env` **sin alterarlo**, y que las
+  comillas simples (`ADMIN_TOKEN='$argon2id$...'`,
+  `INITIAL_ADMIN_PASSWORD='...'`) eviten la interpolación de `$` como en
+  Docker Compose. Verificación: tras desplegar, `docker exec vaultwarden env
+  | grep ADMIN_TOKEN` debe mostrar el hash completo, sin comillas y con
+  todos sus `$`; y el login en `/admin` debe funcionar.
+- `domain.create`/`domain.byComposeId` contra un compose real: el shape
+  exacto de la respuesta, y si el servicio necesita explícitamente la red
+  externa `dokploy-network` (creada por Dokploy) o si Dokploy la inyecta solo.
+- Si `vaultwarden hash --preset owasp` corrido con `docker run --rm -it`
+  desde dentro de un módulo TUI de HLI 2 (bajo `dialog`) hereda la terminal
+  correctamente en todos los casos (probado solo con un stub de `docker` en
+  los tests, nunca contra el binario real).
+- Consumo de RAM de OpenCloud y comportamiento real de sus clientes de
+  escritorio/móvil contra un dominio sin TLS válido todavía.
+- Si `opencloud init` tolera bien corridas repetidas del módulo (el propio
+  proyecto documenta que falla en la segunda vez y por eso se ignora con
+  `|| true`, pero no se probó contra la imagen real).
+- Que `sudo -n` (usado ahora también para LEER `/etc/hli2/*`, no solo para
+  escribir) siga cacheado en el momento exacto en que un módulo llama a
+  `secret_get`/`dokploy_api_configured` — `bootstrap.sh` mantiene un
+  keepalive de fondo, pero nunca se probó el camino de lectura contra un
+  `sudo` real (solo contra el stub de tests).
 
 ### v2.4 — Exposición externa
 

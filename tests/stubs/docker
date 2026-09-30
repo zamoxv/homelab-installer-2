@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Stub de 'docker' para tests: nunca toca un daemon real. Despacha por el
+# subcomando/patrón de argumentos (igual que el stub de 'lsblk' descrito
+# para datadisk: switch sobre "$*"). Todo lo no reconocido: éxito silencioso
+# (exit 0), para no romper módulos que solo necesitan "docker existe/está
+# vivo" sin importarles el detalle.
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call docker "$@"
+
+case "$*" in
+  "run --rm -it vaultwarden/server /vaultwarden hash"*)
+    # Hash Argon2id PHC de mentira, con la forma real
+    # ($argon2id$v=...$m=...,t=...,p=...$salt$hash, sin '=' de relleno: un
+    # PHC de verdad usa base64 SIN padding) para que la validación anclada
+    # de modules/vaultwarden.sh la acepte tal cual.
+    #
+    # Terminado en '\r\n' A PROPÓSITO (no solo '\n'): así se reproduce lo
+    # que hace un 'docker run -it' real, que asigna una pty al proceso del
+    # contenedor — con ONLCR (el modo normal de una pty), cada '\n' que
+    # escribe el proceso sale convertido en '\r\n'. Sin este '\r' el test
+    # nunca podría haber visto el bug real (CRÍTICO 2, ronda 2 de
+    # revisión): la regex vieja solo anclaba el PRINCIPIO
+    # ('^\$argon2id\$'), así que un hash con un '\r' de sobra al final
+    # pasaba igual la validación.
+    # Formato REAL de 'vaultwarden hash' (src/main.rs, PR dani-garcia/vaultwarden#3289):
+    # el valor se imprime entre comillas simples: ADMIN_TOKEN='$argon2id$...'
+    printf '%s\r\n' "ADMIN_TOKEN='"'$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$RRTestfakeHashForTestingOnlyabc123'"'"
+    exit 0
+    ;;
+  "inspect -f "*"State.Running"*)
+    echo "true"
+    exit 0
+    ;;
+  "service inspect dokploy --format"*)
+    echo "dokploy/dokploy:v1.2.3-test"
+    exit 0
+    ;;
+  "service ls --filter"*"--format"*)
+    echo "1/1"
+    exit 0
+    ;;
+  "inspect "*)
+    # Existencia del contenedor/servicio: siempre "sí existe" en estos
+    # tests (los módulos de v2.3 no dependen de un estado "no instalado"
+    # previo al deploy).
+    exit 0
+    ;;
+  "info")
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac

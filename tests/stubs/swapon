@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stub de 'swapon': siempre "sin swap activa" (salida vacía, éxito). Evita
+# que system_disks() (lib/storage.sh) recoja swap real de la máquina que
+# corre los tests y vuelva el resultado no determinístico.
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call swapon "$@"
+exit 0

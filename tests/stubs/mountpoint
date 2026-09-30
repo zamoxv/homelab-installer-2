@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Stub de 'mountpoint': siempre "no es punto de montaje" (exit 1). Ningún
+# test necesita simular un disco ya montado.
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call mountpoint "$@"
+exit 1

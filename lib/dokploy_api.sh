@@ -25,6 +25,11 @@
 #     https://docs.dokploy.com/docs/api/environment
 #     environment.byProjectId  GET  ?projectId=...
 #     environment.one          GET  ?environmentId=...
+#   - domain.create / domain.byComposeId (v2.3, Vaultwarden/OpenCloud vía
+#     Traefik): https://docs.dokploy.com/docs/api/reference-domain
+#     domain.create      POST  { host, composeId?, applicationId?,
+#                                 serviceName?, port?, https?, certificateType? }
+#     domain.byComposeId GET   ?composeId=...
 #
 # INCERTIDUMBRE documentada (la doc pública no renderiza el JSON de
 # respuesta completo, solo status codes): no está confirmado si
@@ -39,18 +44,25 @@
 # verificado. VALIDAR contra un servidor real antes de confiar a ciegas.
 set -euo pipefail
 
-# ':=' (no '='): permite que un test apunte estas rutas a un archivo/dir de
-# prueba en vez de las reales, igual que SERVER_USER/MEDIA_GROUP en core.sh.
-: "${DOKPLOY_ENV_FILE:=/etc/hli2/dokploy.env}"
-: "${DOKPLOY_STATE_FILE:=$STATE_DIR/dokploy-compose-ids}"
+# 'HLI2_DOKPLOY_ENV_FILE'/'HLI2_DOKPLOY_STATE_FILE' (no los nombres pelados):
+# ver el comentario sobre namespacing en lib/core.sh (LOG_DIR/STATE_DIR) —
+# mismo motivo acá, para que un test los apunte a un archivo/dir de scratch
+# sin arriesgar que un "DOKPLOY_ENV_FILE" ambiental cualquiera secuestre en
+# silencio dónde vive el token real en producción.
+DOKPLOY_ENV_FILE="${HLI2_DOKPLOY_ENV_FILE:-/etc/hli2/dokploy.env}"
+DOKPLOY_STATE_FILE="${HLI2_DOKPLOY_STATE_FILE:-$STATE_DIR/dokploy-compose-ids}"
 
 # --- Configuración (token/URL) ---------------------------------------------
 
 # ¿Hay credenciales guardadas? No valida que funcionen (eso lo hace el
 # primer llamado real); solo confirma que el archivo existe y tiene los dos
-# campos.
+# campos. Vía priv_file_exists (lib/secrets.sh): $DOKPLOY_ENV_FILE vive en
+# /etc/hli2, 0700 root:root — un '[[ -f ]]' sin privilegios daría "no existe"
+# SIEMPRE (el usuario sin privilegios que corre bootstrap.sh ni siquiera
+# puede atravesar ese directorio), no solo cuando de verdad no hay
+# credenciales. Mismo hallazgo/corrección que secret_file_exists.
 dokploy_api_configured() {
-  [[ -f "$DOKPLOY_ENV_FILE" ]] || return 1
+  priv_file_exists "$DOKPLOY_ENV_FILE" || return 1
   local url token
   url="$(_dokploy_env_get DOKPLOY_URL)"
   token="$(_dokploy_env_get DOKPLOY_TOKEN)"
@@ -58,12 +70,22 @@ dokploy_api_configured() {
 }
 
 # Valor de una clave del env file, sin sourcearlo (evita ejecutar contenido
-# arbitrario si el archivo estuviera corrupto/manipulado). Una línea
-# "CLAVE=valor" por variable, sin comillas.
+# arbitrario si el archivo estuviera corrupto/manipulado). Lectura vía
+# priv_file_read (lib/secrets.sh: sudo -n cat, mismo motivo que arriba) y
+# comparación EXACTA de la clave con 'case' (no una regex de 'sed' armada
+# con la clave) — valor = todo lo que sigue al PRIMER '=' de la línea.
 _dokploy_env_get() {
-  local key="$1"
-  [[ -f "$DOKPLOY_ENV_FILE" ]] || return 1
-  sed -n "s/^${key}=//p" "$DOKPLOY_ENV_FILE" | head -n1
+  local key="$1" content line
+  content="$(priv_file_read "$DOKPLOY_ENV_FILE")" || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "${key}="*)
+        printf '%s' "${line#"${key}="}"
+        return 0
+        ;;
+    esac
+  done <<<"$content"
+  return 1
 }
 
 _dokploy_api_base() {
@@ -152,12 +174,27 @@ _dokploy_require_jq() {
 # cambio, el header con el token se pasa por STDIN a curl como un archivo de
 # configuración ('-K -': "lee opciones de config desde stdin", sintaxis
 # soportada desde curl 7.10, muy anterior a cualquier versión relevante acá)
-# — eso no aparece en el argv del proceso. El resto de las opciones (método,
-# URL, Content-Type, el body) no son secretas y siguen yendo por argv normal;
-# 'curl' permite mezclar '-K' con opciones sueltas en la misma invocación.
+# — eso no aparece en el argv del proceso. El MÉTODO y la URL no son
+# secretos y siguen yendo por argv normal.
+#
+# El BODY (desde v2.3 puede traer secretos embebidos: el campo "env" de
+# compose.create/update con ADMIN_TOKEN/INITIAL_ADMIN_PASSWORD, ver
+# dokploy_compose_create_or_update) tampoco va nunca por argv: se escribe a
+# un archivo temporal (creado por 'mktemp', 0600 por defecto — solo lo lee
+# el propio usuario) y se pasa a curl como '--data @<archivo>'. El argv de
+# curl solo contiene la RUTA del archivo, nunca su contenido. El archivo se
+# borra explícitamente en CADA punto de salida de la función (éxito o
+# error) — NUNCA con 'trap ... RETURN': se probó a mano (bash 5) que ese
+# trap NO es local a la función donde se define, sino un único trap GLOBAL
+# del shell que una llamada anidada (cualquier otra función que también
+# arme un 'trap ... RETURN', ej. dokploy_compose_create_or_update) pisa sin
+# avisar — con eso, el 'rm' de acá terminaría corriendo en el momento
+# equivocado (o nunca) según qué se haya llamado en el medio. Mismo motivo
+# ya documentado en modules/jellyfin.sh sobre por qué IMPORT_WORK_DIR usa un
+# trap EXIT a nivel de módulo en vez de un 'trap ... RETURN' por función.
 dokploy_api_call() {
   local method="$1" path="$2" body="${3:-}"
-  local base token url resp http_code out curl_args=()
+  local base token url resp http_code out curl_args=() body_file=""
 
   _dokploy_require_jq || return 1
   base="$(_dokploy_api_base)" || { echo "ERROR: la API de Dokploy no está configurada (falta $DOKPLOY_ENV_FILE). Corra la configuración primero." >&2; return 1; }
@@ -166,13 +203,17 @@ dokploy_api_call() {
 
   curl_args=(-sS --connect-timeout 10 --max-time 60 -w $'\n%{http_code}' -K - -X "$method")
   if [[ -n "$body" ]]; then
-    curl_args+=(-H "Content-Type: application/json" -d "$body")
+    body_file="$(mktemp)"
+    printf '%s' "$body" > "$body_file"
+    curl_args+=(-H "Content-Type: application/json" --data "@${body_file}")
   fi
 
   if ! resp="$(curl "${curl_args[@]}" "$url" <<<"header = \"x-api-key: ${token}\"" 2>/dev/null)"; then
+    rm -f "$body_file"
     echo "ERROR: fallo de red llamando a Dokploy ($method $path)." >&2
     return 1
   fi
+  rm -f "$body_file"
 
   http_code="${resp##*$'\n'}"
   out="${resp%$'\n'*}"
@@ -276,31 +317,71 @@ dokploy_compose_id_for() {
 # Crea (o actualiza si ya existe) el compose $app_name en $environment_id con
 # el contenido de $compose_file, y lo despliega. Idempotente. Imprime el
 # composeId final.
+#
+# $4 (opcional) = contenido del campo "env" de Dokploy: variables
+# "CLAVE=valor" (una por línea) que Dokploy sustituye en el compose vía
+# ${CLAVE} al desplegar (mismo mecanismo que un archivo .env junto al
+# docker-compose.yml). Es el canal para secretos (ADMIN_TOKEN de
+# Vaultwarden, INITIAL_ADMIN_PASSWORD de OpenCloud...): el compose
+# versionado solo contiene "${CLAVE}" como referencia, nunca el valor real
+# (ver services/vaultwarden.conf y compose/vaultwarden/docker-compose.yml).
+# Campo "env" documentado en compose.update (docs.dokploy.com/docs/api/
+# reference-compose, 2026-09-29); se asume el mismo campo válido también en
+# compose.create (no confirmado explícitamente en la doc pública — INCERTIDUMBRE
+# a validar en el servidor real, igual que otros campos de este cliente).
 dokploy_compose_create_or_update() {
-  local environment_id="$1" app_name="$2" compose_file="$3"
-  local compose_content composeId body resp
+  local environment_id="$1" app_name="$2" compose_file="$3" env_content="${4:-}"
+  local compose_content composeId body resp env_file rc=0
 
   [[ -f "$compose_file" ]] || { echo "ERROR: no existe el compose renderizado: $compose_file" >&2; return 1; }
   compose_content="$(cat "$compose_file")"
 
+  # 'env_content' puede traer un secreto (ADMIN_TOKEN, INITIAL_ADMIN_PASSWORD...):
+  # se lo pasa a 'jq' con '--rawfile' desde un archivo temporal (0600 por
+  # 'mktemp'), NUNCA con '--arg' desde la variable — '--arg' pondría el
+  # secreto directo en el argv del proceso 'jq' (visible por 'ps'/'/proc'
+  # mientras corre), exactamente lo que este proyecto evita para el token de
+  # la API de Dokploy (ver el comentario de dokploy_api_call). El archivo se
+  # borra EXPLÍCITAMENTE al final (rc + un solo punto de salida), nunca con
+  # 'trap ... RETURN': se comprobó a mano que ese trap es GLOBAL al shell
+  # (una función anidada que arma su propio 'trap ... RETURN', como
+  # dokploy_api_call, lo pisa sin avisar) — ver el comentario de
+  # dokploy_api_call para el detalle de la prueba.
+  env_file="$(mktemp)"
+  printf '%s' "$env_content" > "$env_file"
+
   composeId="$(dokploy_compose_id_for "$app_name")" || composeId=""
 
   if [[ -n "$composeId" ]]; then
-    body="$(jq -n --arg id "$composeId" --arg cf "$compose_content" \
-      '{composeId: $id, composeFile: $cf, sourceType: "raw", composeType: "docker-compose"}')"
-    dokploy_api_post "compose.update" "$body" >/dev/null || return 1
+    body="$(jq -n --arg id "$composeId" --arg cf "$compose_content" --rawfile env "$env_file" \
+      '{composeId: $id, composeFile: $cf, sourceType: "raw", composeType: "docker-compose"} + (if $env != "" then {env: $env} else {} end)')"
+    dokploy_api_post "compose.update" "$body" >/dev/null || rc=1
   else
-    body="$(jq -n --arg name "$app_name" --arg env "$environment_id" --arg cf "$compose_content" \
-      '{name: $name, appName: $name, environmentId: $env, composeType: "docker-compose", sourceType: "raw", composeFile: $cf}')"
-    resp="$(dokploy_api_post "compose.create" "$body")" || return 1
-    composeId="$(jq -r '.composeId // .id // empty' <<<"$resp" 2>/dev/null)" || composeId=""
-    if [[ -z "$composeId" ]]; then
-      echo "ERROR: compose.create no devolvió composeId para '$app_name'. Respuesta: ${resp:0:300}" >&2
-      return 1
+    body="$(jq -n --arg name "$app_name" --arg env_id "$environment_id" --arg cf "$compose_content" --rawfile env "$env_file" \
+      '{name: $name, appName: $name, environmentId: $env_id, composeType: "docker-compose", sourceType: "raw", composeFile: $cf} + (if $env != "" then {env: $env} else {} end)')"
+    if resp="$(dokploy_api_post "compose.create" "$body")"; then
+      composeId="$(jq -r '.composeId // .id // empty' <<<"$resp" 2>/dev/null)" || composeId=""
+      if [[ -z "$composeId" ]]; then
+        echo "ERROR: compose.create no devolvió composeId para '$app_name'. Respuesta: ${resp:0:300}" >&2
+        rc=1
+      else
+        _dokploy_compose_state_set "$app_name" "$composeId"
+        # Si el 'env' no se pudo mandar en compose.create (campo no
+        # soportado ahí), reintentarlo con un compose.update inmediato:
+        # nunca dejar un compose recién creado sin sus variables de entorno
+        # si el llamador pidió alguna.
+        if [[ -n "$env_content" ]]; then
+          body="$(jq -n --arg id "$composeId" --rawfile env "$env_file" '{composeId: $id, env: $env}')"
+          dokploy_api_post "compose.update" "$body" >/dev/null || rc=1
+        fi
+      fi
+    else
+      rc=1
     fi
-    _dokploy_compose_state_set "$app_name" "$composeId"
   fi
 
+  rm -f "$env_file"
+  [[ "$rc" -eq 0 ]] || return 1
   printf '%s' "$composeId"
 }
 
@@ -310,10 +391,11 @@ dokploy_compose_deploy() {
   dokploy_api_post "compose.deploy" "$body" >/dev/null
 }
 
-# Crea/actualiza + despliega en un paso. Imprime el composeId.
+# Crea/actualiza (con 'env' opcional, ver dokploy_compose_create_or_update) +
+# despliega en un paso. Imprime el composeId.
 dokploy_compose_deploy_full() {
-  local environment_id="$1" app_name="$2" compose_file="$3" composeId
-  composeId="$(dokploy_compose_create_or_update "$environment_id" "$app_name" "$compose_file")" || return 1
+  local environment_id="$1" app_name="$2" compose_file="$3" env_content="${4:-}" composeId
+  composeId="$(dokploy_compose_create_or_update "$environment_id" "$app_name" "$compose_file" "$env_content")" || return 1
   dokploy_compose_deploy "$composeId" || return 1
   printf '%s' "$composeId"
 }
@@ -322,4 +404,54 @@ dokploy_compose_delete() {
   local composeId="$1" delete_volumes="${2:-true}" body
   body="$(jq -n --arg id "$composeId" --argjson dv "$delete_volumes" '{composeId: $id, deleteVolumes: $dv}')"
   dokploy_api_post "compose.delete" "$body" >/dev/null
+}
+
+# --- Dominios (Traefik vía Dokploy) -----------------------------------------
+#
+# Fuente (2026-09-29, docs.dokploy.com/docs/api/reference-domain +
+# docs.dokploy.com/docs/core/docker-compose/domains): domain.create admite
+# {host, composeId, serviceName, port, https, certificateType}; para un
+# compose, el servicio debe estar en la red externa "dokploy-network" (la
+# crea Dokploy) para que su Traefik lo alcance — ver el bloque "networks" en
+# compose/vaultwarden/docker-compose.yml y compose/opencloud/docker-compose.yml.
+# INCERTIDUMBRE: la doc pública no confirma el shape exacto de la respuesta
+# de domain.create ni de domain.byComposeId (no se pudo probar contra un
+# Dokploy real desde acá) — validar en el servidor real antes de asumir que
+# el parseo de abajo es correcto.
+#
+# Encuentra un dominio ya creado para $1 (composeId) + $2 (serviceName) + $3
+# (host). Imprime domainId si existe, vacío + return 1 si no (o si
+# domain.byComposeId falla, ej. por no estar soportado en esta versión de
+# Dokploy: se trata como "no hay dominio" y se intenta crear, nunca se
+# asume éxito sin confirmar).
+_dokploy_domain_find() {
+  local compose_id="$1" service_name="$2" host="$3" all
+  all="$(dokploy_api_get "domain.byComposeId?composeId=${compose_id}")" || return 1
+  jq -r --arg svc "$service_name" --arg host "$host" \
+    'map(select(.serviceName == $svc and .host == $host)) | first.domainId // first.id // empty' \
+    <<<"$all" 2>/dev/null
+}
+
+# Crea (si no existe ya) el dominio $3 (host) para el servicio $2 dentro del
+# compose $1, apuntando al puerto $4. $5 = "true"/"false" (https), $6 =
+# certificateType ("letsencrypt" | "none" | "custom"; default "none": sin
+# resolución pública todavía, ver v2.4 en el roadmap). Idempotente por
+# (composeId, serviceName, host). Best-effort: si domain.byComposeId no está
+# disponible, igual intenta domain.create (Dokploy puede rechazar un
+# duplicado por su cuenta; no es motivo para abortar el despliegue del
+# servicio en sí).
+dokploy_domain_ensure() {
+  local compose_id="$1" service_name="$2" host="$3" port="$4" https="${5:-false}" cert_type="${6:-none}"
+  local existing body
+
+  existing="$(_dokploy_domain_find "$compose_id" "$service_name" "$host")" || existing=""
+  if [[ -n "$existing" ]]; then
+    printf '%s' "$existing"
+    return 0
+  fi
+
+  body="$(jq -n --arg host "$host" --arg cid "$compose_id" --arg svc "$service_name" \
+    --argjson port "$port" --argjson https "$https" --arg cert "$cert_type" \
+    '{host: $host, composeId: $cid, serviceName: $svc, port: $port, https: $https, certificateType: $cert}')"
+  dokploy_api_post "domain.create" "$body" >/dev/null
 }

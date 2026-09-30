@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Stub de 'dialog' para tests: nunca dibuja una TUI real. Reproduce la
+# convención real de 'dialog' que ya asumen msg()/confirm()/input_box()/
+# password_box() en lib/core.sh (redirección "3>&1 1>&2 2>&3"): el valor
+# elegido/tipeado se imprime por STDERR, no por stdout.
+#
+# Las respuestas se consumen de colas FILE-BASED (una por tipo de widget,
+# ver DIALOG_*_QUEUE en tests/lib/harness.sh): cada invocación es un proceso
+# nuevo, así que el "siguiente valor" tiene que sobrevivir en un archivo
+# entre llamadas (mismo principio que el contador de huella de disco en el
+# stub de 'lsblk' para datadisk). Si una cola se queda sin líneas, se
+# interpreta como "Cancelar" (exit 1) en vez de romper con un error: un test
+# que pidió menos respuestas de las que el módulo termina consumiendo debe
+# fallar de forma clara (el módulo verá un Cancelar inesperado), no colgarse.
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call dialog "$@"
+
+# Saca y devuelve por stdout la primera línea de la cola $1 (la borra de la
+# cola). Vacío + return 1 si la cola no existe o está vacía.
+_dialog_pop() {
+  local queue="$1" line
+  [[ -f "$queue" ]] || return 1
+  [[ -s "$queue" ]] || return 1
+  line="$(head -n1 "$queue")"
+  tail -n +2 "$queue" > "${queue}.tmp" && mv "${queue}.tmp" "$queue"
+  printf '%s' "$line"
+}
+
+widget=""
+for a in "$@"; do
+  case "$a" in
+    --msgbox|--yesno|--inputbox|--passwordbox|--menu|--textbox|--checklist)
+      widget="$a"
+      break
+      ;;
+  esac
+done
+
+case "$widget" in
+  --msgbox|--textbox)
+    exit 0
+    ;;
+  --yesno)
+    ans="$(_dialog_pop "${DIALOG_YESNO_QUEUE:-/dev/null}")" || ans="no"
+    [[ "$ans" == "yes" ]] && exit 0 || exit 1
+    ;;
+  --inputbox)
+    ans="$(_dialog_pop "${DIALOG_INPUTBOX_QUEUE:-/dev/null}")" || exit 1
+    printf '%s' "$ans" >&2
+    exit 0
+    ;;
+  --passwordbox)
+    ans="$(_dialog_pop "${DIALOG_PASSWORDBOX_QUEUE:-/dev/null}")" || exit 1
+    printf '%s' "$ans" >&2
+    exit 0
+    ;;
+  --menu|--checklist)
+    ans="$(_dialog_pop "${DIALOG_MENU_QUEUE:-/dev/null}")" || exit 1
+    printf '%s' "$ans" >&2
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac

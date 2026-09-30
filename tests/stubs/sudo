@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# Stub de 'sudo' para tests: NUNCA escala privilegios de verdad. Registra
+# cada invocación completa (con log_call, ANTES de decidir qué hacer — así
+# un assert puede confirmar que un secreto nunca apareció acá ni aunque el
+# subcomando se ignore) y despacha por subcomando:
+#
+#   true                        -> éxito, sin más (hli_docker_presence,
+#                                   priv_file_exists).
+#   sh -c '...'                 -> se corre de verdad (solo lectura, ej.
+#                                   'command -v docker'; ver
+#                                   hli_docker_presence en lib/core.sh).
+#   docker ...                  -> delega al stub de 'docker' (hli_docker()
+#                                   es literalmente 'sudo -n docker "$@"').
+#   blkid ...                   -> imprime un UUID falso fijo.
+#   test|cat|stat                -> lectura "privilegiada" (priv_file_exists/
+#                                   priv_file_read, lib/secrets.sh; 'stat'
+#                                   solo lo usan los tests para inspeccionar
+#                                   el modo del archivo): se ejecuta de
+#                                   verdad, con el área root-only
+#                                   (STUB_ROOT_AREA) destrabada solo durante
+#                                   esta llamada (ver _stub_unlock_root_area/
+#                                   _stub_relock_root_area en _stublib.sh).
+#   tee|mkdir|install|cp|touch|rm
+#                                -> se ejecutan DE VERDAD, pero solo si TODOS
+#                                   los argumentos con forma de ruta caen
+#                                   bajo $STUB_SAFE_ROOT (ver
+#                                   _stub_all_paths_safe en _stublib.sh); si
+#                                   apuntan a cualquier otra ruta (ej. el
+#                                   /etc/fstab real), se descartan sin tocar
+#                                   nada (mismo resultado que pedía la
+#                                   consigna para datadisk: 'tee' consume y
+#                                   descarta stdin). También destraban/
+#                                   retraban STUB_ROOT_AREA alrededor de la
+#                                   operación real.
+#   chown|chmod|systemctl|apt|apt-get|needrestart|*
+#                                -> no-op: nunca se ejecutan de verdad (son
+#                                   mutaciones de privilegios/servicios del
+#                                   sistema, no de archivos de scratch).
+#
+# IMPORTANTE: ninguna rama que necesite destrabar/retrabar STUB_ROOT_AREA usa
+# 'exec' — 'exec' reemplaza el proceso y el re-lock de después nunca
+# correría (STUB_ROOT_AREA quedaría destrabado para siempre, rompiendo la
+# simulación para cualquier acceso plano posterior).
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call sudo "$@"
+
+args=("$@")
+# Sacar un '-n' inicial (non-interactive): no cambia el subcomando real.
+if [[ "${args[0]:-}" == "-n" ]]; then
+  args=("${args[@]:1}")
+fi
+
+sub="${args[0]:-}"
+
+case "$sub" in
+  true)
+    exit 0
+    ;;
+  sh)
+    exec "${args[@]}"
+    ;;
+  docker)
+    unset -v 'args[0]'
+    exec docker "${args[@]}"
+    ;;
+  blkid)
+    echo "UUID-TEST"
+    exit 0
+    ;;
+  test)
+    if _stub_all_paths_safe "${args[@]:1}"; then
+      _stub_unlock_root_area
+      test "${args[@]:1}"
+      rc=$?
+      _stub_relock_root_area
+      exit "$rc"
+    fi
+    exit 1
+    ;;
+  cat|stat)
+    if _stub_all_paths_safe "${args[@]:1}"; then
+      _stub_unlock_root_area
+      "$sub" "${args[@]:1}"
+      rc=$?
+      _stub_relock_root_area
+      exit "$rc"
+    fi
+    exit 1
+    ;;
+  tee|mkdir|install|cp|touch)
+    if _stub_all_paths_safe "${args[@]:1}"; then
+      _stub_unlock_root_area
+      if [[ "$sub" == "install" ]]; then
+        # 'install -o root -g root ...': en producción sudo de verdad
+        # eleva a root y esto funciona; en el test el usuario NO es root, y
+        # 'install' FALLA de verdad si se le pide cambiar el dueño a uno
+        # distinto (comprobado a mano: "Operación no permitida", incluso
+        # sobre una ruta de scratch donde el usuario del test es dueño).
+        # Se sacan '-o <valor>'/'-g <valor>' antes de ejecutar de verdad:
+        # el archivo/directorio se crea igual, con el MISMO modo (-m), solo
+        # que dueño por el usuario del test en vez de root — suficiente
+        # para lo que estos tests verifican (existencia, modo, contenido),
+        # nunca dueño real.
+        filtered=() j=1
+        while [[ $j -lt ${#args[@]} ]]; do
+          case "${args[$j]}" in
+            -o|-g) j=$((j + 2)) ;;
+            *) filtered+=("${args[$j]}"); j=$((j + 1)) ;;
+          esac
+        done
+        install "${filtered[@]}"
+        rc=$?
+      else
+        "${args[@]}"
+        rc=$?
+      fi
+      _stub_relock_root_area
+      exit "$rc"
+    else
+      # Ruta fuera del scratch de test: jamás se toca. SOLO 'tee' necesita
+      # además consumir y descartar stdin (viene de un pipe real, ej.
+      # '... | sudo tee /etc/fstab' — sin leerlo, el extremo escritor de
+      # ese pipe quedaría bloqueado esperando que alguien lea). 'mkdir'/
+      # 'install'/'cp'/'touch' NUNCA leen stdin en uso normal: intentar
+      # 'cat' igual bloquearía este stub para siempre si stdin queda
+      # heredado de una terminal interactiva en vez de estar ya cerrado
+      # (comprobado a mano: colgaba corriendo el módulo directo en una
+      # terminal, aunque no bajo el runner de tests, cuyo stdin ya viene
+      # cerrado).
+      if [[ "$sub" == "tee" ]]; then
+        cat >/dev/null 2>&1 || true
+      fi
+      exit 0
+    fi
+    ;;
+  rm)
+    if _stub_all_paths_safe "${args[@]:1}"; then
+      _stub_unlock_root_area
+      "${args[@]}"
+      rc=$?
+      _stub_relock_root_area
+      exit "$rc"
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac

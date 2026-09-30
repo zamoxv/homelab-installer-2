@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Stub de 'systemctl' (invocación directa, sin sudo): siempre "no
+# disponible" (exit 1). Ningún módulo probado depende de systemd de verdad;
+# los llamadores que importan (ver lib/services.sh, lib/dns.sh) ya toleran
+# este resultado.
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call systemctl "$@"
+exit 1
