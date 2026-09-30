@@ -17,6 +17,7 @@ source "$(dirname "$0")/_stublib.sh"
 log_call curl "$@"
 
 method="GET"
+stdin_config=""
 data_file=""
 url=""
 args=("$@")
@@ -31,6 +32,11 @@ while [[ $i -lt $n ]]; do
     --data)
       i=$((i + 1))
       data_file="${args[$i]#@}"
+      ;;
+    -K)
+      i=$((i + 1))
+      # '-K -': configuración (header con el token) por stdin.
+      [[ "${args[$i]}" == "-" ]] && stdin_config="$(cat)"
       ;;
   esac
   i=$((i + 1))
@@ -56,6 +62,12 @@ if [[ -n "${STUB_HTTP_BODIES_LOG:-}" ]]; then
 fi
 
 http_code=200
+# STUB_CURL_REJECT_TOKEN=<token>: si el header recibido por stdin (-K -)
+# trae ese token, responde 401 (token revocado/incorrecto).
+if [[ -n "${STUB_CURL_REJECT_TOKEN:-}" ]] && grep -qF -- "$STUB_CURL_REJECT_TOKEN" <<<"${stdin_config:-}"; then
+  printf '{"message":"Unauthorized"}\n401'
+  exit 0
+fi
 resp="{}"
 
 case "$url" in

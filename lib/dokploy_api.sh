@@ -200,7 +200,7 @@ _dokploy_require_jq() {
 _dokploy_err() {
   local message="$1"
   local detail="${2:-}"
-  _dokploy_err "${message}${detail:+ $detail}"
+  echo "ERROR: ${message}${detail:+ $detail}" >&2
   log "ERROR API Dokploy: ${message}" 2>/dev/null || true
 }
 
@@ -230,6 +230,10 @@ dokploy_api_call() {
   http_code="${resp##*$'\n'}"
   out="${resp%$'\n'*}"
 
+  if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
+    _dokploy_err "Dokploy rechazó el token de la API (HTTP $http_code): puede haber sido revocado o regenerado. Configúrelo de nuevo en Herramientas -> 'Configurar API de Dokploy'."
+    return 1
+  fi
   if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
     _dokploy_err "Dokploy respondió HTTP ${http_code:-desconocido} en $method $path." "Respuesta: ${out:0:500}"
     return 1

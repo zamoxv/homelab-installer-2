@@ -93,3 +93,16 @@ test_dokploy_project_create_on_fresh_dokploy() {
     [[ "$env_id" == "env-1" ]] || { echo "environmentId inesperado: [$env_id]"; exit 1; }
   ) || { fail "no se pudo resolver el ambiente tras crear el proyecto en un Dokploy vacío"; return 1; }
 }
+
+# Regresión: un reemplazo automático convirtió el 'echo' interno de
+# _dokploy_err en una llamada a sí misma (recursión infinita: cualquier
+# error de la API terminaba el proceso con un desborde de pila, código 139).
+# Un error de la API debe devolver 1 y dejar el mensaje en stderr y en el log.
+test_dokploy_api_error_reports_and_returns() {
+  local rc=0 err
+  err="$( ( source "$REPO_ROOT/lib/core.sh"; _dokploy_err "mensaje de prueba" "detalle-secreto" ) 2>&1 >/dev/null )" || rc=$?
+  [[ $rc -eq 0 ]] || { fail "_dokploy_err terminó con código $rc"; return 1; }
+  [[ "$err" == *"mensaje de prueba"* ]] || { fail "el error no llegó a stderr: [$err]"; return 1; }
+  assert_file_contains "$LOG_DIR/install.log" "mensaje de prueba" "error en el log" || return 1
+  assert_file_not_contains "$LOG_DIR/install.log" "detalle-secreto" "el detalle (posible secreto) no va al log" || return 1
+}
