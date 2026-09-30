@@ -97,6 +97,19 @@ _dp_version_le() {
 
 # ¿El SO ($1=ID, $2=VERSION_ID de /etc/os-release) es una versión
 # oficialmente soportada por Dokploy? Ubuntu <= 24.04 o Debian <= 12.
+# Ofrece desactivar el aviso de nueva versión de Ubuntu (do-release-upgrade):
+# Dokploy solo soporta hasta 24.04, así que pasar a una versión más nueva
+# por error rompería la plataforma. Pregunta (no asume); idempotente.
+_dp_offer_hold_release_upgrade() {
+  local f="${HLI2_RELEASE_UPGRADES_FILE:-/etc/update-manager/release-upgrades}"
+  [[ -f "$f" ]] || return 0
+  grep -qE '^Prompt=never' "$f" 2>/dev/null && return 0
+  confirm "Dokploy solo está soportado hasta Ubuntu 24.04.\n\n¿Desactivar el aviso de actualización a una nueva versión de Ubuntu?\n\n(Las actualizaciones de seguridad de 24.04 siguen llegando normalmente hasta 2029. Cambiar de versión solo será posible a mano con 'do-release-upgrade'.)" \
+    || return 0
+  sudo sed -i 's/^Prompt=.*/Prompt=never/' "$f" || { msg "No se pudo modificar $f."; return 0; }
+  log "Aviso de nueva versión de Ubuntu desactivado (Prompt=never en $f)."
+}
+
 _dp_os_supported() {
   local id="$1" version="$2"
   case "$id" in
@@ -425,16 +438,23 @@ _dokploy_main() {
   # --- Pre-chequeos, ANTES de descargar nada ---
 
   local os_id="" os_version=""
-  if [[ -f /etc/os-release ]]; then
+  local os_release="/etc/os-release"
+  if [[ -f "$os_release" ]]; then
     # Best-effort: un os-release corrupto/no sourceable no debe tumbar el
     # módulo, solo dejar os_id/os_version vacíos (se tratan como "no
     # soportado" más abajo, que es el lado seguro).
-    os_id="$(. /etc/os-release && echo "${ID:-}")" || true
-    os_version="$(. /etc/os-release && echo "${VERSION_ID:-}")" || true
+    os_id="$(. "$os_release" && echo "${ID:-}")" || true
+    os_version="$(. "$os_release" && echo "${VERSION_ID:-}")" || true
   fi
   if ! _dp_os_supported "${os_id:-}" "${os_version:-0}"; then
-    confirm "Este sistema (${os_id:-desconocido} ${os_version:-N/D}) no es una versión oficialmente soportada por Dokploy.\n\nSoporte oficial: Ubuntu <= 24.04 o Debian <= 12.\n\n¿Instalar de todos modos, bajo su propio riesgo?" \
-      || { msg "Instalación de Dokploy cancelada."; return 0; }
+    # BLOQUEO, no advertencia (validado en hardware real, Ubuntu 26.04): el
+    # instalador oficial fija Docker 28.5.0 porque Docker 29 dejó de aceptar
+    # la versión de API que usa el Traefik de Dokploy (el ruteo deja de
+    # funcionar). Docker no publica 28.5.0 para versiones de Ubuntu
+    # posteriores a las soportadas, así que la instalación falla a mitad de
+    # camino; forzar Docker 29 dejaría Traefik roto.
+    msg "Este sistema (${os_id:-desconocido} ${os_version:-N/D}) no está soportado por Dokploy.\n\nDokploy necesita Docker 28.5.0 (Docker 29 es incompatible con su Traefik), y Docker no publica esa versión para este sistema.\n\nSoportados: Ubuntu 24.04 LTS o anterior, Debian 12 o anterior.\nReinstale con Ubuntu Server 24.04 LTS."
+    return 1
   fi
 
   # 80/443/3000 quedan literales A PROPÓSITO (no vienen del registro): no son
@@ -592,6 +612,15 @@ _dokploy_main() {
     msg "La instalación de Dokploy terminó con errores (código $rc).\n\nRevise el log:\n$LOG_DIR/dokploy.log"
     return 1
   fi
+
+  # El instalador oficial no se detiene si falla la instalación de Docker
+  # (sigue y falla más adelante, o no): verificar explícitamente.
+  if [[ "$(hli_docker_presence)" != "present" ]] || ! hli_docker info >/dev/null 2>&1; then
+    msg "El instalador de Dokploy terminó, pero Docker no quedó instalado o no responde.\n\nCausa habitual: la versión de Docker que exige Dokploy no está disponible para este sistema.\n\nRevise el log:\n$LOG_DIR/dokploy.log"
+    return 1
+  fi
+
+  _dp_offer_hold_release_upgrade
 
   # --- Post-instalación ---
 
