@@ -1,0 +1,148 @@
+# Validación de HLI 2 en equipos de prueba
+
+Guía para probar v2.0–v2.3 en hardware real **antes** de tocar el M70q
+(que sirve el DNS y los servicios de la casa).
+
+| Equipo | Rol |
+|---|---|
+| **T400** | Banco principal: todas las pruebas |
+| **X230** | Jellyfin con aceleración por hardware (`/dev/dri`) y módulo `power` (tapa) |
+| **X201** | Repetición rápida de lo que falle, o segunda prueba de `power` |
+
+Cada prueba tiene un **resultado esperado**. Anote lo que no coincida y
+adjunte `/var/log/hli2/<módulo>.log`.
+
+---
+
+## 1. Preparar cada equipo
+
+1. Instalar **Ubuntu Server 24.04.x** (`live-server-amd64.iso`, de
+   <https://releases.ubuntu.com/24.04/>; verificar el SHA256 contra `SHA256SUMS`).
+   - Disco interno con **LVM** (opción por defecto): el instalador deja parte
+     del VG sin asignar, y eso prueba la expansión automática.
+   - Marcar **Instalar OpenSSH server**.
+2. Conectarlo por cable a la red de la casa (`10.20.30.x`). Eso prueba la
+   protección de v2.1 contra el choque entre Docker Swarm (`10.0.0.0/8`) y la LAN.
+3. **No** configurar el router para usar este equipo como DNS: así AdGuard de
+   prueba no afecta a la casa.
+
+### Discos USB para `datadisk`
+
+Hacen falta **dos discos o pendrives USB** que se puedan borrar:
+
+- **USB-A**: vacío (o con datos descartables).
+- **USB-B**: con una partición y un archivo, para probar el aviso de
+  particiones. Prepararlo en el equipo de prueba (verificar la letra con `lsblk`):
+
+```bash
+sudo parted /dev/sdX --script mklabel gpt mkpart datos ext4 1MiB 100%
+sudo mkfs.ext4 -L datos /dev/sdX1
+sudo mount /dev/sdX1 /mnt && echo prueba | sudo tee /mnt/archivo && sudo umount /mnt
+```
+
+Anotar qué informa cada uno: `lsblk -dno NAME,SIZE,SERIAL,WWN,MODEL`. Si un
+USB no informa serie ni WWN, la huella de `datadisk` depende solo del tamaño
+(limitación conocida, ver ROADMAP): es útil saberlo.
+
+## 2. Copiar el HLI 2 al equipo
+
+Desde el Fedora (el repo no tiene remoto todavía):
+
+```bash
+git -C ~/dev/hli2 bundle create /tmp/hli2.bundle --all
+scp /tmp/hli2.bundle <usuario>@<ip-equipo>:
+```
+
+En el equipo:
+
+```bash
+git clone hli2.bundle hli2 && cd hli2 && bash bootstrap.sh
+```
+
+Para actualizar después de una corrección: repetir el `bundle`/`scp` y, en el
+equipo, `git -C hli2 pull ~/hli2.bundle main`.
+
+---
+
+## 3. Pruebas
+
+### v2.0 — Host base (T400)
+
+| # | Prueba | Resultado esperado |
+|---|---|---|
+| 1 | Instalación completa (módulos por defecto) | Termina; si algo falla, lo lista al final con la ruta del log |
+| 2 | `storage` con VG libre | Ofrece expandir; tras aceptar, `df -h /` muestra todo el disco. Re-ejecutar: no ofrece nada |
+| 3 | En cualquier aviso de `storage`, presionar **ESC** | El módulo sigue; la instalación completa no se corta |
+| 4 | `datadisk` con USB-A y USB-B conectados | Lista ambos; **nunca** el disco interno |
+| 5 | `datadisk` → elegir **USB-B** (disco entero) | Avisa que tiene particiones y ofrece solo cancelar/formatear. Cancelar |
+| 6 | `datadisk` → elegir **la partición de USB-B** → "usar" | Monta en `/srv/mediaN` sin borrar; `archivo` sigue ahí. Entrada en `/etc/fstab` por UUID con `nofail` |
+| 7 | **Cambio de disco en caliente**: `datadisk` → elegir USB-A y, *antes de confirmar*, desconectarlo y conectar otro USB en el mismo puerto | Aborta con "ya no está disponible o cambió"; **no formatea** el otro disco |
+| 8 | `datadisk` → USB-A → formatear | Tres confirmaciones; queda montado en el siguiente `/srv/mediaN` |
+| 9 | Re-ejecutar 8 con el mismo disco | `/etc/fstab` no duplica la línea |
+| 10 | `samba` | Un recurso por cada `/srv/media*` + backups; `testparm -s` sin errores; se ve desde el Fedora |
+| 11 | Reiniciar sin los USB conectados | Arranca igual (`nofail`); `status` muestra Samba activo |
+
+Para la prueba 7: si los dos USB son del mismo modelo y tamaño y no informan
+serie, el cambio **no** se detectará (limitación conocida). En ese caso,
+anotarlo y repetir con dos USB distintos.
+
+### v2.1 — Dokploy (T400)
+
+| # | Prueba | Resultado esperado |
+|---|---|---|
+| 12 | Módulo `dokploy` | Pregunta IP y versión; el resumen muestra un pool `172.20.0.0/16` (porque la LAN es `10.20.30.0/24`) |
+| 13 | Tras instalar | `docker info` → Swarm activo; `docker network inspect ingress` fuera de `10.x`; panel en `http://<ip>:3000` |
+| 14 | Crear la cuenta admin en el panel | Inmediatamente (el primero en entrar queda como admin) |
+| 15 | Re-ejecutar `dokploy` | **Solo** ofrece actualizar o nada; nunca reinstala |
+| 16 | `sudo systemctl stop docker.socket docker` y re-ejecutar | Aborta: "no se pudo determinar el estado". Después: `sudo systemctl start docker` |
+
+### v2.2 — Servicios actuales (T400; Jellyfin también en X230)
+
+Generar el token en el panel de Dokploy: Configuración → Perfil → API/CLI.
+
+| # | Prueba | Resultado esperado |
+|---|---|---|
+| 17 | Primer servicio (p. ej. `qbittorrent`) | Pide el token; `sudo ls -l /etc/hli2/` → `dokploy.env` con `-rw------- root` |
+| 18 | Canary | Se ejecuta antes del primer servicio; tarda unos minutos; termina OK y borra el compose de prueba |
+| 19 | `qbittorrent` | Contenedor activo; WebUI en `:8080`; descargas en `/srv/media*/downloads` con grupo `media` |
+| 20 | `jellyfin` en el **T400** | Activo en `:8096`. Sin `/dev/dri` usable: despliega sin aceleración y sin error |
+| 21 | `jellyfin` en el **X230** | `ls /dev/dri` muestra `renderD128`; el contenedor lo ve (`docker exec jellyfin ls /dev/dri`); en Jellyfin → Panel → Reproducción, activar VA-API y reproducir algo que requiera transcodificar. Lo que valida al HLI es que `/dev/dri` y el grupo `render` lleguen al contenedor; si la transcodificación en sí falla, puede ser la generación del chip (Ivy Bridge, soporte limitado en Jellyfin) y no un error del HLI: anotarlo igual |
+| 22 | `adguard` | Panel en `:3053`; desde el Fedora: `dig @<ip> ubuntu.com` responde (`sudo dnf install bind-utils` si falta `dig`); en el equipo `getent hosts ubuntu.com` sigue funcionando |
+| 23 | Forzar fallo de AdGuard: antes de desplegar, `sudo nc -lu 0.0.0.0 53` en otra terminal | Revierte el DNS: `/etc/resolv.conf` vuelve a su estado anterior y el equipo sigue resolviendo |
+| 24 | `import-v1` con un respaldo real del v1 | Importa a `/srv/appdata/*`; Jellyfin conserva bibliotecas; qBittorrent conserva torrents |
+
+Para la prueba 24: generar el respaldo en el M70q con el módulo `backup` del
+HLI v1 (solo crea un `.tar.gz`, no cambia nada más) y copiarlo al equipo de
+prueba. Las rutas de media del respaldo (`/srv/media...`) tienen que existir
+en el equipo de prueba para que las bibliotecas se vean.
+
+### v2.3 — Servicios nuevos (T400)
+
+| # | Prueba | Resultado esperado |
+|---|---|---|
+| 25 | `vaultwarden` | Pide dominio y la contraseña del panel (dos veces, en la terminal) |
+| 26 | Verificar el token | `docker exec vaultwarden env \| grep ADMIN_TOKEN` → hash completo `$argon2id$...`, **sin comillas** y con todos los `$` |
+| 27 | Entrar a `/admin` | Acepta la contraseña ingresada en 25 |
+| 28 | `homeassistant` | Activo en `:8123` (red host); detecta dispositivos Xiaomi de la red en Integraciones |
+| 29 | `opencloud` | Despliega; el login **no** funcionará sin dominio con TLS (esperado hasta v2.4). Anotar RAM: `docker stats --no-stream` |
+| 30 | Re-ejecutar `opencloud` | No falla por `opencloud init` repetido |
+
+### Energía (X230 o X201)
+
+| # | Prueba | Resultado esperado |
+|---|---|---|
+| 31 | Módulo `power`, luego cerrar la tapa | El equipo **no** suspende: sigue respondiendo por SSH y `ping` |
+| 32 | Reiniciar y repetir 31 | Igual: la configuración persiste |
+
+### Respuestas de la API de Dokploy
+
+Es lo más importante de confirmar: el cliente de la API se escribió sin
+conocer la forma exacta de las respuestas. Si algún despliegue falla,
+guardar la salida del módulo y `/var/log/hli2/<módulo>.log`.
+
+---
+
+## 4. Al terminar
+
+Enviar la lista de pruebas con su resultado (OK / falló + qué pasó) y los
+logs de los módulos que fallaron. Con eso se corrige antes de v2.4.
