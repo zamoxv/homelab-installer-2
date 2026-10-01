@@ -9,25 +9,6 @@ source "$(dirname "$0")/_stublib.sh"
 log_call docker "$@"
 
 case "$*" in
-  "run --rm -it vaultwarden/server /vaultwarden hash"*)
-    # Hash Argon2id PHC de mentira, con la forma real
-    # ($argon2id$v=...$m=...,t=...,p=...$salt$hash, sin '=' de relleno: un
-    # PHC de verdad usa base64 SIN padding) para que la validación anclada
-    # de modules/vaultwarden.sh la acepte tal cual.
-    #
-    # Terminado en '\r\n' A PROPÓSITO (no solo '\n'): así se reproduce lo
-    # que hace un 'docker run -it' real, que asigna una pty al proceso del
-    # contenedor — con ONLCR (el modo normal de una pty), cada '\n' que
-    # escribe el proceso sale convertido en '\r\n'. Sin este '\r' el test
-    # nunca podría haber visto el bug real (CRÍTICO 2, ronda 2 de
-    # revisión): la regex vieja solo anclaba el PRINCIPIO
-    # ('^\$argon2id\$'), así que un hash con un '\r' de sobra al final
-    # pasaba igual la validación.
-    # Formato REAL de 'vaultwarden hash' (src/main.rs, PR dani-garcia/vaultwarden#3289):
-    # el valor se imprime entre comillas simples: ADMIN_TOKEN='$argon2id$...'
-    printf '%s\r\n' "ADMIN_TOKEN='"'$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$RRTestfakeHashForTestingOnlyabc123'"'"
-    exit 0
-    ;;
   "run --rm -i httpd:2-alpine htpasswd -n -i -B -C 10 "*)
     # Lee y descarta la contraseña de stdin (igual que haría el htpasswd
     # real; acá no se usa para nada, el hash de la respuesta es fijo — lo

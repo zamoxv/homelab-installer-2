@@ -330,7 +330,69 @@ Los tests `tests/test_secrets.sh` (lectura root-only simulada con un área
 `tests/test_vaultwarden.sh` (docker stub emitiendo `\r\n` como una pty
 real) prueban que ambos críticos fallaban antes de estos cambios y pasan
 después — ver `tests/lib/harness.sh` (`STUB_ROOT_AREA`) y
-`tests/stubs/sudo`/`tests/stubs/docker`.
+`tests/stubs/sudo`/`tests/stubs/docker`. (El crítico 2, el `\r` colado,
+quedó sin objeto más adelante: ver el hallazgo de hardware real más abajo,
+que abandona por completo el `docker run -it` para el ADMIN_TOKEN — el test
+que lo probaba se retiró junto con ese código.)
+
+**Hallazgo de usabilidad/seguridad, validado en hardware real (Ubuntu
+24.04.5, 2026-09-30)**: `_vaultwarden_ensure_admin_token`
+(`modules/vaultwarden.sh`) corría `docker run --rm -it vaultwarden/server
+/vaultwarden hash --preset owasp` heredando la terminal del módulo (esa CLI
+exige una tty real: con stdin sin tty entra en pánico). En el servidor real
+el prompt de contraseña **nunca apareció** y las teclas tipeadas se
+mostraban en eco en la terminal local **sin llegar al contenedor**: el
+módulo quedaba colgado esperando una respuesta que el contenedor jamás
+recibía. No es razonable pedirle a cada usuario que depure esto a mano en su
+propio hardware. Causa más probable (no confirmada con un `strace` contra el
+servidor real, pero consistente con el síntoma): `hli_docker` es `sudo -n
+docker ...` (`lib/core.sh`), y el `use_pty` por defecto de `sudo` intercala
+su PROPIA pty entre la terminal real y el proceso hijo; combinado con `-it`
+(que además le pide a Docker asignarle otra pty al contenedor) y con la
+salida yendo a `tee`, la cadena de ptys/pipes no garantiza que el teclado
+llegue transparente hasta `vaultwarden hash` dentro del contenedor.
+Corregido abandonando el contenedor interactivo por completo: la contraseña
+ahora se pide con la propia TUI del HLI (`password_box`, `dialog
+--passwordbox`, sin pty de por medio — mismo patrón que
+`_adguard_ensure_admin_user` en `modules/adguard.sh`: mínimo 8 caracteres,
+debe repetirse igual, se limpia la variable en toda salida, Cancelar aborta
+sin guardar nada y sin marcar el módulo como hecho) y el hash se genera con
+la CLI `argon2` de los repositorios de Ubuntu (paquete `argon2`, instalado
+con `hli_apt install argon2` si falta), con la contraseña **solo por
+stdin**, nunca por argv (mismo criterio que ya motivó pasar el token de la
+API de Dokploy por stdin en vez de argv, v2.2). Parámetros: preset
+"Bitwarden" (`m=65540` KiB, `t=3`, `p=4` — el que `vaultwarden hash` usa POR
+DEFECTO sin `--preset owasp`; confirmado contra la wiki oficial,
+<https://github.com/dani-garcia/vaultwarden/wiki/Enabling-admin-page>,
+sección "Using argon2 CLI tool": `echo -n 'MySecretPassword' | argon2
+"$(openssl rand -base64 32)" -e -id -k 65540 -t 3 -p 4`). La sal sale de
+`head -c 16 /dev/urandom | base64` (no de `openssl rand -base64 32` como en
+el ejemplo de la wiki): verificado a mano dentro de un contenedor
+`ubuntu:24.04` descartable (paquete `argon2` 0~20190702+dfsg-4build1) que
+con 16 bytes de entrada la sal re-codificada por `argon2` en el PHC de
+salida **nunca** lleva padding `=` (24 caracteres ASCII, múltiplo de 3); con
+32 bytes (44 caracteres, no múltiplo de 3) el padding ocasional rompería la
+regex anclada existente (sin `=` en la clase de caracteres). El binario no
+exige tty, lee la contraseña de stdin sin problema y devuelve el PHC con un
+`\n` final que la propia sustitución de comandos de bash recorta sola —
+ya no hace falta limpiar ningún `\r` (no hay pty) ni quitar comillas simples
+(formato propio de `vaultwarden hash`, no de `argon2`). Se eliminó también
+el código que limpiaba ese `\r`/esas comillas (ya sin objeto) y el test que
+lo probaba (`test_vaultwarden_admin_token_strips_pty_carriage_return`); el
+resto de `tests/test_vaultwarden.sh` se reescribió para el nuevo flujo
+(`tests/stubs/argon2`, nuevo: lee la contraseña de stdin, nunca de argv) y
+suma casos para contraseña corta y contraseñas que no coinciden. Vaultwarden
+no tiene una CLI propia de verificación de hashes: la validación de que el
+valor generado es aceptado por el `bcrypt.go`/`argon2` que compara Vaultwarden
+se apoya en el formato PHC completo (regex anclada a ambos lados) y en que
+la librería `argon2` que usa Vaultwarden (crate `argon2`, Rust) es
+compatible con el formato PHC estándar que emite la CLI `argon2` de
+referencia (ambas implementan la misma RFC 9106). **Verificado end-to-end
+(2026-10-01)**: hash generado con la CLI `argon2` de `ubuntu:24.04` y los
+mismos parámetros del módulo, cargado como `ADMIN_TOKEN` en un
+`vaultwarden/server:latest` descartable: `POST /admin` con la contraseña
+correcta → 200 y cookie `VW_ADMIN`; con una incorrecta → 401 "Invalid admin
+token". Detalle completo en Engram (`hli2/vaultwarden-hash`).
 
 **Pendiente de validar en un servidor real** (no se pudo probar contra un
 Dokploy real desde acá):
@@ -347,10 +409,14 @@ Dokploy real desde acá):
 - `domain.create`/`domain.byComposeId` contra un compose real: el shape
   exacto de la respuesta, y si el servicio necesita explícitamente la red
   externa `dokploy-network` (creada por Dokploy) o si Dokploy la inyecta solo.
-- Si `vaultwarden hash --preset owasp` corrido con `docker run --rm -it`
+- ~~Si `vaultwarden hash --preset owasp` corrido con `docker run --rm -it`
   desde dentro de un módulo TUI de HLI 2 (bajo `dialog`) hereda la terminal
-  correctamente en todos los casos (probado solo con un stub de `docker` en
-  los tests, nunca contra el binario real).
+  correctamente en todos los casos~~ — **resuelto, y mal**: en hardware real
+  NO heredaba la terminal (ver el hallazgo de arriba). Reemplazado por
+  `password_box` + CLI `argon2`.
+- ~~Que el login en `/admin` de Vaultwarden funcione con un hash de la CLI
+  `argon2`~~ — **verificado** contra un Vaultwarden real descartable (ver
+  arriba). Falta solo repetirlo en la X230 con el despliegue completo.
 - Consumo de RAM de OpenCloud y comportamiento real de sus clientes de
   escritorio/móvil contra un dominio sin TLS válido todavía.
 - Si `opencloud init` tolera bien corridas repetidas del módulo (el propio

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Stub de 'argon2' para tests: nunca corre el binario real. Registra el argv
+# completo con log_call (así un test puede afirmar que la CONTRASEÑA nunca
+# aparece ahí — en modules/vaultwarden.sh, 'argon2 "$salt" -id -t 3 -k 65540
+# -p 4 -l 32 -e' solo recibe la SAL por argv, la contraseña viaja únicamente
+# por stdin) y CONSUME stdin (igual que el 'htpasswd' real: sin leerlo, el
+# extremo escritor del pipe, 'printf ... | argon2 ...' en el módulo, quedaría
+# esperando que alguien lea).
+#
+# Imprime un hash Argon2id PHC de mentira pero con la forma REAL que produce
+# 'argon2 ... -e' (sin comillas, un '\n' final, sal/hash en base64 SIN
+# padding): se repite acá $argon2id$v=19$m=65540,t=3,p=4$... con los mismos
+# parámetros (m=65540, t=3, p=4) que pasa modules/vaultwarden.sh, para que la
+# validación anclada de ese módulo la acepte tal cual.
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call argon2 "$@"
+
+# Descarta la contraseña que llega por stdin (nunca se usa para nada: el
+# hash de la respuesta es fijo — lo que le importa a los tests es que la
+# contraseña NUNCA llegó por argv, ver STUB_CALL_LOG).
+cat >/dev/null 2>&1 || true
+
+printf '%s\n' '$argon2id$v=19$m=65540,t=3,p=4$c29tZXNhbHRzYWx0$RRTestfakeHashForTestingOnlyabc123'
+exit 0

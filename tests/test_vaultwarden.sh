@@ -4,27 +4,52 @@
 # tests/stubs), y comprueba:
 #   1. El módulo termina en éxito y marca 'vaultwarden' hecho.
 #   2. El ADMIN_TOKEN queda guardado como hash Argon2id PHC en
-#      /etc/hli2/vaultwarden.env (real, en el scratch), root-only, SIN
-#      ningún '\r' colado (CRÍTICO 2, ronda 2 de revisión — ver
-#      test_vaultwarden_admin_token_strips_pty_carriage_return más abajo).
+#      /etc/hli2/vaultwarden.env (real, en el scratch), root-only.
 #   3. Ese hash llega al campo "env" del compose.create/update de Dokploy
 #      (STUB_HTTP_BODIES_LOG) — el canal de secretos funciona de punta a
 #      punta.
-#   4. El hash NUNCA aparece como argumento de ningún proceso real invocado
-#      (STUB_CALL_LOG: docker/curl/jq/sudo) — ni el token de la API de
-#      Dokploy tampoco.
+#   4. La CONTRASEÑA tipeada por el usuario nunca aparece como argumento de
+#      ningún proceso real invocado (STUB_CALL_LOG: docker/curl/jq/sudo/
+#      argon2) — solo viaja por stdin hacia 'argon2' (ver tests/stubs/
+#      argon2) y por la cola file-based de tests/stubs/dialog
+#      (DIALOG_PASSWORDBOX_QUEUE), nunca por argv.
 #   5. El compose renderizado y enviado a Dokploy usa "${ADMIN_TOKEN}"
 #      (sustitución de Dokploy), nunca el valor real, embebido.
+#
+# HALLAZGO (validado en hardware real, Ubuntu 24.04.5) que motivó reescribir
+# este módulo y estos tests: la versión anterior generaba el ADMIN_TOKEN
+# corriendo 'docker run --rm -it vaultwarden/server /vaultwarden hash' (esa
+# CLI exige una tty real) heredando la terminal del módulo. En el servidor
+# real el prompt de contraseña nunca apareció y las teclas tipeadas se
+# mostraban en eco en la terminal local sin llegar al contenedor: el módulo
+# quedaba colgado. Se abandonó el contenedor interactivo: la contraseña
+# ahora se pide con password_box (dialog --passwordbox, TUI propia del HLI,
+# mismo patrón que _adguard_ensure_admin_user en modules/adguard.sh) y el
+# hash se genera con la CLI 'argon2' de Ubuntu, contraseña SOLO por stdin.
+# Ver el comentario de cabecera de _vaultwarden_ensure_admin_token en
+# modules/vaultwarden.sh para el detalle completo (causa probable del
+# cuelgue, parámetros del preset "Bitwarden", y por qué la sal usa 16 bytes
+# y no los 32 del ejemplo de la wiki de Vaultwarden).
 #
 # Regex completa de un PHC Argon2id (la misma que usa modules/vaultwarden.sh,
 # anclada a AMBOS lados): se repite acá para poder afirmar "el hash
 # guardado tiene la forma COMPLETA correcta", no solo "contiene $argon2id$".
 PHC_REGEX='^\$argon2id\$v=[0-9]+\$m=[0-9]+,t=[0-9]+,p=[0-9]+\$[A-Za-z0-9+/]+\$[A-Za-z0-9+/]+$'
 
+# Contraseña de prueba usada en varios tests de abajo: 12 caracteres, pasa el
+# mínimo de 8. Nunca debe aparecer en STUB_CALL_LOG (solo en la cola de
+# dialog y por stdin hacia argon2, ninguno de los dos pasa por argv de un
+# proceso logueado).
+TEST_PASSWORD="SuperSecret1"
+
 test_vaultwarden_deploy_ok() {
   harness_mark_canary_done
 
   echo "vault.example.com" > "$DIALOG_INPUTBOX_QUEUE"
+  {
+    echo "$TEST_PASSWORD"
+    echo "$TEST_PASSWORD"
+  } > "$DIALOG_PASSWORDBOX_QUEUE"
 
   bash "$REPO_ROOT/modules/vaultwarden.sh" || return 1
 
@@ -44,12 +69,30 @@ test_vaultwarden_deploy_ok() {
   assert_file_contains "$STUB_HTTP_BODIES_LOG" '${ADMIN_TOKEN}' "compose usa la referencia, no un literal" || return 1
 
   # El hash NUNCA aparece en el log de argv de ningún proceso real
-  # (docker/curl/jq/sudo) — solo debe existir en el log de BODIES (que lee
-  # contenido de archivo, no argv) y en el propio secret_file.
+  # (docker/curl/jq/sudo/argon2) — solo debe existir en el log de BODIES (que
+  # lee contenido de archivo, no argv) y en el propio secret_file.
   assert_file_not_contains "$STUB_CALL_LOG" "$hash" "el hash nunca debe estar en argv de ningún proceso" || return 1
+
+  # La CONTRASEÑA tipeada tampoco debe aparecer nunca en argv: solo viajó por
+  # stdin hacia 'argon2' (ver tests/stubs/argon2, que la descarta con 'cat
+  # >/dev/null') y por la cola file-based de 'dialog' (DIALOG_PASSWORDBOX_QUEUE,
+  # no es un proceso logueado en STUB_CALL_LOG).
+  assert_file_not_contains "$STUB_CALL_LOG" "$TEST_PASSWORD" "la contraseña nunca en argv de ningún proceso" || return 1
 
   # El token de la API de Dokploy tampoco debe aparecer nunca en ningún argv.
   assert_file_not_contains "$STUB_CALL_LOG" "test-token-abc123" "el token de la API nunca en argv" || return 1
+
+  # Ya NO se corre 'docker run ... /vaultwarden hash' en absoluto (el
+  # contenedor interactivo se abandonó, ver el hallazgo de cabecera).
+  # Chequeo preciso con grep -P anclado por tabs (NUNCA un substring plano
+  # como "vaultwarden/server": ESE texto SÍ aparece legítimamente en el log,
+  # embebido dentro del compose YAML que se le pasa a 'jq' para armar el
+  # body de compose.create/update — mismo patrón que ya usaba
+  # test_vaultwarden_redeploy_reuses_token más abajo).
+  if grep -qP '^docker\trun\t--rm\t-it\tvaultwarden/server\t/vaultwarden\thash' "$STUB_CALL_LOG" 2>/dev/null; then
+    fail "no debe invocarse 'docker run --rm -it vaultwarden/server /vaultwarden hash' en absoluto"
+    return 1
+  fi
 
   # Se configuró un dominio en Traefik vía la API (domain.create).
   assert_file_contains "$STUB_HTTP_BODIES_LOG" "vault.example.com" "dominio enviado a domain.create" || return 1
@@ -59,44 +102,58 @@ test_vaultwarden_deploy_ok() {
   assert_file_contains "$STUB_HTTP_BODIES_LOG" "SIGNUPS_ALLOWED=false" "signups deshabilitados en el compose" || return 1
 }
 
-# CRÍTICO 2 (ronda 2 de revisión): el stub de 'docker' (tests/stubs/docker)
-# emite la línea "ADMIN_TOKEN=..." terminada en '\r\n', reproduciendo lo que
-# hace de verdad un 'docker run -it' (pty con ONLCR). Si modules/
-# vaultwarden.sh no limpiara ese '\r' (o si la validación solo anclara el
-# PRINCIPIO de la regex, como en la versión anterior), este test fallaría:
-# el hash guardado/enviado terminaría con un '\r' colado que nunca
-# coincidiría con el hash real que compara Vaultwarden, dejando el login de
-# /admin roto.
-test_vaultwarden_admin_token_strips_pty_carriage_return() {
+# Contraseña de menos de 8 caracteres: el módulo debe abortar SIN guardar
+# nada y SIN marcar el módulo como hecho (mismo criterio que
+# _adguard_ensure_admin_user: nunca se persiste un secreto a medio
+# configurar).
+test_vaultwarden_password_too_short_aborts() {
   harness_mark_canary_done
 
   echo "vault.example.com" > "$DIALOG_INPUTBOX_QUEUE"
+  echo "short1" > "$DIALOG_PASSWORDBOX_QUEUE"   # 6 caracteres, < 8
 
-  bash "$REPO_ROOT/modules/vaultwarden.sh" || return 1
+  if bash "$REPO_ROOT/modules/vaultwarden.sh"; then
+    fail "el módulo debió abortar con una contraseña de menos de 8 caracteres"
+    return 1
+  fi
 
-  local hash
-  hash="$( ( source "$REPO_ROOT/lib/core.sh"; secret_get vaultwarden ADMIN_TOKEN ) )" || return 1
+  assert_file_not_contains "$STATE_FILE" "vaultwarden" "no debe marcarse hecho" || return 1
 
-  case "$hash" in
-    *$'\r'*)
-      fail "el hash guardado contiene un '\\r' (no se limpió la salida de la pty de 'docker run -it')"
-      return 1
-      ;;
-  esac
-  [[ "$hash" =~ $PHC_REGEX ]] || { fail "hash guardado no matchea la regex COMPLETA (¿quedó un '\\r' u otra basura al final?): [$hash]"; return 1; }
+  ( source "$REPO_ROOT/lib/core.sh"; secret_file_exists vaultwarden ) \
+    && { fail "no debió guardarse ningún ADMIN_TOKEN"; return 1; }
 
-  # El valor que de verdad se mandó a Dokploy (el body real, no el argv)
-  # tampoco debe llevar el '\r'.
-  case "$(cat "$STUB_HTTP_BODIES_LOG")" in
-    *"ADMIN_TOKEN=${hash}"$'\r'*)
-      fail "el '\\r' llegó hasta el body enviado a Dokploy"
-      return 1
-      ;;
-  esac
+  return 0
+}
+
+# Las dos contraseñas no coinciden: abortar SIN guardar nada y SIN marcar el
+# módulo como hecho.
+test_vaultwarden_password_mismatch_aborts() {
+  harness_mark_canary_done
+
+  echo "vault.example.com" > "$DIALOG_INPUTBOX_QUEUE"
+  {
+    echo "$TEST_PASSWORD"
+    echo "OtraContraseña2"
+  } > "$DIALOG_PASSWORDBOX_QUEUE"
+
+  if bash "$REPO_ROOT/modules/vaultwarden.sh"; then
+    fail "el módulo debió abortar con contraseñas que no coinciden"
+    return 1
+  fi
+
+  assert_file_not_contains "$STATE_FILE" "vaultwarden" "no debe marcarse hecho" || return 1
+
+  ( source "$REPO_ROOT/lib/core.sh"; secret_file_exists vaultwarden ) \
+    && { fail "no debió guardarse ningún ADMIN_TOKEN"; return 1; }
+
+  assert_file_not_contains "$STUB_CALL_LOG" "$TEST_PASSWORD" "la contraseña nunca en argv, ni siquiera al abortar" || return 1
+
+  return 0
 }
 
 # Redeploy: si ya hay un ADMIN_TOKEN guardado, el módulo NO debe volver a
-# pedirlo (ni tocar docker para regenerarlo) — reutiliza el existente.
+# pedirlo (ni tocar 'argon2'/docker para regenerarlo) — reutiliza el
+# existente.
 test_vaultwarden_redeploy_reuses_token() {
   harness_mark_canary_done
 
@@ -115,9 +172,17 @@ test_vaultwarden_redeploy_reuses_token() {
 
   bash "$REPO_ROOT/modules/vaultwarden.sh" || return 1
 
-  # No debe haber invocado 'docker run ... /vaultwarden hash' en absoluto.
-  if grep -qF $'\t/vaultwarden\thash' "$STUB_CALL_LOG" 2>/dev/null; then
+  # No debe haber invocado 'argon2' en absoluto (ni 'docker run ...
+  # vaultwarden/server', que ya no existe como camino posible). Chequeo
+  # preciso con grep -P anclado por tabs, no un substring plano: "vaultwarden/
+  # server" SÍ aparece legítimamente en el log, embebido dentro del compose
+  # YAML que se le pasa a 'jq' para el body de compose.create/update.
+  if grep -qP '^argon2\t' "$STUB_CALL_LOG" 2>/dev/null; then
     fail "se re-generó el ADMIN_TOKEN aunque ya había uno y el usuario dijo que no"
+    return 1
+  fi
+  if grep -qP '^docker\trun\t--rm\t-it\tvaultwarden/server\t/vaultwarden\thash' "$STUB_CALL_LOG" 2>/dev/null; then
+    fail "tampoco debe tocar docker para el hash"
     return 1
   fi
 
