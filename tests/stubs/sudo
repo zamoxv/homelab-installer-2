@@ -47,8 +47,20 @@ log_call sudo "$@"
 
 args=("$@")
 # Sacar un '-n' inicial (non-interactive): no cambia el subcomando real.
+had_n=0
 if [[ "${args[0]:-}" == "-n" ]]; then
   args=("${args[@]:1}")
+  had_n=1
+fi
+
+# STUB_SUDO_FAIL_N=1: simula una sesión de sudo NO cacheada (o vencida) para
+# cualquier llamada no-interactiva ('sudo -n ...'), dejando 'sudo' normal
+# (sin -n) funcionando igual. Reproduce el escenario real que motiva el
+# chequeo fail-closed de priv_file_exists (lib/secrets.sh) y de
+# dokploy_api_configure_verified (lib/dokploy_api.sh): el keepalive de
+# bootstrap.sh no corrió, o venció justo antes de esta llamada.
+if [[ "$had_n" -eq 1 && -n "${STUB_SUDO_FAIL_N:-}" ]]; then
+  exit 1
 fi
 
 sub="${args[0]:-}"

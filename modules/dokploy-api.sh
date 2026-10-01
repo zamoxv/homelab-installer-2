@@ -6,42 +6,15 @@
 # HLI-TIPO: tool
 # HLI-TUI: yes
 #
-# Pide de nuevo la dirección y el token de la API de Dokploy (por ejemplo,
-# si el token se revocó o se regeneró en el panel) y verifica que funcionen
-# antes de dejarlos guardados. Si la verificación falla, restaura las
-# credenciales anteriores.
+# Punto de entrada desde Herramientas para (re)configurar la API de
+# Dokploy (por ejemplo, si el token se revocó o se regeneró en el panel).
+# Toda la lógica real (instrucciones, backup de la config anterior, pedir
+# IP/puerto/token, verificar con 'project.all', reintentar o restaurar ante
+# un fallo) vive en dokploy_api_configure_verified (lib/dokploy_api.sh): es
+# la MISMA función que usa modules/dokploy.sh al terminar la instalación (o
+# cuando Dokploy ya está instalado pero la API no está configurada) — una
+# sola implementación, nunca duplicada entre los dos módulos.
 set -euo pipefail
 source "$(dirname "$0")/../lib/core.sh"
 
-backup=""
-if priv_file_exists "$DOKPLOY_ENV_FILE" 2>/dev/null; then
-  backup="${DOKPLOY_ENV_FILE}.anterior"
-  sudo install -m 0600 -o root -g root /dev/null "$backup"
-  sudo cp "$DOKPLOY_ENV_FILE" "$backup"
-fi
-
-_restore_previous() {
-  if [[ -n "$backup" ]]; then
-    sudo cp "$backup" "$DOKPLOY_ENV_FILE"
-    sudo rm -f "$backup"
-  else
-    sudo rm -f "$DOKPLOY_ENV_FILE"
-  fi
-}
-
-if ! dokploy_api_setup; then
-  _restore_previous
-  msg "No se cambió la configuración de la API de Dokploy."
-  exit 0
-fi
-
-hli_busy "Verificando la conexión con Dokploy..."
-if ! dokploy_api_get "project.all" >/dev/null; then
-  _restore_previous
-  msg "Dokploy no aceptó la dirección o el token ingresados.\n\nSe mantuvo la configuración anterior.\n\nRevise la dirección del panel y copie el token de nuevo desde Configuración -> Perfil -> API/CLI."
-  exit 1
-fi
-
-[[ -n "$backup" ]] && sudo rm -f "$backup"
-log "API de Dokploy reconfigurada y verificada."
-msg "Conexión con Dokploy verificada. El nuevo token quedó guardado."
+dokploy_api_configure_verified

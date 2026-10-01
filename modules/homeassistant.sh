@@ -4,6 +4,7 @@
 # HLI-ORDER: 64
 # HLI-DEFAULT: yes
 # HLI-TUI: yes
+# HLI-REQUIERE: dokploy-api
 #
 # Modo "Container" (sin add-ons/supervisor), network_mode: host (decisiones
 # #5 y #7 del roadmap): el uso previsto son integraciones Xiaomi y Samsung

@@ -4,6 +4,7 @@
 # HLI-ORDER: 65
 # HLI-DEFAULT: yes
 # HLI-TUI: yes
+# HLI-REQUIERE: dokploy-api
 #
 # OpenCloud necesita una URL pública fija (OC_URL) para funcionar de verdad
 # (cookies/CORS/login), pero la exposición pública real (Cloudflare Tunnel)

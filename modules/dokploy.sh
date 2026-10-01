@@ -106,8 +106,29 @@ _dp_offer_hold_release_upgrade() {
   grep -qE '^Prompt=never' "$f" 2>/dev/null && return 0
   confirm "Dokploy solo está soportado hasta Ubuntu 24.04.\n\n¿Desactivar el aviso de actualización a una nueva versión de Ubuntu?\n\n(Las actualizaciones de seguridad de 24.04 siguen llegando normalmente hasta 2029. Cambiar de versión solo será posible a mano con 'do-release-upgrade'.)" \
     || return 0
-  sudo sed -i 's/^Prompt=.*/Prompt=never/' "$f" || { msg "No se pudo modificar $f."; return 0; }
-  log "Aviso de nueva versión de Ubuntu desactivado (Prompt=never en $f)."
+
+  # Hallazgo de revisión: 'sed -i' sobre una línea 'Prompt=' que no exista
+  # (comentada, ej. '#Prompt=normal', o ausente directamente) es un no-op
+  # silencioso — el 'log' de éxito de abajo corría igual, sin haber
+  # cambiado nada, y el aviso se volvía a ofrecer en cada corrida. En vez
+  # de depender de que 'sed' haya encontrado algo, se arma el contenido
+  # completo a mano (todo menos cualquier línea 'Prompt=' sin comentar, más
+  # 'Prompt=never' al final) y recién DESPUÉS de leerlo entero se escribe
+  # de una sola vez con 'tee' — leer primero, escribir después, nunca en el
+  # mismo pipeline ('grep "$f" | sudo tee "$f"' arriesga una carrera real:
+  # 'tee' podría truncar "$f" antes de que 'grep' termine de leerlo).
+  local content
+  content="$(grep -vE '^Prompt=' "$f" 2>/dev/null)" || true
+  if ! { [[ -n "$content" ]] && printf '%s\n' "$content"; printf 'Prompt=never\n'; } | sudo tee "$f" >/dev/null; then
+    msg "No se pudo modificar $f."
+    return 0
+  fi
+
+  if grep -qE '^Prompt=never' "$f" 2>/dev/null; then
+    log "Aviso de nueva versión de Ubuntu desactivado (Prompt=never en $f)."
+  else
+    msg "No se pudo confirmar que $f quedó con 'Prompt=never' después de modificarlo. Revíselo a mano."
+  fi
 }
 
 _dp_os_supported() {
@@ -401,6 +422,22 @@ _dokploy_main() {
       actualizar) _dokploy_update || true ;;
       nada) msg "No se hizo ningún cambio." ;;
     esac
+
+    # Dokploy ya está (o queda) instalado, pero puede no tener la API
+    # configurada todavía (ej. primera vez que se corre este módulo tras la
+    # instalación inicial, o un servidor migrado). Se pide acá, sea cual sea
+    # la elección de arriba ('actualizar' o 'nada'): así ningún módulo de
+    # servicio (jellyfin/qbittorrent/adguard/vaultwarden/homeassistant/
+    # opencloud) es el primero en pedirla a mitad de su propio flujo. Un
+    # fallo acá (usuario cancela, o rechaza reintentar tras una verificación
+    # fallida) NUNCA aborta este módulo: Dokploy en sí ya está bien, la API
+    # se puede configurar después desde Herramientas -> 'Configurar API de
+    # Dokploy', o se la va a volver a pedir dokploy_preflight en el primer
+    # servicio que la necesite (ver lib/canary.sh).
+    if ! dokploy_api_configured; then
+      dokploy_api_configure_verified || true
+    fi
+
     mark_done dokploy
     return 0
   fi
@@ -656,7 +693,31 @@ _dokploy_main() {
   local panel_url
   panel_url="$(service_url dokploy "$ADVERTISE_ADDR")" || true
 
-  msg "Dokploy instalado.\n\n$status_note\n\nPanel: ${panel_url:-http://$ADVERTISE_ADDR:${dokploy_port}}\n\nIMPORTANTE: cree la cuenta de administrador AHORA entrando al panel. El primer visitante que entra se convierte en admin: cualquiera en la LAN que llegue primero se queda con esa cuenta.\n\nOJO: los puertos que Docker/Dokploy publican (80, 443, ${dokploy_port}, y los que publique cada servicio) NO pasan por ufw ni por ningún firewall del host: Docker los expone directo con sus propias reglas de iptables."
+  msg "Dokploy instalado.\n\n$status_note\n\nPanel: ${panel_url:-http://$ADVERTISE_ADDR:${dokploy_port}}\n\nOJO: los puertos que Docker/Dokploy publican (80, 443, ${dokploy_port}, y los que publique cada servicio) NO pasan por ufw ni por ningún firewall del host: Docker los expone directo con sus propias reglas de iptables."
+
+  # Pedir y verificar el token de la API de Dokploy ACÁ, al terminar una
+  # instalación nueva exitosa, en vez de dejar que lo pida a mitad de su
+  # propio flujo el primer módulo de servicio que lo necesite
+  # (jellyfin/qbittorrent/adguard/vaultwarden/homeassistant/opencloud, ver
+  # dokploy_preflight en lib/canary.sh — si el usuario cancelara ahí en
+  # medio de, por ejemplo, el despliegue de Jellyfin, los servicios
+  # siguientes volverían a pedirlo uno por uno). Las instrucciones
+  # completas (crear la cuenta de administrador PRIMERO — el primer
+  # visitante del panel se queda con ella —, después generar el token)
+  # viven en dokploy_api_configure_verified (lib/dokploy_api.sh), misma
+  # función que usa la herramienta "Configurar API de Dokploy".
+  #
+  # Solo se pide si el panel ya respondió (ready==1): pedir el token contra
+  # un Dokploy que todavía está levantando haría fallar la verificación por
+  # una razón ajena al token en sí, confuso justo después de instalar. Un
+  # fallo acá NUNCA aborta este módulo: la instalación de Dokploy ya
+  # terminó bien: la API se puede configurar después (Herramientas, o el
+  # primer servicio que la necesite).
+  if [[ "$ready" -eq 1 ]]; then
+    dokploy_api_configure_verified || true
+  else
+    msg "Dokploy todavía no respondió dentro del tiempo de espera, así que no se pide la API ahora.\n\nUna vez que el panel esté accesible, configúrela desde Herramientas -> 'Configurar API de Dokploy' (o se la va a pedir el primer servicio que la necesite)."
+  fi
 
   mark_done dokploy
   return 0

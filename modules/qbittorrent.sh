@@ -4,6 +4,7 @@
 # HLI-ORDER: 61
 # HLI-DEFAULT: yes
 # HLI-TUI: yes
+# HLI-REQUIERE: dokploy-api
 set -euo pipefail
 source "$(dirname "$0")/../lib/core.sh"
 

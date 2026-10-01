@@ -4,6 +4,7 @@
 # HLI-ORDER: 60
 # HLI-DEFAULT: yes
 # HLI-TUI: yes
+# HLI-REQUIERE: dokploy-api
 #
 # Prepara APPDATA/jellyfin, ofrece importar config del HLI v1, renderiza el
 # compose (lib/compose.sh) y lo despliega vía la API de Dokploy

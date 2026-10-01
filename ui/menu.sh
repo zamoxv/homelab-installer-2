@@ -110,8 +110,49 @@ _failed_modules_summary() {
   printf '%s' "$list"
 }
 
+# Mismo formato que _failed_modules_summary, pero sin ruta de log (un
+# módulo omitido nunca llegó a correr, no hay nada que revisar ahí).
+_skipped_modules_summary() {
+  local f list=""
+  for f in "$@"; do
+    list+="  - $f"$'\n'
+  done
+  printf '%s' "$list"
+}
+
+# ¿El módulo $1 necesita la API de Dokploy configurada (metadata
+# 'HLI-REQUIERE: dokploy-api', ver jellyfin/qbittorrent/adguard/vaultwarden/
+# homeassistant/opencloud) y todavía NO lo está? Única condición que
+# install_full/install_custom usan para OMITIR un módulo en vez de
+# correrlo y dejar que falle: así ningún módulo de servicio es el primero
+# en pedir el token a mitad de su propio flujo (eso ahora lo pide
+# modules/dokploy.sh al terminar, ver dokploy_api_configure_verified en
+# lib/dokploy_api.sh) y, si el usuario cancela esa pregunta, los servicios
+# siguientes no fallan uno por uno repitiendo el mismo pedido.
+_module_needs_unconfigured_dokploy_api() {
+  local m="$1"
+  [[ "$(module_meta "$m" REQUIERE)" == "dokploy-api" ]] && ! dokploy_api_configured
+}
+
+# Arma, si corresponde, el bloque de texto final con las secciones de
+# módulos fallados y/u omitidos para un msg() de resumen. Vacío si no hubo
+# ninguno de los dos (el llamador decide entonces mostrar el mensaje de
+# "sin errores").
+_install_summary_block() {
+  local -n _failed_ref=$1
+  local -n _skipped_ref=$2
+  local block=""
+  if [[ ${#_failed_ref[@]} -gt 0 ]]; then
+    block+="Módulos que fallaron:\n$(_failed_modules_summary "${_failed_ref[@]}")\n"
+  fi
+  if [[ ${#_skipped_ref[@]} -gt 0 ]]; then
+    block+="Módulos omitidos (no instalados):\n$(_skipped_modules_summary "${_skipped_ref[@]}")\nLa API de Dokploy no está configurada. Configúrela en Herramientas -> 'Configurar API de Dokploy' y vuelva a instalar estos servicios.\n"
+  fi
+  printf '%s' "$block"
+}
+
 install_full() {
-  local all=() m i=0 total failed=()
+  local all=() m i=0 total failed=() skipped=()
   while read -r m; do
     [[ "$(module_meta "$m" DEFAULT)" == "yes" ]] && all+=("$m")
   done < <(_installable_modules)
@@ -121,9 +162,15 @@ install_full() {
 
   # Cada módulo se corre de forma independiente: si uno falla, se registra y
   # se sigue con el resto (nunca se aborta la instalación completa por un
-  # solo módulo).
+  # solo módulo). Los que necesitan la API de Dokploy y todavía no la
+  # tienen configurada se OMITEN (ni se corren ni cuentan como fallados):
+  # ver _module_needs_unconfigured_dokploy_api.
   for m in "${all[@]}"; do
     i=$((i + 1))
+    if _module_needs_unconfigured_dokploy_api "$m"; then
+      skipped+=("$m")
+      continue
+    fi
     if [[ "$(module_meta "$m" TUI)" == "yes" ]]; then
       run_module "$m" || failed+=("$m")
     else
@@ -131,15 +178,19 @@ install_full() {
     fi
   done
 
-  if [[ ${#failed[@]} -eq 0 ]]; then
+  local summary
+  summary="$(_install_summary_block failed skipped)"
+  if [[ -z "$summary" ]]; then
     msg "Instalación completa finalizada sin errores.\n\nRevise el Dashboard para ver el estado de los servicios."
   else
-    msg "Instalación completa finalizada CON ERRORES.\n\nMódulos que fallaron:\n$(_failed_modules_summary "${failed[@]}")\nRevise el log de cada uno para más detalle."
+    local hint=""
+    [[ ${#failed[@]} -gt 0 ]] && hint="Revise el log de cada módulo fallado para más detalle."
+    msg "Instalación completa finalizada.\n\n${summary}${hint}"
   fi
 }
 
 install_custom() {
-  local args=() m desc state failed=()
+  local args=() m desc state failed=() skipped=()
 
   while read -r m; do
     desc="$(module_meta "$m" DESC)"
@@ -160,13 +211,27 @@ install_custom() {
     "${args[@]}" \
     3>&1 1>&2 2>&3) || return
 
+  # Mismo criterio de omisión que install_full, también acá: aunque el
+  # usuario haya elegido el módulo a propósito en el checklist, si necesita
+  # la API de Dokploy y todavía no está configurada se omite (no se corre,
+  # no se cuenta como fallado) en vez de dejar que dokploy_preflight lo
+  # haga fallar a mitad de camino — el usuario puede configurarla desde
+  # Herramientas y volver a correr la instalación personalizada.
   for item in $SELECTED; do
     item="${item//\"/}"
+    if _module_needs_unconfigured_dokploy_api "$item"; then
+      skipped+=("$item")
+      continue
+    fi
     run_module "$item" || failed+=("$item")
   done
 
-  if [[ ${#failed[@]} -gt 0 ]]; then
-    msg "Instalación personalizada finalizada CON ERRORES.\n\nMódulos que fallaron:\n$(_failed_modules_summary "${failed[@]}")\nRevise el log de cada uno para más detalle."
+  local summary
+  summary="$(_install_summary_block failed skipped)"
+  if [[ -n "$summary" ]]; then
+    local hint=""
+    [[ ${#failed[@]} -gt 0 ]] && hint="Revise el log de cada módulo fallado para más detalle."
+    msg "Instalación personalizada finalizada.\n\n${summary}${hint}"
   fi
 }
 

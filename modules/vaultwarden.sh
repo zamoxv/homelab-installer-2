@@ -4,6 +4,7 @@
 # HLI-ORDER: 63
 # HLI-DEFAULT: yes
 # HLI-TUI: yes
+# HLI-REQUIERE: dokploy-api
 #
 # Prepara APPDATA/vaultwarden/data, pide el dominio (Vaultwarden todavía NO
 # se expone a Internet en esta fase: solo LAN vía Traefik, ver

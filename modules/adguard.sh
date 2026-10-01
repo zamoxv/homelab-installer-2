@@ -4,6 +4,7 @@
 # HLI-ORDER: 62
 # HLI-DEFAULT: yes
 # HLI-TUI: yes
+# HLI-REQUIERE: dokploy-api
 #
 # network_mode: host (ver compose/adguard/docker-compose.yml): AdGuard
 # necesita el puerto 53 del host para DNS. Este módulo siembra o normaliza

@@ -256,6 +256,145 @@ dokploy_api_call() {
 dokploy_api_get() { dokploy_api_call GET "$1"; }
 dokploy_api_post() { dokploy_api_call POST "$1" "$2"; }
 
+# --- Configurar + verificar (única implementación) --------------------------
+#
+# Flujo completo de "pedir credenciales de la API de Dokploy y no darlas por
+# buenas hasta confirmar que funcionan": muestra las instrucciones paso a
+# paso (crear la cuenta de administrador PRIMERO — el primer visitante del
+# panel se queda con ella —, después generar el token), pide IP/puerto/token
+# (dokploy_api_setup) y verifica con 'project.all'. Si la verificación
+# falla, explica el motivo y ofrece reintentar (sin perder la configuración
+# anterior hasta confirmar una nueva) o cancelar.
+#
+# ÚNICA implementación: la usan tanto modules/dokploy-api.sh (herramienta
+# "Configurar/cambiar token" del menú) como modules/dokploy.sh (al terminar
+# una instalación nueva, y cuando Dokploy ya está instalado pero la API
+# todavía no está configurada) — antes esta lógica (backup, pedir, verificar,
+# restaurar) vivía duplicada a mano dentro de modules/dokploy-api.sh.
+#
+# Backup/restauración: si ya había credenciales guardadas, se respaldan
+# ANTES del primer intento (una sola vez, no en cada reintento) y se
+# restauran si el usuario termina cancelando (ya sea en el propio
+# dokploy_api_setup, o después de un fallo de verificación). Si no había
+# credenciales previas y se termina cancelando, no queda ningún archivo de
+# credenciales (nunca se deja a medio escribir).
+#
+# Devuelve 0 solo si quedaron guardadas credenciales que Dokploy aceptó
+# (verificadas con 'project.all'). Devuelve 1 en cualquier otro caso
+# (usuario canceló el ingreso de datos, o rechazó reintentar tras un fallo
+# de verificación) — en ese caso puede haber quedado la configuración
+# ANTERIOR restaurada (si había) o ninguna (si no había). El llamador decide
+# si eso es motivo de abortar su propio flujo o no (ver modules/dokploy.sh:
+# un fallo acá nunca aborta una instalación de Dokploy que ya terminó bien).
+# Restaura (o limpia) $DOKPLOY_ENV_FILE a partir de $_DOKPLOY_CFGV_BACKUP,
+# fijada por dokploy_api_configure_verified antes de registrar el trap EXIT
+# de abajo. Nombre con prefijo propio (no una variable 'local' común) a
+# propósito: un trap EXIT corre en el entorno del shell en el momento de
+# salir, no necesariamente todavía "dentro" del scope léxico de la función
+# que lo armó, así que no hay que depender de que 'local backup' siga
+# resuelta por scoping dinámico — se usa una variable de módulo explícita.
+_dokploy_cfgv_restore_on_abort() {
+  if [[ -n "${_DOKPLOY_CFGV_BACKUP:-}" ]]; then
+    sudo cp "$_DOKPLOY_CFGV_BACKUP" "$DOKPLOY_ENV_FILE" 2>/dev/null || true
+    sudo rm -f "$_DOKPLOY_CFGV_BACKUP" 2>/dev/null || true
+  fi
+}
+
+dokploy_api_configure_verified() {
+  # Fail-closed (hallazgo de revisión): un 'sudo -n' que no funciona (sesión
+  # cacheada por bootstrap.sh vencida o nunca iniciada) hace que
+  # priv_file_exists() devuelva 1 por EL MISMO camino que "el archivo
+  # genuinamente no existe" (ver el comentario de priv_file_exists en
+  # lib/secrets.sh: no hay forma de distinguir los dos casos por código de
+  # retorno). Si eso pasara acá y se lo tratara como "no hay nada que
+  # respaldar", dokploy_api_setup pisaría unas credenciales FUNCIONANDO sin
+  # haberlas respaldado, y un fallo de verificación posterior borraría el
+  # archivo entero (cero credenciales, ni las viejas ni las nuevas) en vez
+  # de restaurarlas — pérdida irrecuperable. Por eso se exige 'sudo -n true'
+  # ACÁ, antes de preguntar nada ni tocar el archivo, y se aborta con un
+  # mensaje claro si no funciona: nunca seguir adelante sin poder confirmar
+  # primero si hay algo que proteger.
+  if ! sudo -n true 2>/dev/null; then
+    msg "No se pudo verificar sudo para configurar la API de Dokploy (la sesión cacheada por bootstrap.sh no está disponible o venció).\n\nPor seguridad, no se continúa: sin esto no se puede confirmar si hay credenciales existentes para respaldarlas antes de pedir unas nuevas.\n\nReintente (puede hacer falta volver a autenticar sudo)."
+    return 1
+  fi
+
+  local dp_port default_ip
+  dp_port="$(service_get dokploy PORT 2>/dev/null)" || dp_port="3000"
+  default_ip="$(get_ip 2>/dev/null || true)"
+
+  msg "Antes de configurar la API de Dokploy:\n\n1. Abra http://${default_ip:-<ip-del-servidor>}:${dp_port} en un navegador.\n\n2. Si todavía no lo hizo, CREE LA CUENTA DE ADMINISTRADOR ahora: el primer visitante que entra al panel se convierte en administrador, así que cualquiera que llegue antes se queda con esa cuenta.\n\n3. Ya dentro del panel: Configuración -> Perfil (/settings/profile) -> sección API/CLI -> genere un token.\n\nA continuación se piden la IP, el puerto y ese token."
+
+  local backup=""
+  if priv_file_exists "$DOKPLOY_ENV_FILE" 2>/dev/null; then
+    backup="${DOKPLOY_ENV_FILE}.anterior"
+    sudo install -m 0600 -o root -g root /dev/null "$backup"
+    sudo cp "$DOKPLOY_ENV_FILE" "$backup"
+  fi
+
+  # Red de seguridad ante una interrupción (Ctrl+C, señal, caída de dialog)
+  # ENTRE que se hizo el backup y que se confirma éxito/fracaso: sin esto,
+  # una salida abrupta a mitad de dokploy_api_setup (que ya pudo haber
+  # sobrescrito $DOKPLOY_ENV_FILE con datos a medio ingresar) dejaría el
+  # archivo en un estado inconsistente y el '.anterior' huérfano. Es un
+  # trap EXIT (dispara una sola vez, al terminar ESTE proceso bash, sea
+  # cual sea el motivo) — nunca 'trap ... RETURN' (ese SÍ es global al
+  # shell completo y un problema real ya documentado en dokploy_api_call /
+  # dokploy_compose_create_or_update). Un trap EXIT acá es seguro porque
+  # esta función siempre corre como el punto de entrada casi-de-nivel-
+  # superior de un script bash PROPIO (modules/dokploy-api.sh completo, o
+  # modules/dokploy.sh vía run_module: cada módulo es un proceso bash
+  # nuevo) — nada más en ese mismo proceso arma otro trap EXIT que lo
+  # pudiera pisar. Se limpia (trap - EXIT) en cada punto de retorno normal
+  # de más abajo: a partir de ahí el resultado (éxito, restauración,
+  # cancelación) ya quedó aplicado a mano, y dejar el trap armado
+  # repetiría esa acción (con datos potencialmente obsoletos) cuando el
+  # proceso termine más tarde por una razón totalmente ajena.
+  _DOKPLOY_CFGV_BACKUP="$backup"
+  trap _dokploy_cfgv_restore_on_abort EXIT
+
+  while true; do
+    if ! dokploy_api_setup; then
+      trap - EXIT
+      if [[ -n "$backup" ]]; then
+        sudo cp "$backup" "$DOKPLOY_ENV_FILE"
+        sudo rm -f "$backup"
+        msg "No se cambió la configuración de la API de Dokploy. Se conservó la anterior."
+      else
+        msg "No se configuró la API de Dokploy."
+      fi
+      _DOKPLOY_CFGV_BACKUP=""
+      return 1
+    fi
+
+    hli_busy "Verificando la conexión con Dokploy..."
+    if dokploy_api_get "project.all" >/dev/null 2>&1; then
+      trap - EXIT
+      [[ -n "$backup" ]] && sudo rm -f "$backup"
+      _DOKPLOY_CFGV_BACKUP=""
+      log "API de Dokploy configurada y verificada (project.all respondió)."
+      msg "Conexión con Dokploy verificada. Las credenciales quedaron guardadas."
+      return 0
+    fi
+
+    if confirm "Dokploy no aceptó la dirección o el token ingresados.\n\nRevise la dirección del panel y copie el token de nuevo desde Configuración -> Perfil -> API/CLI.\n\n¿Reintentar?"; then
+      continue
+    fi
+
+    trap - EXIT
+    if [[ -n "$backup" ]]; then
+      sudo cp "$backup" "$DOKPLOY_ENV_FILE"
+      sudo rm -f "$backup"
+      msg "Se canceló la configuración de la API de Dokploy. Se conservó la anterior."
+    else
+      sudo rm -f "$DOKPLOY_ENV_FILE"
+      msg "Se canceló la configuración de la API de Dokploy. No quedaron credenciales guardadas."
+    fi
+    _DOKPLOY_CFGV_BACKUP=""
+    return 1
+  done
+}
+
 # --- Proyecto ("homelab") ---------------------------------------------------
 
 DOKPLOY_PROJECT_NAME="homelab"
