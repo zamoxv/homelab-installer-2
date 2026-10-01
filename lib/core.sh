@@ -111,16 +111,42 @@ hli_busy_end() {
   stty echo </dev/tty 2>/dev/null || true
 }
 
+# Altura para msgbox/yesno según el texto. Con altura 0 (automática) dialog
+# deja estos cuadros sin espacio para el texto (validado en la X230: aviso
+# vacío); con una altura fija, los textos largos no entran. Se calcula:
+# líneas del texto (los '\n' de dialog separan líneas; cada línea ocupa
+# ceil(largo/ancho_útil)) + bordes y botones, limitado al alto de la
+# terminal.
+_dlg_height() {
+  local text="$1" width="${2:-76}" extra="${3:-6}"
+  local usable=$(( width - 8 )) lines=0 seg rows max len
+  # dialog interpreta la secuencia literal '\n' como salto de línea.
+  while IFS= read -r seg; do
+    len=${#seg}
+    if (( len == 0 )); then
+      lines=$(( lines + 1 ))
+    else
+      lines=$(( lines + (len + usable - 1) / usable ))
+    fi
+  done <<<"${text//\\n/$'\n'}"
+  rows=$(( lines + extra ))
+  (( rows < 7 )) && rows=7
+  max="$(tput lines 2>/dev/null)" || max=24
+  [[ "$max" =~ ^[0-9]+$ ]] || max=24
+  (( rows > max - 2 )) && rows=$(( max - 2 ))
+  printf '%s' "$rows"
+}
+
 msg() {
   hli_busy_end
   # Puramente informativo (un botón "Aceptar"): ESC o un fallo de dialog no
   # deben abortar el módulo que llamó a msg(), así que nunca propaga error.
-  dialog --title "HLI 2" --msgbox "$1" 0 76 || true
+  dialog --title "HLI 2" --msgbox "$1" "$(_dlg_height "$1")" 76 || true
 }
 
 confirm() {
   hli_busy_end
-  dialog --title "Confirmar" --yesno "$1" 0 76
+  dialog --title "Confirmar" --yesno "$1" "$(_dlg_height "$1")" 76
 }
 
 input_box() {
