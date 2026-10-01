@@ -74,3 +74,17 @@ test_opencloud_password_with_single_quote_rejected() {
     && { fail "no debería haber guardado ningún secreto"; return 1; }
   return 0
 }
+
+# Mismo orden que Vaultwarden: dominio antes del despliegue.
+test_opencloud_domain_created_before_deploy() {
+  harness_mark_canary_done
+  echo "cloud.example.com" > "$DIALOG_INPUTBOX_QUEUE"
+  { echo 'Super$ecreta123!'; echo 'Super$ecreta123!'; } > "$DIALOG_PASSWORDBOX_QUEUE"
+  bash "$REPO_ROOT/modules/opencloud.sh" || { fail "el módulo falló"; return 1; }
+
+  local domain_line deploy_line
+  domain_line="$(grep -n '^>>> POST .*domain\.create' "$STUB_HTTP_BODIES_LOG" | head -1 | cut -d: -f1)"
+  deploy_line="$(grep -n '^>>> POST .*compose\.deploy' "$STUB_HTTP_BODIES_LOG" | tail -1 | cut -d: -f1)"
+  [[ -n "$domain_line" && -n "$deploy_line" ]] || { fail "faltan llamadas: domain=[$domain_line] deploy=[$deploy_line]"; return 1; }
+  (( domain_line < deploy_line )) || { fail "domain.create (línea $domain_line) va después de compose.deploy (línea $deploy_line)"; return 1; }
+}

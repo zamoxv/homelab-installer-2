@@ -97,7 +97,19 @@ _opencloud_main() {
 
   local env_line
   env_line="$(dotenv_single_quoted INITIAL_ADMIN_PASSWORD "$admin_pass")" || { msg "La contraseña guardada contiene caracteres que no se pueden enviar de forma segura (comilla simple o salto de línea). Vuelva a configurarla."; return 1; }
-  if ! composeId="$(dokploy_compose_deploy_full "$environment_id" "opencloud" "$compose_file" "$env_line")"; then
+  # Orden: crear/actualizar el compose -> registrar el dominio -> desplegar.
+  # Dokploy agrega las etiquetas de Traefik del dominio DURANTE el despliegue
+  # (docs: core/docker-compose/domains); un dominio creado después del
+  # despliegue no se aplica hasta el siguiente (validado en la X230: 404).
+  hli_busy "Desplegando opencloud en Dokploy..."
+  local domain_ok=1
+  if ! composeId="$(dokploy_compose_create_or_update "$environment_id" "opencloud" "$compose_file" "$env_line")"; then
+    msg "Falló la creación del servicio OpenCloud vía la API de Dokploy. Revise las credenciales y el panel."
+    rm -f "$compose_file"
+    return 1
+  fi
+  dokploy_domain_ensure "$composeId" "opencloud" "$domain" 9200 false none >/dev/null || domain_ok=0
+  if ! dokploy_compose_deploy "$composeId" >/dev/null; then
     msg "Falló el despliegue de OpenCloud vía la API de Dokploy. Revise las credenciales y el panel."
     rm -f "$compose_file"
     return 1
@@ -107,8 +119,7 @@ _opencloud_main() {
   # Puerto 9200 del propio contenedor; certificateType "none" a propósito
   # (mismo motivo que Vaultwarden: sin dominio públicamente resoluble
   # todavía, Let's Encrypt fallaría el desafío HTTP-01).
-  dokploy_domain_ensure "$composeId" "opencloud" "$domain" 9200 false none \
-    || msg "OpenCloud se desplegó, pero no se pudo configurar el dominio '$domain' en Traefik vía la API de Dokploy. Puede configurarlo a mano desde el panel (pestaña Dominios del compose 'opencloud')."
+  [[ "$domain_ok" -eq 1 ]] || msg "OpenCloud se desplegó, pero no se pudo configurar el dominio '$domain' en Traefik vía la API de Dokploy. Configúrelo desde el panel (pestaña Dominios del compose 'opencloud') y vuelva a desplegar."
 
   local status_note
   if service_wait_active opencloud 180; then

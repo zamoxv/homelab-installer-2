@@ -199,7 +199,19 @@ _vaultwarden_main() {
 
   local env_line
   env_line="$(dotenv_single_quoted ADMIN_TOKEN "$admin_token")" || { msg "El ADMIN_TOKEN guardado tiene un formato inesperado. Vuelva a generarlo."; return 1; }
-  if ! composeId="$(dokploy_compose_deploy_full "$environment_id" "vaultwarden" "$compose_file" "$env_line")"; then
+  # Orden: crear/actualizar el compose -> registrar el dominio -> desplegar.
+  # Dokploy agrega las etiquetas de Traefik del dominio DURANTE el despliegue
+  # (docs: core/docker-compose/domains); un dominio creado después del
+  # despliegue no se aplica hasta el siguiente (validado en la X230: 404).
+  hli_busy "Desplegando vaultwarden en Dokploy..."
+  local domain_ok=1
+  if ! composeId="$(dokploy_compose_create_or_update "$environment_id" "vaultwarden" "$compose_file" "$env_line")"; then
+    msg "Falló la creación del servicio Vaultwarden vía la API de Dokploy. Revise las credenciales y el panel."
+    rm -f "$compose_file"
+    return 1
+  fi
+  dokploy_domain_ensure "$composeId" "vaultwarden" "$domain" 80 false none >/dev/null || domain_ok=0
+  if ! dokploy_compose_deploy "$composeId" >/dev/null; then
     msg "Falló el despliegue de Vaultwarden vía la API de Dokploy. Revise las credenciales y el panel."
     rm -f "$compose_file"
     return 1
@@ -210,8 +222,7 @@ _vaultwarden_main() {
   # "dokploy-network"); certificateType "none" a propósito: sin un dominio
   # públicamente resoluble todavía (eso es v2.4), pedir Let's Encrypt
   # fallaría el desafío HTTP-01. Ver INCERTIDUMBRE en lib/dokploy_api.sh.
-  dokploy_domain_ensure "$composeId" "vaultwarden" "$domain" 80 false none \
-    || msg "Vaultwarden se desplegó, pero no se pudo configurar el dominio '$domain' en Traefik vía la API de Dokploy. Puede configurarlo a mano desde el panel (pestaña Dominios del compose 'vaultwarden')."
+  [[ "$domain_ok" -eq 1 ]] || msg "Vaultwarden se desplegó, pero no se pudo configurar el dominio '$domain' en Traefik vía la API de Dokploy. Configúrelo desde el panel (pestaña Dominios del compose 'vaultwarden') y vuelva a desplegar."
 
   local status_note
   if service_wait_active vaultwarden 120; then
