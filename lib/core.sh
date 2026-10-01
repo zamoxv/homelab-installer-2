@@ -115,12 +115,12 @@ msg() {
   hli_busy_end
   # Puramente informativo (un botón "Aceptar"): ESC o un fallo de dialog no
   # deben abortar el módulo que llamó a msg(), así que nunca propaga error.
-  dialog --title "HLI 2" --msgbox "$1" 12 76 || true
+  dialog --title "HLI 2" --msgbox "$1" 0 76 || true
 }
 
 confirm() {
   hli_busy_end
-  dialog --title "Confirmar" --yesno "$1" 12 76
+  dialog --title "Confirmar" --yesno "$1" 0 76
 }
 
 input_box() {
@@ -128,7 +128,10 @@ input_box() {
   local prompt="$2"
   local default="${3:-}"
   hli_busy_end
-  dialog --title "$title" --inputbox "$prompt" 10 76 "$default" 3>&1 1>&2 2>&3
+  # Altura 0 = dialog la calcula según el texto. Con una altura fija, un
+  # texto largo no entra y dialog falla ("Can't make sub-window", validado
+  # en la X230), y el módulo lo tomaba como "cancelar" sin avisar.
+  dialog --title "$title" --inputbox "$prompt" 0 76 "$default" 3>&1 1>&2 2>&3
 }
 
 # Como input_box(), pero con entrada oculta (--passwordbox, sin eco en
@@ -139,7 +142,7 @@ password_box() {
   local title="$1"
   local prompt="$2"
   hli_busy_end
-  dialog --title "$title" --insecure --passwordbox "$prompt" 10 76 3>&1 1>&2 2>&3
+  dialog --title "$title" --insecure --passwordbox "$prompt" 0 76 3>&1 1>&2 2>&3
 }
 
 # Valida la FORMA de un nombre de dominio (nunca su resolución real):

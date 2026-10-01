@@ -30,7 +30,7 @@ _opencloud_prepare_dirs() {
 
 _opencloud_ask_domain() {
   local domain
-  domain=$(input_box "OpenCloud" "Dominio PÚBLICO futuro para OpenCloud (ej: cloud.tu-dominio.com).\n\nOpenCloud necesita una URL fija para funcionar (cookies/login) pero todavía no se expone a Internet (eso es la fase v2.4, Cloudflare Tunnel). El login NO funcionará del todo hasta que ese dominio resuelva de verdad y tenga TLS. Por ahora queda desplegado y accesible solo por Traefik en la LAN; puede volver a correr este módulo más adelante con el mismo dominio.") || return 1
+  domain=$(input_box "OpenCloud" "Dominio público que tendrá OpenCloud (ej: cloud.tu-dominio.com).\n\nEl login completo funcionará cuando ese dominio tenga HTTPS (fase v2.4).") || return 1
   [[ -n "$domain" ]] || { msg "Dominio vacío: se cancela el despliegue de OpenCloud."; return 1; }
   hli2_valid_hostname "$domain" || { msg "'$domain' no tiene forma de nombre de dominio válido (ej: cloud.tu-dominio.com). Se cancela: vuelva a correr el módulo con un dominio válido."; return 1; }
   printf '%s' "$domain"
