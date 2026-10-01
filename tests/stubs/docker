@@ -28,6 +28,23 @@ case "$*" in
     printf '%s\r\n' "ADMIN_TOKEN='"'$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$RRTestfakeHashForTestingOnlyabc123'"'"
     exit 0
     ;;
+  "run --rm -i httpd:2-alpine htpasswd -n -i -B -C 10 "*)
+    # Lee y descarta la contraseña de stdin (igual que haría el htpasswd
+    # real; acá no se usa para nada, el hash de la respuesta es fijo — lo
+    # que importa para el test es que la contraseña NUNCA llegó por argv,
+    # ver STUB_CALL_LOG). Sin leerla, el extremo escritor del pipe
+    # ('printf ... | hli_docker run ...' en modules/adguard.sh) podría
+    # quedar esperando.
+    cat >/dev/null 2>&1 || true
+    user="${@: -1}"
+    # Hash Argon2id... no, bcrypt de mentira, con la forma REAL de
+    # 'htpasswd -B' ($2y$<costo>$<22 salt + 31 hash>, base64 sin padding).
+    # Terminado en '\n' PLANO (no '\r\n'): a diferencia del stub de
+    # 'vaultwarden hash' de más abajo, acá 'docker run -i' (SIN '-t') no
+    # asigna una pty, así que no hay traducción ONLCR que limpiar.
+    printf '%s:$2y$10$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0\n' "$user"
+    exit 0
+    ;;
   "inspect -f "*"State.Running"*)
     echo "true"
     exit 0

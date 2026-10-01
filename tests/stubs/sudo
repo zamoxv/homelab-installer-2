@@ -32,7 +32,7 @@
 #                                   descarta stdin). También destraban/
 #                                   retraban STUB_ROOT_AREA alrededor de la
 #                                   operación real.
-#   chown|chmod|systemctl|apt|apt-get|needrestart|*
+#   chown|systemctl|apt|apt-get|needrestart|*
 #                                -> no-op: nunca se ejecutan de verdad (son
 #                                   mutaciones de privilegios/servicios del
 #                                   sistema, no de archivos de scratch).
@@ -100,7 +100,7 @@ case "$sub" in
     fi
     exit 1
     ;;
-  tee|mkdir|install|cp|touch)
+  tee|mkdir|install|cp|touch|chmod)
     if _stub_all_paths_safe "${args[@]:1}"; then
       _stub_unlock_root_area
       if [[ "$sub" == "install" ]]; then

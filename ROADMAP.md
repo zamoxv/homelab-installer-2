@@ -150,10 +150,49 @@ documentación pública no la renderiza completa) — el cliente resuelve el `en
 `environment.byProjectId` (sí documentado) y guarda el `composeId` en estado local para no
 depender de un endpoint de listado de composes no confirmado; si `compose.one` devolviera un
 `composeId` que Dokploy ya no reconoce, se trata como "no existe" y se vuelve a crear. También
-falta confirmar en un AdGuard real si un `AdGuardHome.yaml` "sembrado" a mano (solo
-`http.address`/`dns.bind_hosts`) evita del todo el asistente de instalación o si igual pide crear
-el usuario admin (esperable, no es un bug) — y correr la validación canaria una vez contra el
-Dokploy real antes de desplegar Jellyfin/qBittorrent/AdGuard de verdad.
+falta correr la validación canaria una vez contra el Dokploy real antes de desplegar
+Jellyfin/qBittorrent/AdGuard de verdad.
+
+**Hallazgo de seguridad CRÍTICO, validado en hardware real**: el `AdGuardHome.yaml` "sembrado" a
+mano (solo `http.address`/`dns.bind_hosts`, ver `modules/adguard.sh:_adguard_seed_if_missing`) SÍ
+evita el asistente de instalación por completo — y ese asistente es, precisamente, donde AdGuard
+crea el usuario admin. Sin un usuario creado de antemano, el panel en `:3053` arrancaba **SIN
+AUTENTICACIÓN**: cualquiera en la LAN podía entrar y cambiar el DNS de toda la casa. Corregido:
+`modules/adguard.sh` (`_adguard_ensure_admin_user`) ahora crea el usuario admin A MANO, escrito
+directo en el YAML (`lib/importer.sh`: `adguard_yaml_has_users`/`adguard_yaml_append_user`) ANTES
+del primer arranque del contenedor, pidiendo usuario (`input_box`, default `admin`, charset
+validado) y contraseña dos veces (`password_box`, mínimo 8 caracteres, deben coincidir). El hash
+se genera con `htpasswd -B` (bcrypt), el método que documenta la propia wiki de AdGuard Home
+(<https://github.com/AdguardTeam/AdGuardHome/wiki/Configuration>, sección de reseteo de
+contraseña: `htpasswd -B -C 10 -n -b <USERNAME> <PASSWORD>`), corrido dentro de un contenedor
+descartable (`httpd:2-alpine`, trae `htpasswd` de Apache) porque Ubuntu Server no lo trae
+instalado por defecto. Se usa `-i` en vez de `-b`: `-b` pone la contraseña en el ARGV del proceso
+(visible por `ps`/`/proc/<pid>/cmdline` para cualquier usuario local — mismo problema de fondo que
+el token de la API de Dokploy en v2.2); `-i` la lee por STDIN sin que aparezca nunca en argv, log
+ni entorno (manual de Apache: <https://httpd.apache.org/docs/current/programs/htpasswd.html>). El
+hash resultante (prefijo `$2y$`, el que usa `crypt_blowfish`/`apache2-utils`) se valida con una
+regex ANCLADA A AMBOS LADOS antes de guardarse; AdGuard Home (Go) lo acepta sin conversión porque
+compara con `golang.org/x/crypto/bcrypt.CompareHashAndPassword`, cuyo parseo del hash
+(`bcrypt.go:decodeVersion`) solo rechaza una *major version* mayor a `2` — cualquier *minor
+version* (`a`/`b`/`x`/`y`) es válida. La escritura en el YAML nunca pasa por `sed` (el hash
+contiene `$` y puede contener `/`, ambos especiales para los delimitadores/reemplazos de `sed`):
+va por `awk` con el usuario/hash como variables (`-v`, nunca interpolados en el texto del programa
+awk), preservando el resto del archivo. El archivo queda en `0600 root:root` al escribir el
+usuario (antes solo tenía `chown root:root`, pero `$APPDATA_ROOT` es `0755` — mundialmente
+listable/atravesable — así que sin este endurecimiento el hash bcrypt quedaba legible por
+cualquier usuario local del host), con el mismo patrón `install -m 0600` + `tee` (nunca `tee` +
+`chmod` después) que ya usa `secret_file_write` (`lib/secrets.sh`). Si el YAML ya tiene usuarios
+(importado de un backup del v1 con la instalación del wizard ya completada, o de una corrida
+anterior de este mismo módulo), nunca se pregunta nada ni se pisan: idempotente. Tests en
+`tests/test_adguard.sh` (instalación nueva pide credenciales y genera el hash; config importada
+con usuarios no pregunta nada y los preserva tal cual; contraseñas que no coinciden o de menos de
+8 caracteres abortan SIN escribir ningún usuario y SIN marcar el módulo como hecho; la contraseña
+nunca aparece en el log de argv de ningún proceso real).
+
+**Pendiente de validar en un servidor real**: que el login contra el panel de AdGuard Home en
+`:3053` funcione de verdad con el hash generado por este flujo (`htpasswd -B` corrido vía
+`httpd:2-alpine`) — solo se probó contra un stub de `docker` en los tests, nunca contra el binario
+real de `htpasswd` ni contra un AdGuard Home real comparando el hash.
 
 **Revisión de seguridad (post-implementación)**: se corrigieron 3 hallazgos críticos — el token de
 la API viajaba en el argv de `curl` (visible por `ps`/`/proc/<pid>/cmdline` para cualquier usuario
@@ -353,6 +392,13 @@ Dokploy real desde acá):
   carcasas USB) quedan identificados solo por tamaño: un cambio por otro disco
   del mismo tamaño mientras el diálogo está abierto no se detectaría. Las tres
   confirmaciones muestran dispositivo, tamaño y modelo como última defensa.
+
+- **Permisos de `AdGuardHome.yaml`**: el HLI lo deja en 0600 root (contiene
+  el hash de la contraseña del panel), pero AdGuard Home lo reescribe con
+  0644 al guardar cambios
+  ([AdGuardHome#764](https://github.com/AdguardTeam/AdGuardHome/issues/764)).
+  Limitación de AdGuard, no del HLI. Mitigación: `/srv/appdata/adguard/conf`
+  no debería ser legible por otros usuarios (validar en el servidor real).
 
 ## Riesgos a validar primero
 

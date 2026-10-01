@@ -316,6 +316,101 @@ adguard_yaml_set_dns_bind() {
   rm -f "$tmp"
 }
 
+# --- AdGuard Home: usuario admin inicial ------------------------------------
+#
+# ¿El YAML $1 ya tiene al menos un usuario real bajo 'users:'? Un
+# 'users: []' (lista vacía explícita) NO cuenta como "tiene usuarios": según
+# la propia documentación de AdGuard Home (Configuration wiki, sección
+# "users"), una lista vacía desactiva la autenticación — mismo caso que "no
+# hay clave 'users:' en absoluto" para efectos de modules/adguard.sh (hay
+# que crear un admin antes de arrancar el contenedor). Se lee siempre con
+# 'sudo cat' (nunca un '[[ -f ]]'/'cat' plano): funciona sin importar si el
+# archivo ya quedó en 0600 por una corrida anterior de
+# adguard_yaml_append_user, o si todavía está en el modo por defecto de la
+# siembra inicial.
+adguard_yaml_has_users() {
+  local yaml="$1"
+  [[ -f "$yaml" ]] || return 1
+  sudo cat -- "$yaml" 2>/dev/null | awk '
+    /^users:[[:space:]]*$/ { in_users = 1; next }
+    # Cualquier entrada de lista bajo users: cuenta como usuario existente
+    # (sin depender del orden de las claves name/password): ante la duda,
+    # nunca se reemplaza la lista. Clases POSIX, no '\S': el awk por defecto
+    # de Ubuntu es mawk, que no entiende las extensiones de gawk.
+    in_users && /^[[:space:]]*-[[:space:]]*[^[:space:]]/ { found = 1; exit }
+    /^[^[:space:]]/ { in_users = 0 }
+    END { exit (found ? 0 : 1) }
+  '
+}
+
+# Agrega un único usuario ($2 nombre, $3 hash bcrypt ya generado y validado
+# por el llamador) a la sección 'users:' de nivel superior del YAML $1,
+# preservando el resto del archivo intacto. Reemplaza una sección 'users:'
+# existente SOLO si está vacía (ningún '- name:' adentro, o 'users: []')
+# — este helper se llama únicamente después de que adguard_yaml_has_users ya
+# confirmó que no hay usuarios reales que pudiera pisar; nunca se usa para
+# agregar un segundo usuario a una lista con contenido.
+#
+# A propósito, NUNCA pasa por 'sed': el hash bcrypt contiene '$' y puede
+# contener '/' (ambos con significado especial para los delimitadores
+# habituales de 's///' y para el lado derecho de un reemplazo de sed, donde
+# '&'/'\' son especiales), así que toda la transformación va por 'awk' con
+# el usuario/hash pasados como variables (-v, nunca interpolados en el texto
+# del programa awk en sí) — un simple 'print "..." hash' los imprime tal
+# cual, sin que '$' dispare ninguna referencia a campo ($0/$1/...) porque esa
+# sintaxis solo aplica en el CÓDIGO awk, nunca sobre el contenido de una
+# variable de datos.
+#
+# El archivo nunca pasa por 'sudo sed -i'/'sudo awk' directo tampoco (esos
+# subcomandos no están soportados por el stub de 'sudo' de los tests, ver
+# tests/stubs/sudo): se lee con 'sudo cat', se transforma con 'awk' SIN sudo
+# (no hace falta: ya está en una variable del proceso actual, no en el
+# archivo root-only), y se vuelve a escribir con 'sudo tee' — mismo patrón
+# que ya usa modules/adguard.sh (_adguard_seed_if_missing).
+#
+# Deja el archivo en 0600 root:root al terminar: a partir de acá contiene un
+# hash bcrypt (un secreto, aunque resistente a fuerza bruta), y
+# $APPDATA_ROOT queda 0755 por storage.sh/dokploy.sh (mundialmente
+# listable/atravesable) — sin este endurecimiento, cualquier usuario local
+# del host podría leer el hash directo del disco.
+#
+# 'install -m 0600' PRIMERO, 'tee' DESPUÉS (nunca 'tee' + 'chmod' al final):
+# mismo criterio exacto que secret_file_write (lib/secrets.sh) — ese orden
+# ("mkdir/tee + chmod después") deja una ventana en la que el archivo recién
+# truncado por 'tee' tiene el modo por defecto del proceso (umask,
+# típicamente 0644, legible por cualquiera) hasta que el chmod posterior
+# corre. Acá el 0600 final se aplica ANTES de que 'tee' escriba una sola
+# línea de contenido nuevo.
+adguard_yaml_append_user() {
+  local yaml="$1" user="$2" hash="$3" new_content
+  [[ -f "$yaml" ]] || { echo "ERROR: no existe $yaml" >&2; return 1; }
+  [[ -n "$user" && -n "$hash" ]] || { echo "ERROR: adguard_yaml_append_user necesita usuario y hash." >&2; return 1; }
+
+  new_content="$(sudo cat -- "$yaml" 2>/dev/null | awk -v user="$user" -v hash="$hash" '
+    BEGIN { done = 0; in_users = 0 }
+    /^users:[[:space:]]*(\[\][[:space:]]*)?$/ && !done {
+      print "users:"
+      print "  - name: " user
+      print "    password: " hash
+      done = 1
+      in_users = ($0 !~ /\[\]/)
+      next
+    }
+    in_users && /^[[:space:]]/ { next }
+    { in_users = 0; print }
+    END {
+      if (!done) {
+        print "users:"
+        print "  - name: " user
+        print "    password: " hash
+      }
+    }
+  ')" || return 1
+
+  sudo install -m 0600 -o root -g root /dev/null "$yaml"
+  printf '%s\n' "$new_content" | sudo tee "$yaml" >/dev/null
+}
+
 # Copia adguard/AdGuardHome.yaml del backup a APPDATA/adguard/conf y normaliza
 # el panel al puerto del registro (services/adguard.conf, 3053) + DNS
 # escuchando en todas las interfaces. Dueño root (AdGuard corre como root
@@ -335,6 +430,8 @@ importer_adguard() {
   adguard_yaml_set_dns_bind "$dest_dir/AdGuardHome.yaml"
 
   sudo chown -R root:root "$dest_dir"
+  # Root-only: el YAML importado trae el hash de la contraseña del panel.
+  sudo chmod 0600 "$dest_dir/AdGuardHome.yaml"
 }
 
 # --- authorized_keys (SSH) ---------------------------------------------------
