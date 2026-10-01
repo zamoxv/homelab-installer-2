@@ -397,8 +397,9 @@ Dokploy real desde acá):
   el hash de la contraseña del panel), pero AdGuard Home lo reescribe con
   0644 al guardar cambios
   ([AdGuardHome#764](https://github.com/AdguardTeam/AdGuardHome/issues/764)).
-  Limitación de AdGuard, no del HLI. Mitigación: `/srv/appdata/adguard/conf`
-  no debería ser legible por otros usuarios (validar en el servidor real).
+  Limitación de AdGuard, no del HLI. Mitigación aplicada: las carpetas
+  `/srv/appdata/adguard/{conf,work}` quedan en 0700 root, así que el archivo
+  no es alcanzable por otros usuarios aunque AdGuard le cambie el modo.
 
 ## Riesgos a validar primero
 

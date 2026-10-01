@@ -292,7 +292,7 @@ importer_qbittorrent() {
 # (3000 es de Dokploy).
 adguard_yaml_set_http_address() {
   local yaml="$1" port="$2"
-  [[ -f "$yaml" ]] || return 0
+  sudo test -f "$yaml" || return 0
   sudo sed -i -E "0,/^[[:space:]]*address:[[:space:]]/ s|^([[:space:]]*address:[[:space:]]*).*\$|\\10.0.0.0:${port}|" "$yaml"
 }
 
@@ -302,7 +302,7 @@ adguard_yaml_set_http_address() {
 # homelab-installer/lib/common.sh:245-262.
 adguard_yaml_set_dns_bind() {
   local yaml="$1" tmp
-  [[ -f "$yaml" ]] || return 0
+  sudo test -f "$yaml" || return 0
   tmp="$(mktemp)"
   sudo awk '
     /^[[:space:]]*bind_hosts:[[:space:]]*$/ {
@@ -330,7 +330,7 @@ adguard_yaml_set_dns_bind() {
 # siembra inicial.
 adguard_yaml_has_users() {
   local yaml="$1"
-  [[ -f "$yaml" ]] || return 1
+  sudo test -f "$yaml" || return 1
   sudo cat -- "$yaml" 2>/dev/null | awk '
     /^users:[[:space:]]*$/ { in_users = 1; next }
     # Cualquier entrada de lista bajo users: cuenta como usuario existente
@@ -383,7 +383,7 @@ adguard_yaml_has_users() {
 # línea de contenido nuevo.
 adguard_yaml_append_user() {
   local yaml="$1" user="$2" hash="$3" new_content
-  [[ -f "$yaml" ]] || { echo "ERROR: no existe $yaml" >&2; return 1; }
+  sudo test -f "$yaml" || { echo "ERROR: no existe $yaml" >&2; return 1; }
   [[ -n "$user" && -n "$hash" ]] || { echo "ERROR: adguard_yaml_append_user necesita usuario y hash." >&2; return 1; }
 
   new_content="$(sudo cat -- "$yaml" 2>/dev/null | awk -v user="$user" -v hash="$hash" '
@@ -432,6 +432,7 @@ importer_adguard() {
   sudo chown -R root:root "$dest_dir"
   # Root-only: el YAML importado trae el hash de la contraseña del panel.
   sudo chmod 0600 "$dest_dir/AdGuardHome.yaml"
+  sudo chmod 0700 "$dest_dir"
 }
 
 # --- authorized_keys (SSH) ---------------------------------------------------

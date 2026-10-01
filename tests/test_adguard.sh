@@ -186,3 +186,16 @@ test_adguard_has_users_any_key_order() {
   ( source "$REPO_ROOT/lib/core.sh"; adguard_yaml_has_users "$y" ) \
     || { fail "no detectó un usuario con las claves en otro orden"; return 1; }
 }
+
+# Las carpetas de AdGuard quedan en 0700 root: cualquier verificación sin
+# sudo sobre esas rutas falla en el servidor real (en los tests no se nota,
+# porque el usuario del test es dueño de su carpeta). Se prohíben.
+test_adguard_paths_checked_with_sudo() {
+  local hits
+  hits="$(grep -nE '\[\[ -[efsdr] "?\$(yaml|dest_dir)"?|\[\[ -[efsdr] "?\$APPDATA_ROOT/adguard' \
+    "$REPO_ROOT/modules/adguard.sh" "$REPO_ROOT/lib/importer.sh" | grep -v '^[^:]*:[0-9]*:[[:space:]]*#' || true)"
+  if [[ -n "$hits" ]]; then
+    fail "verificaciones sin sudo sobre rutas root-only de AdGuard:"$'\n'"$hits"
+    return 1
+  fi
+}

@@ -46,6 +46,11 @@ source "$(dirname "$0")/../lib/core.sh"
 _adguard_prepare_dirs() {
   sudo mkdir -p "$APPDATA_ROOT/adguard/conf" "$APPDATA_ROOT/adguard/work"
   sudo chown -R root:root "$APPDATA_ROOT/adguard"
+  # Carpetas root-only: AdGuard reescribe AdGuardHome.yaml con 0644 al
+  # guardar cambios (AdGuardHome#764) y el archivo contiene el hash de la
+  # contraseña del panel. Con la carpeta en 0700 nadie más llega al archivo.
+  # Por eso toda verificación sobre estas rutas usa 'sudo test'.
+  sudo chmod 0700 "$APPDATA_ROOT/adguard/conf" "$APPDATA_ROOT/adguard/work"
 }
 
 _adguard_yaml_path() {
@@ -64,7 +69,7 @@ _adguard_offer_import() {
   tar_path=$(input_box "Importar AdGuard Home" "Ruta al backup-<fecha>.tar.gz del HLI v1:") || return 0
   [[ -n "$tar_path" ]] || return 0
 
-  if [[ -f "$APPDATA_ROOT/adguard/conf/AdGuardHome.yaml" ]]; then
+  if sudo test -f "$APPDATA_ROOT/adguard/conf/AdGuardHome.yaml"; then
     confirm "Ya hay un AdGuardHome.yaml en $APPDATA_ROOT/adguard/conf.\n\n¿Sobrescribirlo con el del backup?" || return 0
   fi
 
@@ -86,7 +91,7 @@ _adguard_offer_import() {
 _adguard_seed_if_missing() {
   local yaml port
   yaml="$(_adguard_yaml_path)"
-  [[ -f "$yaml" ]] && return 0
+  sudo test -f "$yaml" && return 0
 
   port="$(service_get adguard PORT)" || port="3053"
   cat <<EOF | sudo tee "$yaml" >/dev/null
