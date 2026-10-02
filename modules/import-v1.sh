@@ -44,25 +44,41 @@ _import_v1_main() {
   if importer_inspect_has jellyfin; then
     if confirm "¿Importar Jellyfin (jellyfin/lib + jellyfin/etc del backup)?"; then
       if importer_gate_service jellyfin "Jellyfin"; then do_jf=1; else summary+="  - Jellyfin: OMITIDO.\n"; fi
+    else
+      summary+="  - Jellyfin: no seleccionado.\n"
     fi
+  else
+    summary+="  - Jellyfin: no viene en el backup.\n"
   fi
 
   if importer_inspect_has qbittorrent; then
     if confirm "¿Importar qBittorrent (qbittorrent/config + qbittorrent/share del backup)?"; then
       if importer_gate_service qbittorrent "qBittorrent"; then do_qb=1; else summary+="  - qBittorrent: OMITIDO.\n"; fi
+    else
+      summary+="  - qBittorrent: no seleccionado.\n"
     fi
+  else
+    summary+="  - qBittorrent: no viene en el backup.\n"
   fi
 
   if importer_inspect_has adguard; then
     if confirm "¿Importar AdGuard Home (AdGuardHome.yaml del backup, normalizado a 0.0.0.0:3053)?"; then
       if importer_gate_service adguard "AdGuard Home"; then do_ag=1; else summary+="  - AdGuard Home: OMITIDO.\n"; fi
+    else
+      summary+="  - AdGuard Home: no seleccionado.\n"
     fi
+  else
+    summary+="  - AdGuard Home: no viene en el backup.\n"
   fi
 
   if importer_inspect_has ssh; then
     if confirm "¿Fusionar ssh/authorized_keys del backup con las claves actuales de $SERVER_USER?"; then
       do_ssh=1
+    else
+      summary+="  - Claves SSH: no seleccionado.\n"
     fi
+  else
+    summary+="  - Claves SSH: no vienen en el backup.\n"
   fi
 
   if [[ $(( do_jf + do_qb + do_ag + do_ssh )) -eq 0 ]]; then

@@ -184,8 +184,9 @@ test_import_component_without_data_is_not_offered() {
 
   bash "$REPO_ROOT/modules/import-v1.sh" || { fail "import-v1 falló"; return 1; }
 
-  assert_file_not_contains "$STUB_CALL_LOG" "AdGuard Home" "no debe preguntar por AdGuard sin su yaml" || return 1
-  assert_file_not_contains "$STUB_CALL_LOG" "Jellyfin" "no debe preguntar por Jellyfin sin archivos" || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" "¿Importar AdGuard" "no debe preguntar por AdGuard sin su yaml" || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" "¿Importar Jellyfin" "no debe preguntar por Jellyfin sin archivos"
+  assert_file_contains "$STUB_CALL_LOG" "AdGuard Home: no viene en el backup" "el resumen informa el componente ausente" || return 1
   assert_file_not_contains "$STUB_CALL_LOG" $'docker\tstop' "no debe detener nada" || return 1
 }
 
