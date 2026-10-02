@@ -46,6 +46,13 @@ _dns_resolves() {
 # Tras aplicar el cambio, VERIFICA que el host todavía resuelve nombres; si
 # no, revierte con restore_dns_port() antes de devolver error (nunca deja el
 # host sin DNS aunque el llamador ignore el código de salida).
+# 1 si free_dns_port() aplicó el cambio EN ESTA ejecución. restore solo debe
+# revertir lo que hizo esta ejecución: si el puerto ya estaba liberado de una
+# ejecución anterior (AdGuard funcionando), revertirlo tras un redeploy
+# fallido devolvería el 53 a systemd-resolved y el AdGuard anterior ya no
+# podría arrancar: la casa quedaría sin DNS.
+DNS_PORT_CHANGED_NOW=0
+
 free_dns_port() {
   systemctl is-active --quiet systemd-resolved 2>/dev/null || return 0
 
@@ -89,6 +96,7 @@ free_dns_port() {
     return 1
   fi
 
+  DNS_PORT_CHANGED_NOW=1
   return 0
 }
 
@@ -125,4 +133,11 @@ restore_dns_port() {
   fi
 
   sudo systemctl restart systemd-resolved 2>/dev/null || true
+}
+
+# Revierte free_dns_port() solo si el cambio se aplicó en esta ejecución.
+restore_dns_port_if_changed_now() {
+  [[ "${DNS_PORT_CHANGED_NOW:-0}" -eq 1 ]] || return 0
+  restore_dns_port
+  DNS_PORT_CHANGED_NOW=0
 }

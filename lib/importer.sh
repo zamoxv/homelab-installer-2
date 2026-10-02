@@ -75,69 +75,177 @@ _importer_tar_reject_reasons() {
   printf '%s' "$reasons"
 }
 
-# Extrae $1 (tar.gz de backup v1) a un directorio temporal nuevo y lo valida
-# mínimamente (existe config.yml, y al menos una carpeta de componente
-# conocida). Imprime la ruta del directorio extraído por stdout. Falla
-# cerrado: ante cualquier duda sobre el contenido del tar (formato, miembros
-# inseguros, espacio insuficiente, algo que resuelve fuera del destino), no
-# se deja nada utilizable en disco y se devuelve 1.
-importer_extract() {
-  local tar_path="$1" work listing listing_err reject
-  [[ -f "$tar_path" ]] || { echo "ERROR: no existe el archivo: $tar_path" >&2; return 1; }
+# Lista y valida el tar $1 SIN extraer nada, y deja el resultado en caché
+# (variables globales, para que importer_extract no vuelva a recorrer el
+# tar): IMPORT_TAR_PATH, IMPORT_TAR_LISTING, IMPORT_TAR_TOTAL_BYTES. Permite
+# decidir qué importar (qué componentes trae, cuánto pesa) ANTES de la
+# extracción, que es la parte lenta. Falla cerrado (return 1, con mensaje por
+# hli_error) si el tar no es legible o trae miembros inseguros. Debe llamarse
+# en el shell actual (no dentro de $(...)) para que la caché sobreviva.
+importer_inspect() {
+  local tar_path="$1" listing listing_err reject
+  [[ -f "$tar_path" ]] || { hli_error "no existe el archivo: $tar_path"; return 1; }
 
-  # 1) Listar ANTES de tocar disco: valida forma/miembros sin extraer nada.
+  # Listar ANTES de tocar disco: valida forma/miembros sin extraer nada.
   # stdout (el listado) y stderr (avisos de 'tar', ej. "Eliminando la '/'
   # inicial de los nombres" cuando ve una ruta absoluta) se capturan por
   # SEPARADO a propósito: el listado en stdout sigue mostrando el nombre de
   # miembro ORIGINAL sin recortar (verificado), que es justo lo que hace
   # falta para poder rechazarlo; si se mezclaran con 'tar -tzvf ... 2>&1',
-  # esas líneas de aviso se colarían en el parseo campo-por-campo de más
-  # abajo y podrían ensuciarlo.
-  if ! listing_err="$(tar -tzvf "$tar_path" 2>&1 1>/dev/null)"; then
-    echo "ERROR: no se pudo listar '$tar_path' (¿no es un tar.gz válido?). Detalle: ${listing_err:0:300}" >&2
+  # esas líneas de aviso se colarían en el parseo campo-por-campo y podrían
+  # ensuciarlo. Una sola pasada: el listado y los avisos van a un archivo
+  # temporal del usuario (no hay que releer el tar comprimido dos veces).
+  local errf
+  errf="$(mktemp)"
+  hli_busy "Verificando el backup..."
+  if ! listing="$(tar -tzvf "$tar_path" 2>"$errf")"; then
+    listing_err="$(head -c 300 "$errf")" || listing_err=""
+    rm -f "$errf"
+    hli_error "no se pudo listar '$tar_path' (¿no es un tar.gz válido?). Detalle: $listing_err"
     return 1
   fi
-  listing="$(tar -tzvf "$tar_path" 2>/dev/null)"
+  rm -f "$errf"
 
   reject="$(_importer_tar_reject_reasons "$listing")"
   if [[ -n "$reject" ]]; then
-    echo "ERROR: el tar contiene entradas no seguras; se aborta SIN extraer nada:" >&2
-    printf '%s' "$reject" >&2
+    hli_error "el tar contiene entradas no seguras; se aborta SIN extraer nada:"$'\n'"$reject"
     return 1
   fi
 
-  # 2) Espacio libre en el destino temporal vs. tamaño total (descomprimido)
-  # listado por 'tar -tzv' (columna 3 de cada línea). Best-effort: si no se
-  # puede leer alguno de los dos números, no bloquea (mejor intentar y que
-  # falle la extracción con un error claro, que negar un import legítimo por
-  # no poder medir).
+  IMPORT_TAR_PATH="$tar_path"
+  IMPORT_TAR_LISTING="$listing"
+  # Tamaño total descomprimido: columna 3 de cada línea de 'tar -tzv'
+  # (mawk-compatible: sin \s/\S/\w).
+  IMPORT_TAR_TOTAL_BYTES="$(awk '{sum+=$3} END{printf "%d", sum}' <<<"$listing")" || IMPORT_TAR_TOTAL_BYTES=0
+  [[ "$IMPORT_TAR_TOTAL_BYTES" =~ ^[0-9]+$ ]] || IMPORT_TAR_TOTAL_BYTES=0
+  return 0
+}
+
+# ¿Trae el backup (según el listado cacheado por importer_inspect) datos
+# REALES importables del componente $1? No alcanza con la carpeta vacía:
+# se exige un archivo marcador, para no detener nunca un contenedor por un
+# componente sin nada que importar.
+#   jellyfin    algún archivo bajo jellyfin/lib/ o jellyfin/etc/
+#   qbittorrent algún archivo bajo qbittorrent/
+#   adguard     adguard/AdGuardHome.yaml
+#   ssh         ssh/authorized_keys
+importer_inspect_has() {
+  local comp="$1" perms ownergroup size date time path
+  [[ -n "${IMPORT_TAR_LISTING:-}" ]] || return 1
+  while read -r perms ownergroup size date time path; do
+    [[ -n "$perms" && "${perms:0:1}" != "d" ]] || continue
+    path="${path#./}"
+    case "$comp:$path" in
+      jellyfin:jellyfin/lib/*|jellyfin:jellyfin/etc/*) return 0 ;;
+      qbittorrent:qbittorrent/*) return 0 ;;
+      adguard:adguard/AdGuardHome.yaml) return 0 ;;
+      ssh:ssh/authorized_keys) return 0 ;;
+    esac
+  done <<<"$IMPORT_TAR_LISTING"
+  return 1
+}
+
+# Extrae el tar $1 a $2 mostrando progreso. Con terminal: 'dialog --gauge'
+# alimentado con los bytes ya extraídos (du del destino) contra el total
+# ($3, del listado). Es solo cosmético: la extracción corre en segundo plano
+# y su código de salida (el que cuenta) se toma de 'wait'. Sin terminal
+# (tests, segundo plano) extrae sin dibujar nada. Los avisos de tar van al
+# archivo $4. Devuelve el código de 'tar'.
+_importer_tar_extract() {
+  local tar_path="$1" work="$2" total="$3" errf="$4" rc=0 mb gpid="" donef="$4.done"
+  mb=$(( total / 1048576 ))
+  if { : >/dev/tty; } 2>/dev/null && command -v dialog >/dev/null 2>&1; then
+    stty -echo </dev/tty 2>/dev/null || true
+    # El medidor corre EN SEGUNDO PLANO y 'tar' en PRIMER plano: un trabajo
+    # en segundo plano de un script no interactivo arranca con SIGINT
+    # ignorado, así que un 'tar' en segundo plano sobrevivía a Ctrl+C y
+    # seguía llenando el disco. En primer plano, Ctrl+C lo mata y el
+    # script termina (los trap EXIT limpian). El medidor termina solo: al
+    # aparecer $donef o cuando el proceso padre ya no existe.
+    (
+      parent=$$
+      while [[ ! -e "$donef" ]] && kill -0 "$parent" 2>/dev/null; do
+        cur="$(du -sb "$work" 2>/dev/null | cut -f1)" || cur=0
+        [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+        pct=0
+        (( total > 0 )) && pct=$(( cur * 100 / total ))
+        (( pct > 99 )) && pct=99
+        printf 'XXX\n%d\nExtrayendo el backup (%d MB)...\nXXX\n' "$pct" "$mb"
+        sleep 1
+      done
+      printf 'XXX\n100\nExtrayendo el backup (%d MB)...\nXXX\n' "$mb"
+    ) | dialog --title "HLI 2" --gauge "Extrayendo el backup (${mb} MB)..." 8 70 0 >/dev/tty 2>/dev/null &
+    gpid=$!
+    tar -xzf "$tar_path" -C "$work" --no-same-owner --no-same-permissions 2>"$errf" || rc=$?
+    : > "$donef"
+    wait "$gpid" 2>/dev/null || true
+    rm -f "$donef"
+    hli_busy_end   # devuelve el eco del teclado
+  else
+    tar -xzf "$tar_path" -C "$work" --no-same-owner --no-same-permissions 2>"$errf" || rc=$?
+  fi
+  return "$rc"
+}
+
+# Extrae $1 (tar.gz de backup v1) a un directorio temporal nuevo y lo valida
+# mínimamente (existe config.yml, y al menos una carpeta de componente
+# conocida). Deja la ruta del directorio extraído en la GLOBAL IMPORT_WORK_DIR
+# (no por stdout): así existe en el shell del llamador desde ANTES de empezar
+# a extraer y el trap EXIT de cada módulo (importer_exit_cleanup) puede
+# borrarlo aunque se interrumpa con Ctrl+C — llamarla dentro de $(...)
+# perdería la variable. Llamar SIN command substitution. Falla
+# cerrado: ante cualquier duda sobre el contenido del tar (formato, miembros
+# inseguros, espacio insuficiente, algo que resuelve fuera del destino), no
+# se deja nada utilizable en disco y se devuelve 1. Si el llamador ya corrió
+# importer_inspect sobre este mismo tar, reutiliza su listado (no relee el
+# tar); si no, lo inspecciona acá.
+importer_extract() {
+  local tar_path="$1" work
+  IMPORT_WORK_DIR=""
+  if [[ "${IMPORT_TAR_PATH:-}" != "$tar_path" ]]; then
+    importer_inspect "$tar_path" || return 1
+  fi
+
+  # Espacio libre en el destino temporal vs. tamaño total (descomprimido).
+  # Best-effort: si no se puede leer alguno de los dos números, no bloquea
+  # (mejor intentar y que falle la extracción con un error claro, que negar
+  # un import legítimo por no poder medir).
   local total_kb avail_kb tmp_base
-  total_kb="$(awk '{sum+=$3} END{if (sum>0) print int(sum/1024)+1}' <<<"$listing")" || true
+  total_kb=$(( IMPORT_TAR_TOTAL_BYTES / 1024 + 1 ))
+  [[ "$IMPORT_TAR_TOTAL_BYTES" -gt 0 ]] || total_kb=""
   tmp_base="${TMPDIR:-/tmp}"
   avail_kb="$(df --output=avail -k "$tmp_base" 2>/dev/null | tail -n1 | tr -dc '0-9')" || true
   if [[ -n "$total_kb" && -n "$avail_kb" && "$avail_kb" -lt "$total_kb" ]]; then
-    echo "ERROR: no hay espacio suficiente en $tmp_base para extraer el backup (necesita ~${total_kb}KB, disponibles ${avail_kb}KB)." >&2
+    hli_error "no hay espacio suficiente en $tmp_base para extraer el backup (necesita ~${total_kb}KB, disponibles ${avail_kb}KB)."
     return 1
   fi
 
-  # 3) Extraer. '--no-same-owner --no-same-permissions': el contenido queda
+  # Extraer. '--no-same-owner --no-same-permissions': el contenido queda
   # con el dueño/permisos del proceso actual (no los que traía el tar,
   # potencialmente ajenos/root de otra máquina); cada importer_* fija el
   # dueño final correcto al copiar desde acá hacia APPDATA. Stderr de tar NO
   # se descarta: si algo sale mal se ve en el mensaje de error.
   work="$(mktemp -d)"
-  local tar_err=""
-  if ! tar_err="$(tar -xzf "$tar_path" -C "$work" --no-same-owner --no-same-permissions 2>&1)"; then
-    echo "ERROR: no se pudo extraer '$tar_path'. Detalle: ${tar_err:0:300}" >&2
-    rm -rf "$work"
+  IMPORT_WORK_DIR="$work"
+  # Archivo de avisos de tar: hermano del directorio ($work.err), así
+  # importer_cleanup lo borra junto con él aunque se interrumpa.
+  local tar_err="" errf="$work.err"
+  : > "$errf"
+  if ! _importer_tar_extract "$tar_path" "$work" "${IMPORT_TAR_TOTAL_BYTES:-0}" "$errf"; then
+    tar_err="$(head -c 300 "$errf")" || tar_err=""
+    rm -f "$errf"
+    hli_error "no se pudo extraer '$tar_path'. Detalle: $tar_err"
+    rm -rf "$work"; IMPORT_WORK_DIR=""
     return 1
   fi
-  [[ -n "$tar_err" ]] && log "importer_extract: aviso de tar al extraer '$tar_path': ${tar_err:0:500}" 2>/dev/null || true
+  tar_err="$(head -c 500 "$errf")" || tar_err=""
+  rm -f "$errf"
+  [[ -z "$tar_err" ]] || log "importer_extract: aviso de tar al extraer '$tar_path': $tar_err" 2>/dev/null || true
 
-  # 4) Defensa en profundidad: aunque el listado ya se validó (paso 1),
-  # confirmar con realpath que NINGÚN archivo extraído terminó resolviendo
-  # fuera de $work (cubre además el caso de un hardlink/symlink que el tar
-  # hubiera creado por otra vía no capturada por el parseo del listado).
+  # Defensa en profundidad: aunque el listado ya se validó, confirmar con
+  # realpath que NINGÚN archivo extraído terminó resolviendo fuera de $work
+  # (cubre además el caso de un hardlink/symlink que el tar hubiera creado
+  # por otra vía no capturada por el parseo del listado).
   local f rp work_rp
   work_rp="$(realpath "$work")"
   while IFS= read -r -d '' f; do
@@ -145,16 +253,16 @@ importer_extract() {
     case "$rp" in
       "$work_rp"|"$work_rp"/*) : ;;
       *)
-        echo "ERROR: un archivo extraído resuelve fuera del directorio temporal ($f -> $rp). Se aborta." >&2
-        rm -rf "$work"
+        hli_error "un archivo extraído resuelve fuera del directorio temporal ($f -> $rp). Se aborta."
+        rm -rf "$work"; IMPORT_WORK_DIR=""
         return 1
         ;;
     esac
   done < <(find "$work" -mindepth 1 -print0)
 
   if [[ ! -f "$work/config.yml" ]]; then
-    echo "ERROR: el tar no tiene 'config.yml' en la raíz: no parece un backup válido del HLI v1." >&2
-    rm -rf "$work"
+    hli_error "el tar no tiene 'config.yml' en la raíz: no parece un backup válido del HLI v1."
+    rm -rf "$work"; IMPORT_WORK_DIR=""
     return 1
   fi
 
@@ -163,26 +271,68 @@ importer_extract() {
     [[ -d "$work/$d" ]] && known=1
   done
   if [[ "$known" -eq 0 ]]; then
-    echo "ERROR: el tar no contiene ninguna carpeta de componente conocida (jellyfin/qbittorrent/adguard/samba/hli/ssh)." >&2
-    rm -rf "$work"
+    hli_error "el tar no contiene ninguna carpeta de componente conocida (jellyfin/qbittorrent/adguard/samba/hli/ssh)."
+    rm -rf "$work"; IMPORT_WORK_DIR=""
     return 1
   fi
 
-  printf '%s' "$work"
+  return 0
 }
 
 importer_cleanup() {
   local work="$1"
-  [[ -n "$work" && -d "$work" ]] && rm -rf "$work"
+  if [[ -n "$work" ]]; then rm -rf "$work"; rm -f "$work.err" "$work.err.done"; fi
+  return 0
 }
 
-# --- Seguridad: solo importar con el contenedor destino detenido/ausente ----
+# Contenedores que ESTE proceso detuvo para importar y todavía no volvieron a
+# levantarse (por redespliegue o despliegue del módulo). 'restart:
+# unless-stopped' no reinicia un contenedor detenido a mano, así que si el
+# proceso falla o se interrumpe antes del despliegue, importer_exit_cleanup
+# los vuelve a arrancar (la config ya copiada es aceptable; dejar el
+# servicio caído, no: AdGuard es el DNS de la casa).
+IMPORT_STOPPED_CONTAINERS=""
+
+importer_stopped_add() {
+  IMPORT_STOPPED_CONTAINERS+="$1 "
+}
+
+importer_stopped_clear() {
+  IMPORT_STOPPED_CONTAINERS="${IMPORT_STOPPED_CONTAINERS// $1 / }"
+  IMPORT_STOPPED_CONTAINERS="${IMPORT_STOPPED_CONTAINERS/#$1 /}"
+}
+
+# Trap EXIT de los módulos que importan: borra el directorio de extracción,
+# vuelve a arrancar lo que quedó detenido y restaura el eco del teclado.
+# Vuelve a iniciar un contenedor detenido por la importación. Si falla (p. ej.
+# sudo sin contraseña en caché tras una espera larga), lo deja registrado en
+# stderr y en el log con el comando exacto: nunca un servicio caído en silencio.
+_importer_restart_container() {
+  local c="$1"
+  hli_docker start "$c" >/dev/null 2>&1 && return 0
+  hli_error "no se pudo volver a iniciar el contenedor '$c'. Inícielo a mano: sudo docker start $c"
+  return 1
+}
+
+importer_exit_cleanup() {
+  local c
+  if [[ -n "${IMPORT_WORK_DIR:-}" ]]; then importer_cleanup "$IMPORT_WORK_DIR"; fi
+  for c in ${IMPORT_STOPPED_CONTAINERS:-}; do
+    _importer_restart_container "$c"
+  done
+  IMPORT_STOPPED_CONTAINERS=""
+  hli_busy_end
+  return 0
+}
+
+# --- Seguridad: estado del contenedor destino --------------------------------
 
 # ¿Es seguro importar sobre el servicio $1 (id de services/<id>.conf, KIND
-# container)? Solo "detenido", "no instalado" o "docker no disponible" (el
-# contenedor sencillamente no existe) se consideran seguros. "activo" y
+# container) sin más trámite? Solo "detenido", "no instalado" o "docker no
+# disponible" (el contenedor sencillamente no existe) lo son. "activo" y
 # "desconocido" NUNCA: fallar cerrado ante cualquier duda, nunca escribir
-# appdata de un servicio que puede estar corriendo ahora mismo.
+# appdata de un servicio que puede estar corriendo ahora mismo. Para decidir
+# qué hacer con cada uno de esos dos casos, ver importer_gate_service.
 importer_container_safe() {
   local service_id="$1" state
   state="$(service_state "$service_id")"
@@ -190,6 +340,142 @@ importer_container_safe() {
     detenido|"no instalado"|"docker no disponible") return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# Servicios (ids) que el usuario aceptó detener para importar; se vuelven a
+# desplegar (o no, ver importer_apply_service) al terminar.
+IMPORT_STOP_IDS=" "
+
+# Decide, ANTES de extraer nada, si se importa sobre el servicio $1 ($2 =
+# nombre para mostrar). Retorna 0 = continuar, 1 = omitir (ya se avisó al
+# usuario por msg).
+#   detenido / no instalado / docker no disponible -> continuar.
+#   activo      -> ofrece detenerlo, importar y volver a desplegarlo; si el
+#                  usuario acepta, queda marcado en IMPORT_STOP_IDS (el
+#                  stop real ocurre en importer_apply_service, justo antes de
+#                  copiar: así un fallo de extracción no deja el servicio
+#                  parado). Si no, se omite explícitamente.
+#   desconocido (u otro) -> mensaje aparte: no se pudo consultar Docker.
+#                  NUNCA se mezcla con "activo".
+importer_gate_service() {
+  local service_id="$1" label="$2" state
+  state="$(service_state "$service_id")"
+  case "$state" in
+    detenido|"no instalado"|"docker no disponible")
+      return 0
+      ;;
+    activo)
+      if confirm "El servicio $label está corriendo. ¿Detenerlo, importar su configuración y volver a desplegarlo?"; then
+        IMPORT_STOP_IDS+="$service_id "
+        return 0
+      fi
+      msg "$label: se omite la importación (el servicio sigue corriendo, sin cambios)."
+      return 1
+      ;;
+    *)
+      msg "No se pudo consultar el estado de Docker (¿sudo sin contraseña en caché?). Se omite $label por seguridad."
+      return 1
+      ;;
+  esac
+}
+
+# Importación PENDIENTE de un servicio (módulos de servicio): el módulo
+# extrae y pregunta temprano, pero detiene+copia recién justo antes de
+# desplegar (importer_apply_pending), para minimizar el tiempo caído.
+IMPORT_PENDING=""
+
+importer_pending_set() {
+  IMPORT_PENDING="$1|$2|$3"
+}
+
+# Aplica la importación pendiente (si la hay): detener -> copiar. NO
+# redespliega: el módulo despliega inmediatamente después. 0 = aplicada o
+# nada pendiente; 1 = falló (ya se avisó).
+importer_apply_pending() {
+  [[ -n "$IMPORT_PENDING" ]] || return 0
+  local id fn label rc=0
+  IFS='|' read -r id fn label <<<"$IMPORT_PENDING"
+  IMPORT_PENDING=""
+  importer_apply_service "$id" "$fn" "$IMPORT_WORK_DIR" "$label" noredeploy || rc=$?
+  importer_cleanup "$IMPORT_WORK_DIR"
+  IMPORT_WORK_DIR=""
+  if [[ "$rc" -ne 0 ]]; then
+    msg "Falló la importación de $label (ver el log del módulo). Se cancela el despliegue."
+    return 1
+  fi
+  return 0
+}
+
+# ¿El usuario aceptó detener el servicio $1 en importer_gate_service?
+importer_will_stop() {
+  [[ "${IMPORT_STOP_IDS:- }" == *" $1 "* ]]
+}
+
+# Vuelve a desplegar el servicio $1 con el composeId registrado por el
+# módulo del servicio (dokploy_compose_id_for: el mismo compose que
+# desplegó modules/<id>.sh, revalidado contra Dokploy). Si no hay composeId
+# registrado, falla: sin él habría que re-renderizar el compose, que es
+# justamente lo que hace el módulo del servicio.
+importer_redeploy_service() {
+  local service_id="$1" composeId
+  composeId="$(dokploy_compose_id_for "$service_id")" || return 1
+  [[ -n "$composeId" ]] || return 1
+  hli_busy "Volviendo a desplegar $service_id en Dokploy..."
+  dokploy_compose_deploy "$composeId"
+}
+
+# Corre la importación $2 (función importer_*) sobre el directorio extraído $3
+# para el servicio $1 ($4 = nombre para mostrar), con el ciclo de
+# detener/volver a desplegar si el usuario lo aceptó en importer_gate_service.
+# $5 = "redeploy" (default) o "noredeploy": los módulos de servicio
+# (jellyfin.sh...) usan 'noredeploy' porque ellos mismos despliegan justo
+# después de ofrecer la importación.
+# Códigos: 0 = todo bien; 1 = falló la importación (se intenta dejar el
+# contenedor como estaba: se vuelve a arrancar); 10 = importado, pero el
+# redespliegue falló (la configuración YA está importada).
+importer_apply_service() {
+  local service_id="$1" fn="$2" dir="$3" label="$4" mode="${5:-redeploy}"
+  local container rc=0 stopped=0
+  container="$(service_get "$service_id" CONTAINER)" || container="$service_id"
+
+  if importer_will_stop "$service_id"; then
+    hli_busy "Deteniendo $label..."
+    # Se registra ANTES de detener: si 'docker stop' devuelve error pero el
+    # contenedor igual se detuvo, la trampa de salida lo vuelve a iniciar.
+    importer_stopped_add "$container"
+    if ! hli_docker stop "$container" >/dev/null 2>&1; then
+      if [[ "$(hli_docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" == "true" ]]; then
+        importer_stopped_clear "$container"
+      fi
+      hli_error "no se pudo detener el contenedor '$container'; se omite la importación de $label."
+      msg "No se pudo detener $label. No se importó nada de este servicio."
+      return 1
+    fi
+    stopped=1
+  fi
+
+  hli_busy "Copiando $label..."
+  "$fn" "$dir" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    hli_error "falló la importación de $label (código $rc)."
+    if [[ "$stopped" -eq 1 ]]; then
+      _importer_restart_container "$container" && importer_stopped_clear "$container"
+    fi
+    return 1
+  fi
+
+  if [[ "$stopped" -eq 1 && "$mode" == "redeploy" ]]; then
+    if importer_redeploy_service "$service_id"; then
+      importer_stopped_clear "$container"
+    else
+      # La config ya está copiada: al menos dejar el servicio corriendo.
+      _importer_restart_container "$container" && importer_stopped_clear "$container"
+      hli_error "no se pudo volver a desplegar $label tras importar."
+      msg "La configuración de $label ya está importada, pero no se pudo volver a desplegar. Ejecute el módulo de $label desde el menú para desplegarlo."
+      return 10
+    fi
+  fi
+  return 0
 }
 
 # ¿El destino $1 ya tiene contenido? (para pedir confirmación antes de
@@ -386,8 +672,8 @@ adguard_yaml_has_users() {
 # línea de contenido nuevo.
 adguard_yaml_append_user() {
   local yaml="$1" user="$2" hash="$3" new_content
-  sudo test -f "$yaml" || { echo "ERROR: no existe $yaml" >&2; return 1; }
-  [[ -n "$user" && -n "$hash" ]] || { echo "ERROR: adguard_yaml_append_user necesita usuario y hash." >&2; return 1; }
+  sudo test -f "$yaml" || { hli_error "no existe $yaml"; return 1; }
+  [[ -n "$user" && -n "$hash" ]] || { hli_error "adguard_yaml_append_user necesita usuario y hash."; return 1; }
 
   new_content="$(sudo cat -- "$yaml" 2>/dev/null | awk -v user="$user" -v hash="$hash" '
     BEGIN { done = 0; in_users = 0 }

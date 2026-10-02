@@ -83,6 +83,47 @@ log() {
   echo "[$(date '+%F %T')] $msg" | sudo tee -a "$LOG_DIR/install.log" >/dev/null
 }
 
+# Línea con fecha en install.log y, si el proceso es un módulo (ver
+# HLI2_MODULE_NAME más abajo), también en $LOG_DIR/<módulo>.log. Nunca falla:
+# un log que no se puede escribir no debe tumbar al módulo (ni disparar el
+# trap ERR dentro de su propio manejador).
+hli_module_log() {
+  local line="[$(date '+%F %T')] $1" mod="${HLI2_MODULE_NAME:-}"
+  if [[ -n "$mod" ]]; then
+    printf '%s\n' "$line" | sudo tee -a "$LOG_DIR/install.log" "$LOG_DIR/$mod.log" >/dev/null 2>&1 || true
+  else
+    printf '%s\n' "$line" | sudo tee -a "$LOG_DIR/install.log" >/dev/null 2>&1 || true
+  fi
+}
+
+# Error visible Y con rastro: escribe "ERROR: <mensaje>" a stderr y al log del
+# módulo. Los módulos TUI no pueden mandar su stderr por una tubería
+# (dialog dibuja los cuadros de entrada/contraseña por stderr y la tubería
+# rompe la detección del tamaño de la terminal), así que el rastro se deja
+# explícitamente acá. No pasar secretos en el mensaje.
+hli_error() {
+  printf 'ERROR: %s\n' "$1" >&2
+  hli_module_log "ERROR: $1"
+  return 0
+}
+
+# Manejador del trap ERR de los módulos. Registra módulo, línea y SOLO el
+# nombre del comando que falló (primera palabra, sin argumentos ni valores
+# de asignación): BASH_COMMAND es el texto sin expandir, pero igual se
+# recorta para no arrastrar nada sensible a un log legible por otros.
+_hli_on_err() {
+  local rc="$1" line="$2" src="$3" cmd="$4" mod="${HLI2_MODULE_NAME:-?}" where=""
+  [[ -z "${_HLI_IN_ERR:-}" ]] || return 0
+  _HLI_IN_ERR=1
+  cmd="${cmd%%[[:space:]]*}"
+  cmd="${cmd%%=*}"
+  cmd="${cmd:0:40}"
+  [[ "$(basename "$src")" == "$mod.sh" ]] || where=" [$(basename "$src")]"
+  hli_module_log "Error en $mod línea $line$where: $cmd (código $rc)"
+  _HLI_IN_ERR=""
+  return 0
+}
+
 mark_done() {
   local module="$1"
   grep -qxF "$module" "$STATE_FILE" 2>/dev/null || echo "$module" >> "$STATE_FILE"
@@ -317,6 +358,27 @@ run_module_quiet() {
   return "$rc"
 }
 
+# Un módulo ejecutado directamente (fuera de bootstrap.sh, que mantiene sudo
+# cacheado con un keepalive) pide sudo una vez al inicio si no está en caché.
+# Sin esto, toda consulta de estado de Docker (sudo -n) da "desconocido".
+# Solo con terminal interactiva: en segundo plano/tests nunca pregunta nada.
+hli_require_sudo() {
+  [[ -t 0 ]] || return 0
+  sudo -n true 2>/dev/null && return 0
+  sudo -v -p 'HLI 2 necesita permisos de administrador. Contraseña de %p: ' || true
+}
+
+# Procesos de módulo (bash modules/<id>.sh): nombre para los logs y trap ERR
+# que deja rastro de las fallas (línea + comando) en el log del módulo. 'set
+# -E' hace que el trap valga también dentro de funciones y subshells. Sigue
+# la semántica de 'set -e': no dispara en condicionales ni en listas
+# '&&'/'||'.
+if [[ "$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)" == "$(cd "$SCRIPT_DIR/modules" 2>/dev/null && pwd -P)" && "$0" == *.sh ]]; then
+  HLI2_MODULE_NAME="$(basename "$0" .sh)"
+  set -E
+  trap '_hli_on_err "$?" "$LINENO" "${BASH_SOURCE[0]}" "$BASH_COMMAND"' ERR
+fi
+
 # Resto de la biblioteca. El orden importa poco: las funciones se resuelven
 # recién al invocarlas, y para entonces ya está todo sourceado.
 source "$SCRIPT_DIR/lib/storage.sh"
@@ -328,3 +390,5 @@ source "$SCRIPT_DIR/lib/dokploy_api.sh"
 source "$SCRIPT_DIR/lib/compose.sh"
 source "$SCRIPT_DIR/lib/importer.sh"
 source "$SCRIPT_DIR/lib/canary.sh"
+
+hli_require_sudo

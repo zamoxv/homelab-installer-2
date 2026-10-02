@@ -432,16 +432,16 @@ Dokploy real desde acá):
 
 Encontrado al validar la importación real del M70q en la X230 (2026-10-02):
 
-- [ ] Si un servicio está corriendo, ofrecer detenerlo, importar y volver a
+- [x] Si un servicio está corriendo, ofrecer detenerlo, importar y volver a
       desplegarlo (hoy lo omite y deja que el usuario lo resuelva).
-- [ ] Consultar el estado de los contenedores ANTES de extraer el backup (hoy
+- [x] Consultar el estado de los contenedores ANTES de extraer el backup (hoy
       extrae todo, que es lo lento, y recién después decide omitir).
-- [ ] Aviso de "trabajando" y progreso durante la extracción y la copia.
-- [ ] Mensajes separados: "está activo" vs "no se pudo consultar Docker (falta
+- [x] Aviso de "trabajando" y progreso durante la extracción y la copia.
+- [x] Mensajes separados: "está activo" vs "no se pudo consultar Docker (falta
       sudo)".
-- [ ] Un módulo ejecutado directamente (fuera de bootstrap.sh) pide sudo al
+- [x] Un módulo ejecutado directamente (fuera de bootstrap.sh) pide sudo al
       inicio si no está en caché (hoy todo da "desconocido").
-- [ ] Los módulos interactivos dejan sus errores en un log: hoy van a stderr,
+- [x] Los módulos interactivos dejan sus errores en un log: hoy van a stderr,
       la siguiente ventana los tapa y no queda rastro en /var/log/hli2.
 
 ### v2.4 — Exposición externa

@@ -60,29 +60,26 @@ _adguard_yaml_path() {
 _adguard_offer_import() {
   confirm "¿Importar la configuración de AdGuard Home desde un backup del HLI v1 (backup-<fecha>.tar.gz)?" || return 0
 
-  if ! importer_container_safe adguard; then
-    msg "El contenedor 'adguard' parece estar activo o su estado no se pudo determinar. Por seguridad, la importación solo corre con el contenedor detenido o ausente."
-    return 1
-  fi
-
   local tar_path
   tar_path=$(input_box "Importar AdGuard Home" "Ruta al backup-<fecha>.tar.gz del HLI v1:") || return 0
   [[ -n "$tar_path" ]] || return 0
+
+  # Estado del contenedor ANTES de extraer nada (la extracción es lo lento):
+  # si está corriendo, ofrece detenerlo; si no se pudo consultar, se omite.
+  # Este módulo despliega justo después, así que no hace falta volver a
+  # desplegar acá ('noredeploy').
+  importer_gate_service adguard "AdGuard Home" || return 0
 
   if sudo test -f "$APPDATA_ROOT/adguard/conf/AdGuardHome.yaml"; then
     confirm "Ya hay un AdGuardHome.yaml en $APPDATA_ROOT/adguard/conf.\n\n¿Sobrescribirlo con el del backup?" || return 0
   fi
 
-  # IMPORT_WORK_DIR (global, no 'local work'): así el trap EXIT del bloque
-  # de ejecución real (al final del archivo) puede limpiar el directorio
-  # temporal aunque algo falle entre medio bajo 'set -e' — un 'trap ...
-  # RETURN' NO sirve acá porque no es local a esta función (ver el mismo
-  # comentario en modules/dokploy.sh sobre por qué no se usa).
-  IMPORT_WORK_DIR="$(importer_extract "$tar_path")" || { msg "No se pudo extraer el backup. Revise la ruta y que sea un tar.gz válido del HLI v1."; return 1; }
-  importer_adguard "$IMPORT_WORK_DIR"
-  importer_cleanup "$IMPORT_WORK_DIR"
-  IMPORT_WORK_DIR=""
-  msg "Configuración de AdGuard Home importada y normalizada (panel en 0.0.0.0:3053, DNS en todas las interfaces)."
+  # Solo se EXTRAE acá (IMPORT_WORK_DIR es global: importer_exit_cleanup lo
+  # borra aunque se interrumpa). Detener + copiar se difiere hasta justo
+  # antes del despliegue (importer_apply_pending), para minimizar el tiempo
+  # que el servicio queda caído.
+  importer_extract "$tar_path" || { msg "No se pudo extraer el backup. Revise la ruta, que sea un tar.gz válido del HLI v1 y el log del módulo."; return 1; }
+  importer_pending_set adguard importer_adguard "AdGuard Home"
   return 0
 }
 
@@ -197,36 +194,43 @@ _adguard_ensure_admin_user() {
 _adguard_main() {
   _adguard_prepare_dirs
   _adguard_offer_import || true
-  _adguard_seed_if_missing
-  _adguard_ensure_admin_user "$(_adguard_yaml_path)" || return 1
 
+  # Todo lo lento (canary, API, render) ANTES de detener AdGuard (es el DNS
+  # de la casa): después de importer_apply_pending el servicio queda caído
+  # hasta el despliegue.
   dokploy_preflight || return 1
 
   local project_json environment_id compose_file composeId url port
   project_json="$(dokploy_project_find_or_create)" || { msg "No se pudo crear/encontrar el proyecto 'homelab' en Dokploy."; return 1; }
   environment_id="$(dokploy_environment_default_id "$project_json")" || { msg "No se pudo resolver el ambiente por defecto del proyecto 'homelab' en Dokploy."; return 1; }
 
+  compose_file="$(mktemp)"
+  compose_render_adguard > "$compose_file"
+
+  importer_apply_pending || { rm -f "$compose_file"; return 1; }
+  _adguard_seed_if_missing
+  _adguard_ensure_admin_user "$(_adguard_yaml_path)" || { rm -f "$compose_file"; return 1; }
+
   # Recién ACÁ, inmediatamente antes de tocar el compose real: ver el
   # comentario de arriba sobre por qué no se hace al principio del módulo.
   if ! free_dns_port; then
     msg "No se pudo liberar el puerto 53 de forma segura (ver detalle en el log). Se cancela el despliegue de AdGuard: no se toca el DNS del host sin poder garantizar que sigue funcionando."
+    rm -f "$compose_file"
     return 1
   fi
 
-  compose_file="$(mktemp)"
-  compose_render_adguard > "$compose_file"
-
   if ! composeId="$(dokploy_compose_deploy_full "$environment_id" "adguard" "$compose_file")"; then
     msg "Falló el despliegue de AdGuard Home vía la API de Dokploy. Se revierte el cambio de DNS del host (puerto 53 vuelve a systemd-resolved) para no dejarlo sin DNS con AdGuard sin desplegar."
-    restore_dns_port
+    restore_dns_port_if_changed_now
     rm -f "$compose_file"
     return 1
   fi
   rm -f "$compose_file"
+  importer_stopped_clear "$(service_get adguard CONTAINER)"
 
   if ! service_wait_active adguard 120; then
     msg "AdGuard Home no llegó a 'activo' dentro de los 120 segundos de espera. Se revierte el cambio de DNS del host (puerto 53 vuelve a systemd-resolved) para no dejar el host sin DNS con AdGuard caído.\n\nRevise el panel de Dokploy y, cuando el contenedor esté realmente arriba, vuelva a correr este módulo (es idempotente) para liberar el puerto 53 de nuevo."
-    restore_dns_port
+    restore_dns_port_if_changed_now
     return 1
   fi
 
@@ -239,6 +243,6 @@ _adguard_main() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  trap '[[ -n "${IMPORT_WORK_DIR:-}" ]] && importer_cleanup "$IMPORT_WORK_DIR"' EXIT
+  trap importer_exit_cleanup EXIT
   _adguard_main
 fi

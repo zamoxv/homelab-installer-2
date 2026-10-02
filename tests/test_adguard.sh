@@ -213,3 +213,20 @@ test_no_sudo_tee_into_user_tempfiles() {
     return 1
   fi
 }
+
+# Si el puerto 53 ya estaba liberado de una ejecución anterior (AdGuard
+# funcionando), un despliegue fallido NO debe revertirlo: el AdGuard anterior
+# no podría volver a arrancar y la casa quedaría sin DNS. Solo se revierte lo
+# que se cambió en esta ejecución.
+test_dns_restore_only_reverts_change_made_now() {
+  local d="$STUB_SAFE_ROOT/dns"
+  mkdir -p "$d/confd"
+  printf '[Resolve]\nDNSStubListener=no\n' > "$d/confd/99-hli2.conf"
+  ( export HLI2_DNS_PORT_DROPIN="$d/confd/99-hli2.conf" HLI2_DNS_PORT_RESOLVED_CONFD_DIR="$d/confd" \
+      HLI2_DNS_PORT_STATE_DIR="$d"
+    source "$REPO_ROOT/lib/core.sh"
+    systemctl() { return 0; }
+    free_dns_port
+    restore_dns_port_if_changed_now ) >/dev/null 2>&1 || { fail "free/restore devolvió error"; return 1; }
+  [[ -f "$d/confd/99-hli2.conf" ]] || { fail "se revirtió un cambio de una ejecución anterior"; return 1; }
+}

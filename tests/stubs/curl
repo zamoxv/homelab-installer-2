@@ -89,8 +89,14 @@ case "$url" in
     resp='{"project":{"name":"homelab","projectId":"proj-1"},"environment":{"environmentId":"env-1","name":"production"}}'
     ;;
   *compose.one*)
-    http_code=404
-    resp=""
+    # STUB_COMPOSE_ONE_OK=1: el composeId registrado SÍ existe en Dokploy
+    # (camino de redespliegue del importador, dokploy_compose_id_for).
+    if [[ -n "${STUB_COMPOSE_ONE_OK:-}" ]]; then
+      resp='{"composeId":"cid-existing"}'
+    else
+      http_code=404
+      resp=""
+    fi
     ;;
   *compose.create)
     name="$(printf '%s' "$body" | jq -r '.appName // .name // "unknown"' 2>/dev/null)" || name="unknown"
@@ -100,7 +106,13 @@ case "$url" in
     resp='{}'
     ;;
   *compose.deploy)
-    resp='{}'
+    # STUB_CURL_FAIL_DEPLOY=1: el despliegue falla (500).
+    if [[ -n "${STUB_CURL_FAIL_DEPLOY:-}" ]]; then
+      http_code=500
+      resp='{"error":"deploy falló (stub)"}'
+    else
+      resp='{}'
+    fi
     ;;
   *compose.delete)
     resp='{}'

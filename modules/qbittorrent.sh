@@ -16,27 +16,28 @@ _qbittorrent_prepare_dirs() {
 _qbittorrent_offer_import() {
   confirm "¿Importar la configuración de qBittorrent desde un backup del HLI v1 (backup-<fecha>.tar.gz)?" || return 0
 
-  if ! importer_container_safe qbittorrent; then
-    msg "El contenedor 'qbittorrent' parece estar activo o su estado no se pudo determinar. Por seguridad, la importación solo corre con el contenedor detenido o ausente."
-    return 1
-  fi
-
   local tar_path
   tar_path=$(input_box "Importar qBittorrent" "Ruta al backup-<fecha>.tar.gz del HLI v1:") || return 0
   [[ -n "$tar_path" ]] || return 0
+
+  # Estado del contenedor ANTES de extraer nada (la extracción es lo lento):
+  # si está corriendo, ofrece detenerlo; si no se pudo consultar, se omite.
+  # Este módulo despliega justo después, así que no hace falta volver a
+  # desplegar acá ('noredeploy').
+  importer_gate_service qbittorrent "qBittorrent" || return 0
 
   if importer_dest_has_content "$APPDATA_ROOT/qbittorrent/config"; then
     confirm "Ya hay datos en $APPDATA_ROOT/qbittorrent/config.\n\n¿Importar de todos modos? Los archivos del backup se fusionan/sobrescriben encima (rsync)." \
       || return 0
   fi
 
-  # IMPORT_WORK_DIR (global): la limpia el trap EXIT de más abajo (ver el
-  # mismo comentario en modules/jellyfin.sh sobre por qué no un trap RETURN).
-  IMPORT_WORK_DIR="$(importer_extract "$tar_path")" || { msg "No se pudo extraer el backup. Revise la ruta y que sea un tar.gz válido del HLI v1."; return 1; }
-  importer_qbittorrent "$IMPORT_WORK_DIR"
-  importer_cleanup "$IMPORT_WORK_DIR"
-  IMPORT_WORK_DIR=""
-  msg "Configuración de qBittorrent importada desde el backup.\n\nVerifique la ruta de descargas por defecto en el WebUI: si el backup venía de otro disco/punto de montaje, puede necesitar ajustarla a mano."
+  # Solo se EXTRAE acá (IMPORT_WORK_DIR es global: importer_exit_cleanup lo
+  # borra aunque se interrumpa). Detener + copiar se difiere hasta justo
+  # antes del despliegue (importer_apply_pending), para minimizar el tiempo
+  # que el servicio queda caído.
+  importer_extract "$tar_path" || { msg "No se pudo extraer el backup. Revise la ruta, que sea un tar.gz válido del HLI v1 y el log del módulo."; return 1; }
+  importer_pending_set qbittorrent importer_qbittorrent "qBittorrent"
+  return 0
 }
 
 _qbittorrent_main() {
@@ -56,12 +57,23 @@ _qbittorrent_main() {
     return 1
   fi
 
+  # Detener + copiar la importación (si la hay) recién ahora, con todo lo
+  # lento (canary, API, render) ya resuelto: el servicio queda caído solo
+  # el instante entre esto y el despliegue.
+  local imported_note=""
+  [[ -n "$IMPORT_PENDING" ]] && imported_note="\n\nConfiguración importada desde el backup del HLI v1: verifique en el WebUI la ruta de descargas por defecto; si el backup venía de otro disco o punto de montaje, puede necesitar ajustarla a mano."
+  if ! importer_apply_pending; then
+    rm -f "$compose_file"
+    return 1
+  fi
+
   if ! composeId="$(dokploy_compose_deploy_full "$environment_id" "qbittorrent" "$compose_file")"; then
     msg "Falló el despliegue de qBittorrent vía la API de Dokploy. Revise las credenciales y el panel."
     rm -f "$compose_file"
     return 1
   fi
   rm -f "$compose_file"
+  importer_stopped_clear "$(service_get qbittorrent CONTAINER)"
 
   local status_note
   if service_wait_active qbittorrent 120; then
@@ -71,13 +83,13 @@ _qbittorrent_main() {
   fi
 
   url="$(service_url qbittorrent)" || true
-  msg "qBittorrent desplegado (composeId=$composeId).\n\n$status_note\n\nURL: ${url:-N/D}\n\nContraseña temporal del WebUI: revise los logs del contenedor la primera vez (linuxserver la genera e imprime al inicio si no hay una guardada)."
+  msg "qBittorrent desplegado (composeId=$composeId).\n\n$status_note\n\nURL: ${url:-N/D}\n\nContraseña temporal del WebUI: revise los logs del contenedor la primera vez (linuxserver la genera e imprime al inicio si no hay una guardada).${imported_note}"
 
   mark_done qbittorrent
   return 0
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  trap '[[ -n "${IMPORT_WORK_DIR:-}" ]] && importer_cleanup "$IMPORT_WORK_DIR"' EXIT
+  trap importer_exit_cleanup EXIT
   _qbittorrent_main
 fi

@@ -8,6 +8,11 @@ set -uo pipefail
 source "$(dirname "$0")/_stublib.sh"
 log_call docker "$@"
 
+# STUB_DOCKER_FAIL_START=1: 'docker start' falla (p. ej. sudo sin caché).
+if [[ -n "${STUB_DOCKER_FAIL_START:-}" && "${1:-}" == "start" ]]; then
+  exit 1
+fi
+
 case "$*" in
   "run --rm -i httpd:2-alpine htpasswd -n -i -B -C 10 "*)
     # Lee y descarta la contraseña de stdin (igual que haría el htpasswd
