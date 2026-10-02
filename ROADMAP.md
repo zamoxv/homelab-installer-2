@@ -428,7 +428,25 @@ Dokploy real desde acá):
   keepalive de fondo, pero nunca se probó el camino de lectura contra un
   `sudo` real (solo contra el stub de tests).
 
+### v2.3.1 — Importador y diagnóstico (en curso)
+
+Encontrado al validar la importación real del M70q en la X230 (2026-10-02):
+
+- [ ] Si un servicio está corriendo, ofrecer detenerlo, importar y volver a
+      desplegarlo (hoy lo omite y deja que el usuario lo resuelva).
+- [ ] Consultar el estado de los contenedores ANTES de extraer el backup (hoy
+      extrae todo, que es lo lento, y recién después decide omitir).
+- [ ] Aviso de "trabajando" y progreso durante la extracción y la copia.
+- [ ] Mensajes separados: "está activo" vs "no se pudo consultar Docker (falta
+      sudo)".
+- [ ] Un módulo ejecutado directamente (fuera de bootstrap.sh) pide sudo al
+      inicio si no está en caché (hoy todo da "desconocido").
+- [ ] Los módulos interactivos dejan sus errores en un log: hoy van a stderr,
+      la siguiente ventana los tapa y no queda rastro en /var/log/hli2.
+
 ### v2.4 — Exposición externa
+
+Requiere un dominio propio administrado en Cloudflare (DNS en Cloudflare).
 
 - [ ] `cloudflared` apuntando a Traefik. Públicos: Vaultwarden, OpenCloud, sitios web.
       Solo LAN: AdGuard, qBittorrent, Home Assistant, panel de Dokploy.
@@ -469,13 +487,39 @@ Dokploy real desde acá):
 
 ## Riesgos a validar primero
 
-- Dokploy sobre Ubuntu 26.04 (no soportado oficialmente).
-- `network_mode: host` en compose administrado por Dokploy.
-- Cloudflare Tunnel exige un dominio administrado en Cloudflare.
+- ~~Dokploy sobre Ubuntu 26.04~~ — **confirmado incompatible** en la X230: el
+  instalador fija Docker 28.5.0 (Docker 29 rompe su Traefik) y no existe para
+  26.04. El módulo `dokploy` bloquea sistemas posteriores a 24.04.
+- ~~`network_mode: host` en compose administrado por Dokploy~~ — **validado**
+  (AdGuard sirve DNS en 53; Home Assistant descubre dispositivos de la LAN).
+- Cloudflare Tunnel exige un dominio administrado en Cloudflare (v2.4).
 
 ## Migración del M70q
 
-1. Backup completo con el HLI v1 y copiarlo fuera del servidor.
-2. Reinstalar Ubuntu (preferir 24.04 LTS). Los discos de media no se formatean.
-3. Instalar HLI 2 e importar la config desde el tar del v1.
-4. Durante el corte, DNS secundario en el router (AdGuard es el DNS de la casa).
+Estado actual (2026-10-02): M70q en `192.168.1.10`, Ubuntu **26.04**
+(incompatible con Dokploy), `/srv/media2` al **94,7 %** de 888 GB.
+
+1. Backup completo con el HLI v1 (`/srv/backups/backup-<fecha>.tar.gz`) y
+   copiarlo fuera del servidor.
+2. Reinstalar con **Ubuntu Server 24.04 LTS** (obligatorio, no preferencia).
+   Los discos de media no se formatean.
+3. Instalar HLI 2: host base, `datadisk` con la opción "usar" para el disco de
+   media (mantener `/srv/media2`, que es la ruta que tienen las bibliotecas de
+   Jellyfin y los torrents), `dokploy` (crear la cuenta de admin y el token al
+   terminar).
+4. Desplegar los servicios, detenerlos, importar con `import-v1` desde el menú
+   (no ejecutando el módulo suelto) y volver a desplegarlos. Con v2.3.1 esto
+   último lo hará el propio importador.
+5. Durante el corte, DNS secundario en el router (AdGuard es el DNS de la casa).
+6. Planificar espacio: `/srv/media2` está casi lleno; evaluar un segundo disco
+   para el pool (`/srv/media3`) o limpieza antes de migrar.
+
+## Pendiente: uso diario
+
+- [ ] **Paquete `.deb`**: instalar el HLI 2 en `/opt/hli2` con el comando
+      `hli2` disponible desde cualquier carpeta; actualizar instalando una
+      versión nueva del paquete.
+- [ ] **Lanzador en el Fedora** (`.desktop` con ícono): abre una terminal con
+      `ssh -t <servidor> hli2`. Requiere acceso SSH por clave.
+- [ ] **Repositorio remoto en GitHub** para el HLI 2 (hoy los commits viven solo
+      en el Fedora y se copian con `git bundle`).
