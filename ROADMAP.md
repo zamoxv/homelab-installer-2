@@ -514,6 +514,37 @@ Estado actual (2026-10-02): M70q en `192.168.1.10`, Ubuntu **26.04**
 6. Planificar espacio: `/srv/media2` está casi lleno; evaluar un segundo disco
    para el pool (`/srv/media3`) o limpieza antes de migrar.
 
+## Orden acordado (2026-10-02)
+
+1. Repositorio remoto en GitHub (respaldo del código antes de tocar servidores).
+2. Migración del M70q (sección anterior).
+3. JASJIC: de la Raspberry Pi al M70q, en su propio proyecto de Dokploy.
+4. v2.4 — Cloudflare Tunnel.
+
+## JASJIC: proyecto separado en Dokploy
+
+Objetivo: migrar JASJIC (hoy en una Raspberry Pi) al M70q como contenedor,
+separado de los servicios del hogar.
+
+- Dokploy organiza todo en **proyecto → entornos → servicios**. Cada proyecto
+  nace con un entorno `production` que no se puede renombrar ni borrar: el
+  `production` de `homelab` es ese entorno por defecto, no "mis proyectos".
+- La separación correcta es un **proyecto propio** (`jasjic`), no un entorno
+  dentro de `homelab`. Opcional: un entorno `staging` dentro de `jasjic` para
+  probar cambios antes de publicarlos.
+- Los proyectos separan configuración, variables y despliegues, pero
+  comparten CPU, RAM y disco del M70q. Para aislamiento de red, evaluar los
+  "isolated deployments" de Dokploy según si JASJIC se expone a Internet.
+
+Por definir antes de diseñar el módulo:
+- [ ] Stack de JASJIC (lenguaje, base de datos, servicios auxiliares) y cómo
+      corre hoy en la Raspberry Pi.
+- [ ] Datos a migrar (base de datos, archivos subidos) y su tamaño.
+- [ ] Si se expone a Internet (depende de v2.4) o queda solo en la LAN.
+- [ ] Arquitectura: la Raspberry Pi es ARM y el M70q x86_64 — las imágenes o
+      dependencias compiladas para ARM no sirven tal cual.
+- [ ] Respaldo: dumps de su base de datos (capa Dokploy) y archivos (capa HLI).
+
 ## Pendiente: uso diario
 
 - [ ] **Paquete `.deb`**: instalar el HLI 2 en `/opt/hli2` con el comando
