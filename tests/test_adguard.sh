@@ -199,3 +199,17 @@ test_adguard_paths_checked_with_sudo() {
     return 1
   fi
 }
+
+# fs.protected_regular (Ubuntu): root no puede abrir para escritura un
+# archivo de otro usuario en /tmp. Un temporal creado con mktemp es del
+# usuario: nunca se escribe con 'sudo tee'. En los tests no se nota (no hay
+# root real), así que se prohíbe el patrón.
+test_no_sudo_tee_into_user_tempfiles() {
+  local hits
+  hits="$(grep -rnE 'sudo tee (-a )?"?\$(tmp|tmp_[a-z]+|work|body_file|env_file|compose_file)' \
+    "$REPO_ROOT/lib" "$REPO_ROOT/modules" | grep -v '^[^:]*:[0-9]*:[[:space:]]*#' || true)"
+  if [[ -n "$hits" ]]; then
+    fail "escritura con 'sudo tee' en un temporal del usuario (falla con fs.protected_regular):"$'\n'"$hits"
+    return 1
+  fi
+}

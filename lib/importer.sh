@@ -311,7 +311,10 @@ adguard_yaml_set_dns_bind() {
     }
     in_bh && /^[[:space:]]*-[[:space:]]/ { next }
     { in_bh = 0; print }
-  ' "$yaml" | sudo tee "$tmp" >/dev/null
+  ' "$yaml" > "$tmp"
+  # El temporal es del usuario (mktemp): se escribe SIN sudo. Con 'sudo tee'
+  # falla en el servidor real: fs.protected_regular impide que root abra
+  # para escritura un archivo ajeno en /tmp (validado en la X230).
   sudo cp "$tmp" "$yaml"
   rm -f "$tmp"
 }
