@@ -652,6 +652,15 @@ Por definir antes de diseñar el módulo:
 
 ## Pendiente: uso diario
 
+- [ ] **Cancelar o fallar una pregunta no debe ser silencioso.** Validado en el
+      M70q: cuando dialog no pudo dibujar la pregunta del dominio de
+      Vaultwarden, el módulo lo tomó como "Cancelar" y terminó sin aviso (solo
+      figuró en el resumen final). Cada `input_box`/`confirm` que corte el
+      módulo debe mostrar por qué ("se canceló la pregunta X o no se pudo
+      mostrar").
+- [ ] **El log de errores debe señalar el paso que falló**, no la línea donde
+      terminó el módulo: registrar la pila de funciones (`FUNCNAME`,
+      `BASH_LINENO`) en la trampa ERR o en cada `return 1` relevante.
 - [ ] **Tests: punto ciego de `set -e`.** El harness corre cada test en un
       contexto (`if`/`||`) donde bash ignora `set -e` incluso si un subshell lo
       vuelve a activar. Los 24 usos de `( set -euo pipefail; … )` en
