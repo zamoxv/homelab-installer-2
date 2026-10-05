@@ -652,6 +652,12 @@ Por definir antes de diseñar el módulo:
 
 ## Pendiente: uso diario
 
+- [ ] **Herramienta "Cambiar usuario/contraseña de AdGuard"**: AdGuard no permite
+      cambiarla desde su panel (solo editando `AdGuardHome.yaml`). Reusar la
+      generación de hash de la instalación (htpasswd en contenedor, contraseña
+      por stdin) y reemplazar el usuario con AdGuard detenido, reiniciándolo
+      al final (también si algo falla).
+
 - [ ] **Cancelar o fallar una pregunta no debe ser silencioso.** Validado en el
       M70q: cuando dialog no pudo dibujar la pregunta del dominio de
       Vaultwarden, el módulo lo tomó como "Cancelar" y terminó sin aviso (solo
