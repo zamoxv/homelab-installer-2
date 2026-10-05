@@ -580,23 +580,37 @@ va detrás de Access) y lo que no es HTTP (Samba, DNS) necesitan una VPN
 
 ## Migración del M70q
 
-Estado actual (2026-10-02): M70q en `192.168.1.10`, Ubuntu **26.04**
-(incompatible con Dokploy), `/srv/media2` al **94,7 %** de 888 GB.
+Plan de discos (decidido 2026-10-05):
 
-1. Backup completo con el HLI v1 (`/srv/backups/backup-<fecha>.tar.gz`) y
-   copiarlo fuera del servidor.
-2. Reinstalar con **Ubuntu Server 24.04 LTS** (obligatorio, no preferencia).
-   Los discos de media no se formatean.
-3. Instalar HLI 2: host base, `datadisk` con la opción "usar" para el disco de
-   media (mantener `/srv/media2`, que es la ruta que tienen las bibliotecas de
-   Jellyfin y los torrents), `dokploy` (crear la cuenta de admin y el token al
-   terminar).
-4. Desplegar los servicios, detenerlos, importar con `import-v1` desde el menú
-   (no ejecutando el módulo suelto) y volver a desplegarlos. Con v2.3.1 esto
-   último lo hará el propio importador.
-5. Durante el corte, DNS secundario en el router (AdGuard es el DNS de la casa).
-6. Planificar espacio: `/srv/media2` está casi lleno; evaluar un segundo disco
-   para el pool (`/srv/media3`) o limpieza antes de migrar.
+| Disco | Uso | Montaje |
+|---|---|---|
+| NVMe | Sistema y servicios (`/srv/appdata`) | `/` (LVM) |
+| SSD SATA 2 TB (interno, nuevo) | Media | `/srv/media` |
+| HDD 2 TB (USB) | Media | `/srv/media2` |
+| HDD 1 TB (el de hoy) | Solo durante la copia, en carcasa USB | temporal (p. ej. `/mnt/viejo`), fuera del pool |
+
+El M70q tiene una sola bahía SATA de 2,5": el SSD nuevo va adentro y el HDD
+viejo pasa a una carcasa USB para la copia (~840 GB, unas 2–2,5 h por USB).
+
+Pasos:
+1. Backup completo con el HLI v1 (`/srv/backups/backup-<fecha>.tar.gz`) y una
+   copia fuera del M70q (Fedora).
+2. DNS secundario en el router (p. ej. `1.1.1.1`) antes de apagar: AdGuard es
+   el DNS de la casa.
+3. Instalar **Ubuntu Server 24.04 LTS** solo en el NVMe, con LVM, OpenSSH, sin
+   snaps, mismo usuario (UID 1000). **No seleccionar** ningún disco de media en
+   el instalador.
+4. Misma IP que antes (reserva por MAC en el router).
+5. HLI 2: `git clone https://github.com/zamoxv/homelab-installer-2.git hli2`,
+   host base, `datadisk` (SSD → `/srv/media` formateado; HDD USB 2 TB →
+   `/srv/media2`), `dokploy` (cuenta de admin y token al terminar).
+6. Copiar la media del HDD viejo al SSD con `rsync` (progreso, reanudable,
+   verificación al final).
+7. Importar del backup del v1 **solo AdGuard y las claves SSH**. Jellyfin y
+   qBittorrent se instalan limpios (las rutas cambian de `/srv/media2` a
+   `/srv/media`; se acepta perder los estados de visto de Jellyfin).
+8. Desplegar el resto de servicios; bibliotecas de Jellyfin en `/srv/media`.
+9. Quitar el DNS secundario del router cuando AdGuard responda.
 
 ## Orden acordado (2026-10-02)
 
@@ -630,6 +644,10 @@ Por definir antes de diseñar el módulo:
 - [ ] Respaldo: dumps de su base de datos (capa Dokploy) y archivos (capa HLI).
 
 ## Pendiente: uso diario
+
+- [ ] **Módulo "copiar media"** (el v1 tenía `media-transfer`): copiar de un
+      disco a otro del pool con `rsync` (progreso, reanudable, verificación al
+      final), sin pasos manuales.
 
 - [ ] **Paquete `.deb`**: instalar el HLI 2 en `/opt/hli2` con el comando
       `hli2` disponible desde cualquier carpeta; actualizar instalando una
