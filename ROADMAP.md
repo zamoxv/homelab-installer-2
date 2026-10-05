@@ -465,7 +465,7 @@ Requiere un dominio propio con su DNS administrado en Cloudflare.
 | Jellyfin | Solo LAN | Video por el túnel choca con los términos de Cloudflare |
 | AdGuard (panel) | Solo LAN | Cambia el DNS de toda la casa |
 | AdGuard (DNS), Samba | Solo LAN | No son tráfico web |
-| Home Assistant | Por decidir | Ver decisiones abiertas |
+| Home Assistant | Público (protección propia) | La app móvil no atraviesa Access; 2FA obligatorio + bloqueo de IP por intentos fallidos |
 | Sitios web, JASJIC | Por proyecto | |
 
 **Diseño:**
@@ -512,8 +512,13 @@ va detrás de Access) y lo que no es HTTP (Samba, DNS) necesitan una VPN
 (Tailscale o Cloudflare WARP), en una fase posterior.
 
 **Decisiones abiertas** (se completan antes de implementar):
-- [ ] Home Assistant: Access (más seguro, sin app móvil fuera de casa) o público
-      con su login + 2FA (app móvil funciona).
+- [x] Home Assistant: **público con su login + 2FA** (decidido 2026-10-05), para
+      que la app móvil funcione fuera de casa. Requisitos antes de exponerlo:
+      2FA activado en cada usuario, y en `configuration.yaml`:
+      `http: use_x_forwarded_for: true`, `trusted_proxies` (red de Docker de
+      Traefik), `ip_ban_enabled: true`, `login_attempts_threshold: 5`. El
+      módulo de exposición debe negarse a hacerlo público si falta esa
+      configuración.
 - [ ] Método de identidad de Access (correo con código de un solo uso, Google…)
       y quiénes acceden (solo el usuario, familia).
 - [ ] Duración de la sesión de Access.
