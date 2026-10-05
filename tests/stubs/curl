@@ -18,6 +18,7 @@ log_call curl "$@"
 
 method="GET"
 stdin_config=""
+out_file=""
 data_file=""
 url=""
 args=("$@")
@@ -33,6 +34,10 @@ while [[ $i -lt $n ]]; do
       i=$((i + 1))
       data_file="${args[$i]#@}"
       ;;
+    -o)
+      i=$((i + 1))
+      out_file="${args[$i]}"
+      ;;
     -K)
       i=$((i + 1))
       # '-K -': configuración (header con el token) por stdin.
@@ -45,6 +50,28 @@ done
 # en dokploy_api_call siempre se pasa al final ("$url" después de las
 # opciones), así que alcanza con el último elemento del array.
 url="${args[$((n - 1))]}"
+
+# Descargas del repositorio apt de Tailscale ('curl -fsSL -o <archivo> URL').
+# STUB_TAILSCALE_LIST_BAD=1: la lista de fuentes viene con otro contenido;
+# STUB_TAILSCALE_CURL_FAIL=1: la descarga falla.
+case "$url" in
+  https://pkgs.tailscale.com/*)
+    [[ -n "${STUB_TAILSCALE_CURL_FAIL:-}" ]] && exit 22
+    case "$url" in
+      *.noarmor.gpg) content='FAKE-KEYRING-BYTES' ;;
+      *.tailscale-keyring.list)
+        if [[ -n "${STUB_TAILSCALE_LIST_BAD:-}" ]]; then
+          content='deb https://evil.example.com/ubuntu noble main'
+        else
+          content=$'# Tailscale packages for ubuntu noble\ndeb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main'
+        fi
+        ;;
+      *) exit 22 ;;
+    esac
+    [[ -n "$out_file" ]] && printf '%s\n' "$content" > "$out_file" || printf '%s\n' "$content"
+    exit 0
+    ;;
+esac
 
 body=""
 if [[ -n "$data_file" && -f "$data_file" ]]; then

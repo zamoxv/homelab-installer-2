@@ -131,6 +131,32 @@ en el equipo de prueba para que las bibliotecas se vean.
 | 29 | `opencloud` | Despliega; el login **no** funcionará sin dominio con TLS (esperado hasta v2.4). Anotar RAM: `docker stats --no-stream` |
 | 30 | Re-ejecutar `opencloud` | No falla por `opencloud init` repetido |
 
+### v2.4a — Cloudflare Tunnel y Tailscale
+
+Requisitos: un dominio con su DNS en Cloudflare y un túnel **administrado
+remotamente** creado en Cloudflare (Zero Trust → Networks → Tunnels → Create a
+tunnel → Cloudflared). Los nombres de abajo son genéricos: reemplazar
+`<dominio>` por el propio. Tener `vaultwarden`, `opencloud` y `homeassistant`
+desplegados.
+
+| # | Prueba | Resultado esperado |
+|---|---|---|
+| 33 | `cloudflared`, pegar el token (o el comando completo que muestra Cloudflare) | Acepta ambos; `sudo ls -l /etc/hli2/` → `cloudflared.env` con `-rw------- root` |
+| 34 | Pegar un texto cualquiera como token | Rechaza con un aviso; no crea `cloudflared.env` |
+| 35 | Cancelar el cuadro del token | Aviso "Se cancela el despliegue de Cloudflare Tunnel" |
+| 36 | `docker ps --filter name=cloudflared`; en Cloudflare, el túnel | Contenedor activo; el túnel figura `Healthy` |
+| 37 | `docker exec cloudflared env \| grep -c TUNNEL_TOKEN` y `sudo ss -ltn` | `1`; ningún puerto nuevo escuchando en el host |
+| 38 | Crear las rutas en este orden: `vault.<dominio>` ruta `^/admin` → HTTP_STATUS 404; `vault.<dominio>` → HTTP `dokploy-traefik:80`; `cloud.<dominio>` → HTTP `dokploy-traefik:80`; `casa.<dominio>` → HTTP `<IP LAN>:8123` | Con datos móviles: `https://vault.<dominio>` abre; `https://vault.<dominio>/admin` da 404; `https://cloud.<dominio>` abre; `https://casa.<dominio>` abre |
+| 39 | Verificar que el conector llega a Traefik por nombre: `docker network inspect dokploy-network --format '{{range .Containers}}{{.Name}} {{end}}'` | Aparecen `cloudflared` y `dokploy-traefik` (si Traefik tiene otro nombre, anotarlo: hay que cambiar la URL de las rutas); la prueba 38 con `vault.<dominio>` abierto lo confirma |
+| 40 | Un subdominio no listado (`otro.<dominio>`) | No responde / 404 de Cloudflare |
+| 41 | Re-ejecutar `cloudflared` | Ofrece reemplazar el token; con "No" no vuelve a pedirlo y re-despliega |
+| 42 | `tailscale` en el servidor | Muestra aviso, luego `tailscale up` imprime una URL de inicio de sesión **en la terminal**; al aprobarla muestra IP `100.x.y.z` y nombre MagicDNS |
+| 43 | `apt-cache policy tailscale` y `cat /etc/apt/sources.list.d/tailscale.list` | Origen `pkgs.tailscale.com/stable/ubuntu noble`; `systemctl is-active tailscaled` → `active` |
+| 44 | Instalar la app de Tailscale en el teléfono (misma cuenta), apagar el Wi-Fi | `http://<IP Tailscale>:3000` (Dokploy) y `:8096` (Jellyfin) abren |
+| 45 | Re-ejecutar `tailscale` | Solo muestra estado e IP; no reinstala ni vuelve a pedir inicio de sesión |
+| 46 | Paso opcional de AdGuard: aceptar | Confirma que AdGuard escucha en `0.0.0.0:53` y explica los pasos del panel de Tailscale (DNS → Nameservers → IP de Tailscale → Override DNS servers) |
+| 47 | Tras configurar 46, en el teléfono con Tailscale | `ping` a un dominio de lista de bloqueo no resuelve; el resto de Internet funciona |
+
 ### Energía (correr primero)
 
 | # | Prueba | Resultado esperado |

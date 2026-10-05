@@ -76,6 +76,26 @@ case "$sub" in
     unset -v 'args[0]'
     exec docker "${args[@]}"
     ;;
+  tailscale)
+    # 'sudo tailscale ...': delega al 'tailscale' del PATH (stub de
+    # tests/stubs/fake, si el test lo puso); hereda stdout/stdin.
+    unset -v 'args[0]'
+    tailscale "${args[@]}"
+    exit $?
+    ;;
+  env)
+    # hli_apt = 'sudo env VAR=.. apt-get ...'. STUB_APT_FAIL=1 hace fallar
+    # cualquier apt-get; con STUB_APT_INSTALL_BIN_DIR, 'apt-get install
+    # tailscale' "instala" el stub de tailscale en ese directorio.
+    if [[ " ${args[*]} " == *" apt-get "* ]]; then
+      [[ -n "${STUB_APT_FAIL:-}" ]] && exit 1
+      if [[ " ${args[*]} " == *" install tailscale "* && -n "${STUB_APT_INSTALL_BIN_DIR:-}" ]]; then
+        mkdir -p "$STUB_APT_INSTALL_BIN_DIR"
+        cp "$(dirname "$0")/fake/tailscale" "$STUB_APT_INSTALL_BIN_DIR/tailscale"
+      fi
+    fi
+    exit 0
+    ;;
   blkid)
     echo "UUID-TEST"
     exit 0

@@ -1,0 +1,35 @@
+# Cloudflare Tunnel (v2.4a): conector 'cloudflared' de un túnel ADMINISTRADO
+# REMOTAMENTE (creado por el usuario en el panel de Cloudflare, Zero Trust ->
+# Networks -> Tunnels). Las rutas públicas (hostname -> servicio) se definen
+# en ese panel, no acá: el contenedor solo necesita el token.
+#
+# TUNNEL_TOKEN: referencia "${TUNNEL_TOKEN}" (sustitución de Dokploy vía su
+# campo "env", ver dokploy_compose_create_or_update en lib/dokploy_api.sh) en
+# vez de un valor literal: el token nunca queda en este archivo versionado.
+# 'cloudflared tunnel run' lee la variable TUNNEL_TOKEN (equivalente a
+# '--token'; documentada en developers.cloudflare.com, "Tunnel run
+# parameters").
+#
+# Imagen: 'latest' a propósito. Cloudflare publica etiquetas con fecha
+# (p. ej. 2026.10.0) y solo da soporte a versiones de cloudflared de menos
+# de un año; una etiqueta fija quedaría vieja sin que nadie la actualice, y
+# '--no-autoupdate' evita que el propio proceso se reemplace. Se actualiza
+# volviendo a desplegar el compose desde Dokploy (o re-ejecutando el módulo).
+#
+# Sin "ports": el túnel es SALIENTE (el contenedor abre la conexión hacia
+# Cloudflare); no se abre ningún puerto en el router ni en el host. Está en
+# "dokploy-network" para alcanzar a Traefik por nombre (dokploy-traefik:80).
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true

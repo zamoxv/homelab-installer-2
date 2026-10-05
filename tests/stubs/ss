@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Stub de 'ss': imprime $STUB_SS_OUTPUT (vacío por defecto = nada escucha).
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call ss "$@"
+[[ -n "${STUB_SS_OUTPUT:-}" ]] && printf '%s\n' "$STUB_SS_OUTPUT"
+exit 0

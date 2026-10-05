@@ -176,3 +176,15 @@ compose_render_opencloud() {
     | _compose_subst "__GID__" "$gid" \
     | _compose_subst "__DOMAIN__" "$domain"
 }
+
+# --- Cloudflare Tunnel ---------------------------------------------------------
+
+# Sin sustituciones: el template no lleva dominio ni rutas (viven en el panel
+# de Cloudflare) y el TUNNEL_TOKEN NUNCA pasa por acá: el template ya trae
+# "${TUNNEL_TOKEN}" literal (lo sustituye Dokploy vía su campo "env", ver
+# dokploy_compose_create_or_update y modules/cloudflared.sh).
+compose_render_cloudflared() {
+  local template="$SCRIPT_DIR/compose/cloudflared/docker-compose.yml"
+  [[ -f "$template" ]] || { echo "ERROR: falta $template" >&2; return 1; }
+  cat "$template" | _compose_subst "__NONE__" ""
+}

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Stub de 'tailscale' (NO está en el PATH de los stubs: los tests lo copian a
+# un directorio propio, o lo "instala" el stub de sudo cuando ve
+# 'apt-get install tailscale' con STUB_APT_INSTALL_BIN_DIR). El estado de
+# sesión vive en $STUB_TS_STATE (existe y contiene "in" = sesión iniciada).
+set -uo pipefail
+{ printf 'tailscale'; printf '\t%s' "$@"; printf '\n'; } >> "${STUB_CALL_LOG:-/dev/null}"
+state="${STUB_TS_STATE:-/nonexistent}"
+case "${1:-}" in
+  version) echo "1.99.0-stub"; exit 0 ;;
+  status)
+    if [[ "${2:-}" == "--json" ]]; then
+      echo '{"Self":{"DNSName":"homelab.tail1234.ts.net."}}'
+      exit 0
+    fi
+    if [[ -f "$state" ]] && grep -qx in "$state"; then echo "100.64.0.1 homelab"; exit 0; fi
+    echo "Logged out."; exit 1
+    ;;
+  up)
+    [[ -n "${STUB_TS_UP_FAIL:-}" ]] && exit 1
+    printf 'To authenticate, visit:\n\n\thttps://login.tailscale.com/a/STUBLOGIN\n'
+    echo in > "$state"
+    exit 0
+    ;;
+  ip) echo "100.64.0.1"; exit 0 ;;
+esac
+exit 0
