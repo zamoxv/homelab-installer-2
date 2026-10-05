@@ -473,7 +473,10 @@ implementa. Requiere un dominio con su DNS en Cloudflare.
 - [ ] Nombres públicos (por ahora a mano en el panel de Cloudflare, en este
       orden): `vault.<dominio>` ruta `^/admin` → `http_status:404`;
       `vault.<dominio>` → `http://dokploy-traefik:80`; `cloud.<dominio>` →
-      `http://dokploy-traefik:80`; `casa.<dominio>` → `http://<IP LAN>:8123`.
+      `http://opencloud:9200` (directo, sin Traefik: Traefik le pasa
+      `X-Forwarded-Proto: http` y OpenCloud, con `OC_URL` https, responde 308
+      a https en bucle — verificado en el M70q); `casa.<dominio>` →
+      `http://<IP LAN>:8123`.
       Nada más: lo no listado no existe desde fuera.
 - [ ] Home Assistant antes de publicarlo: 2FA en cada usuario y en
       `configuration.yaml` `use_x_forwarded_for`, `trusted_proxies` (red de

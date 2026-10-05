@@ -53,6 +53,9 @@ test_cloudflared_deploy_ok() {
   local texts; texts="$(_cf_dialog_text)"
   assert_contains "$texts" 'vault.<dominio>  ruta ^/admin' || return 1
   assert_contains "$texts" 'dokploy-traefik:80' || return 1
+  # OpenCloud va directo: detrás de Traefik recibe X-Forwarded-Proto http y
+  # responde 308 a https en bucle (verificado en el servidor real).
+  assert_contains "$texts" 'cloud.<dominio>  ->  tipo HTTP, URL opencloud:9200' || return 1
   assert_contains "$texts" ':8123' || return 1
   assert_contains "$texts" 'Ningún puerto del router se abre' || return 1
 }
