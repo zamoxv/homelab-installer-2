@@ -444,12 +444,88 @@ Encontrado al validar la importación real del M70q en la X230 (2026-10-02):
 - [x] Los módulos interactivos dejan sus errores en un log: hoy van a stderr,
       la siguiente ventana los tapa y no queda rastro en /var/log/hli2.
 
-### v2.4 — Exposición externa
+### v2.4 — Exposición externa: Cloudflare Tunnel + Access
 
-Requiere un dominio propio administrado en Cloudflare (DNS en Cloudflare).
+Requiere un dominio propio con su DNS administrado en Cloudflare.
 
-- [ ] `cloudflared` apuntando a Traefik. Públicos: Vaultwarden, OpenCloud, sitios web.
-      Solo LAN: AdGuard, qBittorrent, Home Assistant, panel de Dokploy.
+**Regla de exposición** (acordada 2026-10-05):
+1. **Access**: lo que se usa desde el navegador y puede y debe tener esa capa.
+2. **Público con protección propia**: lo que no puede ir detrás de Access porque
+   sus apps no lo soportan, pero tiene su propio login.
+3. **Solo LAN**: lo que no puede o no conviene salir por el túnel.
+
+| Servicio | Categoría | Motivo |
+|---|---|---|
+| Panel de Dokploy | Access | Solo navegador; controla todo el servidor |
+| qBittorrent | Access | Solo navegador; login propio débil |
+| Seerr | Access | Solo navegador |
+| Vaultwarden | Público (protección propia) | Las apps de Bitwarden no atraviesan Access; login + 2FA |
+| Vaultwarden `/admin` | Access (regla por ruta) | Panel de control del servidor de contraseñas |
+| OpenCloud | Público (protección propia) | Los clientes de sincronización no atraviesan Access |
+| Jellyfin | Solo LAN | Video por el túnel choca con los términos de Cloudflare |
+| AdGuard (panel) | Solo LAN | Cambia el DNS de toda la casa |
+| AdGuard (DNS), Samba | Solo LAN | No son tráfico web |
+| Home Assistant | Por decidir | Ver decisiones abiertas |
+| Sitios web, JASJIC | Por proyecto | |
+
+**Diseño:**
+- **Túnel administrado remotamente** (`cloudflared` como compose de Dokploy en
+  `dokploy-network`), token en `/etc/hli2/cloudflared.env` (root, 0600).
+- **Un registro DNS comodín** proxied `*.<dominio>` → `<tunnel-id>.cfargotunnel.com`
+  (el SSL universal de Cloudflare cubre un nivel de comodín).
+- **Una regla de ingreso** en el túnel: `*.<dominio>` → `http://dokploy-traefik:80`;
+  Traefik enruta por host como ya hace hoy. Verificar en el servidor real que
+  `cloudflared` resuelve `dokploy-traefik` en `dokploy-network`.
+- **Privado por defecto**: aplicación de Access sobre `*.<dominio>` con política
+  Allow para los correos autorizados. Todo dominio nuevo (incluidos los creados
+  a mano en Dokploy) nace protegido.
+- **Públicos explícitos**: una aplicación de Access más específica con política
+  Bypass por cada servicio público (el host más específico gana). Para
+  Vaultwarden, además, una aplicación sobre la ruta `/admin` con política Allow.
+- **Panel de Dokploy**: su dominio se configura con el mecanismo propio de
+  Dokploy (Settings → Web Server), no con `domain.create` (no es un servicio de
+  un proyecto). Decidir si se mantiene el acceso LAN por `IP:3000`.
+- **Home Assistant detrás del proxy**: antes de exponerlo, configurar
+  `http: use_x_forwarded_for: true` y `trusted_proxies` en su
+  `configuration.yaml`; sin eso responde 400.
+- **Servicios con red del host** (Home Assistant): Traefik llega a ellos por la
+  **IP de LAN del servidor**, no por `host.docker.internal` (no existe en Linux
+  sin `extra_hosts`, y el Traefik de Dokploy no es nuestro). Verificar que
+  Dokploy respeta archivos propios en `/etc/dokploy/traefik/dynamic/` o usar
+  otra vía.
+
+**Registro y repositorio público:**
+- El repo solo lleva valores neutros: `SERVICE_SUBDOMAIN` y la exposición por
+  defecto en `services/*.conf`.
+- El dominio real y los cambios de exposición viven en `/etc/hli2/exposure.conf`,
+  que el HLI pregunta al configurar (nunca en git: el repo es público).
+- Herramienta `expose` ("Sincronizar dominios"): reconciliación idempotente
+  manual (sin temporizador al principio): dominio en Dokploy para lo que no es
+  LAN, Bypass para lo público, quitar Bypass de lo que dejó de serlo, y
+  reportar diferencias con lo que hay en Cloudflare.
+- Token de la API de Cloudflare con permisos mínimos (DNS de la zona, Tunnel,
+  Access), root-only, pasado a `curl` por stdin (mismo patrón que Dokploy).
+
+**Límites conocidos** (fuera de v2.4): Access solo protege tráfico web de
+navegador. Las apps móviles que no lo atraviesan (Jellyfin, Home Assistant si
+va detrás de Access) y lo que no es HTTP (Samba, DNS) necesitan una VPN
+(Tailscale o Cloudflare WARP), en una fase posterior.
+
+**Decisiones abiertas** (se completan antes de implementar):
+- [ ] Home Assistant: Access (más seguro, sin app móvil fuera de casa) o público
+      con su login + 2FA (app móvil funciona).
+- [ ] Método de identidad de Access (correo con código de un solo uso, Google…)
+      y quiénes acceden (solo el usuario, familia).
+- [ ] Duración de la sesión de Access.
+- [ ] Panel de Dokploy: mantener o cerrar el acceso LAN por `IP:3000`.
+- [ ] Sitios web y JASJIC: categoría por proyecto.
+
+**Verificación** (manual, en el servidor real):
+- `curl -I https://vault.<dominio>` → 200 sin login; `/admin` → login de Access.
+- `https://dokploy.<dominio>` → login de Access.
+- `https://cualquiera.<dominio>` → login de Access (comodín).
+- Servicios "solo LAN" → no responden desde fuera.
+- `dig <dominio>` no muestra la IP de la casa; puertos 80/443 cerrados en el router.
 
 ### v2.5 — Backups
 
