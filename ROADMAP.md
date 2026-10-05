@@ -519,8 +519,11 @@ va detrás de Access) y lo que no es HTTP (Samba, DNS) necesitan una VPN
       Traefik), `ip_ban_enabled: true`, `login_attempts_threshold: 5`. El
       módulo de exposición debe negarse a hacerlo público si falta esa
       configuración.
-- [ ] Método de identidad de Access (correo con código de un solo uso, Google…)
-      y quiénes acceden (solo el usuario, familia).
+- [x] Método de identidad de Access: **cuenta de Google** (decidido 2026-10-05).
+      Requiere configurar Google como proveedor de identidad en Cloudflare Zero
+      Trust (credenciales OAuth de Google Cloud). Las políticas filtran por
+      correo, nunca "cualquier cuenta de Google".
+- [ ] Quiénes acceden a cada aplicación de Access (solo el usuario, familia).
 - [ ] Duración de la sesión de Access.
 - [ ] Panel de Dokploy: mantener o cerrar el acceso LAN por `IP:3000`.
 - [ ] Sitios web y JASJIC: categoría por proyecto.
