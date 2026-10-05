@@ -6,7 +6,7 @@
 # HLI-TUI: yes
 # HLI-REQUIERE: dokploy-api
 #
-# Prepara APPDATA/jellyfin, ofrece importar config del HLI v1, renderiza el
+# Prepara APPDATA/jellyfin, renderiza el
 # compose (lib/compose.sh) y lo despliega vía la API de Dokploy
 # (lib/dokploy_api.sh), corriendo antes la validación canaria obligatoria
 # (lib/canary.sh) si todavía no se hizo.
@@ -18,36 +18,9 @@ _jellyfin_prepare_dirs() {
   sudo chown -R "$SERVER_USER:$MEDIA_GROUP" "$APPDATA_ROOT/jellyfin"
 }
 
-_jellyfin_offer_import() {
-  confirm "¿Importar la configuración de Jellyfin desde un backup del HLI v1 (backup-<fecha>.tar.gz)?" || return 0
-
-  local tar_path
-  tar_path=$(input_box "Importar Jellyfin" "Ruta al backup-<fecha>.tar.gz del HLI v1:") || return 0
-  [[ -n "$tar_path" ]] || return 0
-
-  # Estado del contenedor ANTES de extraer nada (la extracción es lo lento):
-  # si está corriendo, ofrece detenerlo; si no se pudo consultar, se omite.
-  # Este módulo despliega justo después, así que no hace falta volver a
-  # desplegar acá ('noredeploy').
-  importer_gate_service jellyfin "Jellyfin" || return 0
-
-  if importer_dest_has_content "$APPDATA_ROOT/jellyfin/config"; then
-    confirm "Ya hay datos en $APPDATA_ROOT/jellyfin/config.\n\n¿Importar de todos modos? Los archivos del backup se fusionan/sobrescriben encima (rsync)." \
-      || return 0
-  fi
-
-  # Solo se EXTRAE acá (IMPORT_WORK_DIR es global: importer_exit_cleanup lo
-  # borra aunque se interrumpa). Detener + copiar se difiere hasta justo
-  # antes del despliegue (importer_apply_pending), para minimizar el tiempo
-  # que el servicio queda caído.
-  importer_extract "$tar_path" || { msg "No se pudo extraer el backup. Revise la ruta, que sea un tar.gz válido del HLI v1 y el log del módulo."; return 1; }
-  importer_pending_set jellyfin importer_jellyfin "Jellyfin"
-  return 0
-}
 
 _jellyfin_main() {
   _jellyfin_prepare_dirs
-  _jellyfin_offer_import || true
 
   dokploy_preflight || return 1
 
@@ -62,21 +35,12 @@ _jellyfin_main() {
     return 1
   fi
 
-  # Detener + copiar la importación (si la hay) recién ahora, con todo lo
-  # lento (canary, API, render) ya resuelto: el servicio queda caído solo
-  # el instante entre esto y el despliegue.
-  if ! importer_apply_pending; then
-    rm -f "$compose_file"
-    return 1
-  fi
-
   if ! composeId="$(dokploy_compose_deploy_full "$environment_id" "jellyfin" "$compose_file")"; then
     msg "Falló el despliegue de Jellyfin vía la API de Dokploy. Revise las credenciales y el panel."
     rm -f "$compose_file"
     return 1
   fi
   rm -f "$compose_file"
-  importer_stopped_clear "$(service_get jellyfin CONTAINER)"
 
   local status_note
   if service_wait_active jellyfin 120; then
@@ -93,6 +57,5 @@ _jellyfin_main() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  trap importer_exit_cleanup EXIT
   _jellyfin_main
 fi

@@ -57,33 +57,8 @@ _adguard_yaml_path() {
   printf '%s/adguard/conf/AdGuardHome.yaml' "$APPDATA_ROOT"
 }
 
-_adguard_offer_import() {
-  confirm "¿Importar la configuración de AdGuard Home desde un backup del HLI v1 (backup-<fecha>.tar.gz)?" || return 0
 
-  local tar_path
-  tar_path=$(input_box "Importar AdGuard Home" "Ruta al backup-<fecha>.tar.gz del HLI v1:") || return 0
-  [[ -n "$tar_path" ]] || return 0
-
-  # Estado del contenedor ANTES de extraer nada (la extracción es lo lento):
-  # si está corriendo, ofrece detenerlo; si no se pudo consultar, se omite.
-  # Este módulo despliega justo después, así que no hace falta volver a
-  # desplegar acá ('noredeploy').
-  importer_gate_service adguard "AdGuard Home" || return 0
-
-  if sudo test -f "$APPDATA_ROOT/adguard/conf/AdGuardHome.yaml"; then
-    confirm "Ya hay un AdGuardHome.yaml en $APPDATA_ROOT/adguard/conf.\n\n¿Sobrescribirlo con el del backup?" || return 0
-  fi
-
-  # Solo se EXTRAE acá (IMPORT_WORK_DIR es global: importer_exit_cleanup lo
-  # borra aunque se interrumpa). Detener + copiar se difiere hasta justo
-  # antes del despliegue (importer_apply_pending), para minimizar el tiempo
-  # que el servicio queda caído.
-  importer_extract "$tar_path" || { msg "No se pudo extraer el backup. Revise la ruta, que sea un tar.gz válido del HLI v1 y el log del módulo."; return 1; }
-  importer_pending_set adguard importer_adguard "AdGuard Home"
-  return 0
-}
-
-# Si no hay AdGuardHome.yaml (no se importó nada), siembra uno mínimo antes
+# Si no hay AdGuardHome.yaml, siembra uno mínimo antes
 # del primer arranque, para no depender del asistente en el puerto 3000.
 _adguard_seed_if_missing() {
   local yaml port
@@ -104,8 +79,8 @@ EOF
 }
 
 # Crea el usuario admin A MANO si el YAML todavía no tiene ninguno (ver el
-# comentario de cabecera del archivo). Si ya hay un usuario (importado de un
-# backup del v1, o de una corrida anterior de este mismo módulo), NO
+# comentario de cabecera del archivo). Si ya hay un usuario (importado con la
+# herramienta import-v1, o de una corrida anterior de este mismo módulo), NO
 # pregunta nada y deja el archivo intacto — idempotente, nunca pisa
 # credenciales existentes.
 #
@@ -193,11 +168,9 @@ _adguard_ensure_admin_user() {
 
 _adguard_main() {
   _adguard_prepare_dirs
-  _adguard_offer_import || true
 
-  # Todo lo lento (canary, API, render) ANTES de detener AdGuard (es el DNS
-  # de la casa): después de importer_apply_pending el servicio queda caído
-  # hasta el despliegue.
+  # Todo lo lento (canary, API, render) primero; lo que toca el sistema real
+  # (usuario admin, puerto 53) va justo antes del despliegue.
   dokploy_preflight || return 1
 
   local project_json environment_id compose_file composeId url port
@@ -207,7 +180,6 @@ _adguard_main() {
   compose_file="$(mktemp)"
   compose_render_adguard > "$compose_file"
 
-  importer_apply_pending || { rm -f "$compose_file"; return 1; }
   _adguard_seed_if_missing
   _adguard_ensure_admin_user "$(_adguard_yaml_path)" || { rm -f "$compose_file"; return 1; }
 
@@ -226,7 +198,6 @@ _adguard_main() {
     return 1
   fi
   rm -f "$compose_file"
-  importer_stopped_clear "$(service_get adguard CONTAINER)"
 
   if ! service_wait_active adguard 120; then
     msg "AdGuard Home no llegó a 'activo' dentro de los 120 segundos de espera. Se revierte el cambio de DNS del host (puerto 53 vuelve a systemd-resolved) para no dejar el host sin DNS con AdGuard caído.\n\nRevise el panel de Dokploy y, cuando el contenedor esté realmente arriba, vuelva a correr este módulo (es idempotente) para liberar el puerto 53 de nuevo."
@@ -236,13 +207,12 @@ _adguard_main() {
 
   port="$(service_get adguard PORT)" || port="3053"
   url="$(service_url adguard)" || true
-  msg "AdGuard Home desplegado (composeId=$composeId).\n\nAdGuard Home está corriendo.\n\nPanel: ${url:-http://<ip>:$port}\n\nInicie sesión con el usuario administrador que se acaba de crear (o, si importó un backup del HLI v1, con el usuario que ya tenía: no se le pidió nada porque el YAML importado ya traía uno)."
+  msg "AdGuard Home desplegado (composeId=$composeId).\n\nAdGuard Home está corriendo.\n\nPanel: ${url:-http://<ip>:$port}\n\nInicie sesión con el usuario administrador que se acaba de crear (o, si ya tenía uno configurado —por ejemplo importado con la herramienta import-v1—, con ese usuario: no se le pidió nada porque el YAML ya traía uno)."
 
   mark_done adguard
   return 0
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  trap importer_exit_cleanup EXIT
   _adguard_main
 fi

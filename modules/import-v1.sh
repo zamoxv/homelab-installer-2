@@ -8,9 +8,9 @@
 #
 # Extrae UNA vez un backup-<fecha>.tar.gz del HLI v1 (homelab-installer) e
 # importa lo que corresponda a cada componente (Jellyfin, qBittorrent,
-# AdGuard, claves SSH). Alternativa a hacerlo servicio por servicio desde
-# cada módulo (jellyfin.sh/qbittorrent.sh/adguard.sh también ofrecen la
-# importación individual con el mismo backup). Samba y la config del propio
+# AdGuard, claves SSH). Es la ÚNICA vía para importar un backup del v1:
+# los módulos de servicio (jellyfin/qbittorrent/adguard) no la ofrecen
+# (decisión 2026-10-05). Flujo: detener -> importar -> redesplegar. Samba y la config del propio
 # HLI NUNCA se importan a ciegas acá: Samba lo genera el módulo "samba"
 # (v2.0), y default.conf del v1 no es compatible con el formato de HLI 2.
 set -euo pipefail

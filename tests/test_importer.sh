@@ -136,41 +136,61 @@ test_require_sudo_never_asks_without_tty() {
   assert_file_not_contains "$STUB_CALL_LOG" $'sudo\t-v' "sin tty no hay 'sudo -v'" || return 1
 }
 
-# Módulos de servicio: preflight/API/render ANTES de detener; detener ->
-# copiar -> desplegar; si todo sale bien nadie vuelve a arrancar nada.
-test_jellyfin_module_stops_after_preflight_and_deploys() {
+# import-v1: detener -> copiar -> redesplegar, en ese orden.
+test_import_v1_order_is_stop_then_copy_then_redeploy() {
   local tarf="$STUB_SAFE_ROOT/backup.tar.gz"
   _mk_backup "$tarf" "$STUB_SAFE_ROOT/shim"
   export PATH="$STUB_SAFE_ROOT/shim:$PATH"
-  harness_mark_canary_done
+  export STUB_COMPOSE_ONE_OK=1
+  echo "jellyfin cid-existing" > "$DOKPLOY_STATE_FILE"
   echo "$tarf" > "$DIALOG_INPUTBOX_QUEUE"
   printf 'yes\nyes\n' > "$DIALOG_YESNO_QUEUE"   # importar; detener
 
-  bash "$REPO_ROOT/modules/jellyfin.sh" || { fail "jellyfin.sh falló"; return 1; }
+  bash "$REPO_ROOT/modules/import-v1.sh" || { fail "import-v1 falló"; return 1; }
 
-  local stop_line api_line deploy_line
+  local stop_line copy_line deploy_line
   stop_line="$(grep -nF $'docker\tstop\tjellyfin' "$STUB_CALL_LOG" | head -n1 | cut -d: -f1)"
-  api_line="$(grep -nF 'project.all' "$STUB_CALL_LOG" | head -n1 | cut -d: -f1)"
+  copy_line="$(grep -nF 'rsync' "$STUB_CALL_LOG" | head -n1 | cut -d: -f1)"
   deploy_line="$(grep -nF 'compose.deploy' "$STUB_CALL_LOG" | head -n1 | cut -d: -f1)"
-  [[ -n "$stop_line" && -n "$api_line" && -n "$deploy_line" ]] || { fail "faltan llamadas (stop=$stop_line api=$api_line deploy=$deploy_line)"; return 1; }
-  (( api_line < stop_line )) || { fail "la API/preflight debe ir ANTES de detener (api=$api_line stop=$stop_line)"; return 1; }
-  (( stop_line < deploy_line )) || { fail "detener debe ir antes del despliegue"; return 1; }
-  assert_file_not_contains "$STUB_CALL_LOG" $'docker\tstart' "nada que re-arrancar tras un despliegue correcto" || return 1
+  [[ -n "$stop_line" && -n "$copy_line" && -n "$deploy_line" ]] || { fail "faltan llamadas (stop=$stop_line copy=$copy_line deploy=$deploy_line)"; return 1; }
+  (( stop_line < copy_line )) || { fail "detener debe ir antes de copiar"; return 1; }
+  (( copy_line < deploy_line )) || { fail "copiar debe ir antes de redesplegar"; return 1; }
+  assert_file_not_contains "$STUB_CALL_LOG" $'docker\tstart' "nada que re-arrancar tras un redespliegue correcto" || return 1
 }
 
-test_jellyfin_module_restarts_container_if_deploy_fails() {
+# Si el redespliegue falla, el contenedor detenido se vuelve a arrancar.
+test_import_v1_restarts_container_if_redeploy_fails() {
   local tarf="$STUB_SAFE_ROOT/backup.tar.gz"
   _mk_backup "$tarf" "$STUB_SAFE_ROOT/shim"
   export PATH="$STUB_SAFE_ROOT/shim:$PATH"
-  export STUB_CURL_FAIL_DEPLOY=1
-  harness_mark_canary_done
+  export STUB_COMPOSE_ONE_OK=1 STUB_CURL_FAIL_DEPLOY=1
+  echo "jellyfin cid-existing" > "$DOKPLOY_STATE_FILE"
   echo "$tarf" > "$DIALOG_INPUTBOX_QUEUE"
   printf 'yes\nyes\n' > "$DIALOG_YESNO_QUEUE"
 
-  bash "$REPO_ROOT/modules/jellyfin.sh" && { fail "el módulo debía fallar"; return 1; }
+  bash "$REPO_ROOT/modules/import-v1.sh" || { fail "import-v1 falló"; return 1; }
 
   assert_file_contains "$STUB_CALL_LOG" $'docker\tstop\tjellyfin' "se detuvo" || return 1
-  assert_file_contains "$STUB_CALL_LOG" $'docker\tstart\tjellyfin' "red de seguridad: se volvió a arrancar" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'docker\tstart\tjellyfin' "se volvió a arrancar" || return 1
+  assert_file_contains "$STUB_CALL_LOG" "ya está importada, pero no se pudo volver a desplegar" "aviso claro" || return 1
+}
+
+# Decisión 2026-10-05: los módulos de servicio NO ofrecen importar un backup
+# del v1 (solo la herramienta import-v1).
+test_service_modules_do_not_offer_v1_import() {
+  local m
+  for m in jellyfin qbittorrent; do
+    : > "$STUB_CALL_LOG"
+    harness_mark_canary_done
+    bash "$REPO_ROOT/modules/$m.sh" || { fail "$m.sh falló"; return 1; }
+    assert_file_not_contains "$STUB_CALL_LOG" "backup del HLI v1" "$m no debe ofrecer importar" || return 1
+    assert_file_not_contains "$STUB_CALL_LOG" $'dialog\t--title\tConfirmar' "$m no debe preguntar nada" || return 1
+    assert_file_not_contains "$STUB_CALL_LOG" $'docker\tstop' "$m no debe detener nada" || return 1
+  done
+  if grep -qE "importer_(pending|apply_pending|extract|gate)|_offer_import" "$REPO_ROOT/modules/jellyfin.sh" "$REPO_ROOT/modules/qbittorrent.sh" "$REPO_ROOT/modules/adguard.sh"; then
+    fail "quedó cableado de importación en los módulos de servicio"
+    return 1
+  fi
 }
 
 # S1: carpeta del componente sin archivos reales -> ni pregunta ni detiene.
@@ -225,4 +245,22 @@ test_exit_cleanup_logs_failed_restart() {
     importer_stopped_add adguard
     STUB_DOCKER_FAIL_START=1 importer_exit_cleanup ) 2>/dev/null
   assert_file_contains "$LOG_DIR/install.log" "sudo docker start adguard" "reinicio fallido registrado" || return 1
+}
+
+# Bajo 'set -e', un reinicio fallido no debe cortar la trampa de salida: los
+# demás contenedores registrados se intentan igual.
+test_exit_cleanup_continues_after_failed_restart() {
+  local out
+  # Proceso bash aparte: el harness corre cada test en un contexto (if/||)
+  # donde bash ignora 'set -e' incluso si un subshell lo vuelve a activar, y
+  # el error a detectar solo ocurre con 'set -e' activo (como en un módulo).
+  out="$(REPO_ROOT="$REPO_ROOT" STUB_DOCKER_FAIL_START=1 bash -c '
+    set -euo pipefail
+    source "$REPO_ROOT/lib/core.sh"
+    importer_stopped_add uno
+    importer_stopped_add dos
+    importer_exit_cleanup
+    echo TRAMPA_COMPLETA' 2>/dev/null)"
+  assert_contains "$out" "TRAMPA_COMPLETA" "la limpieza termina aunque falle un reinicio" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'docker\tstart\tdos' "se intenta el segundo contenedor" || return 1
 }

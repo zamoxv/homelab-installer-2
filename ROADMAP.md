@@ -18,6 +18,10 @@ servicios.
 - **Registro de servicios declarativo**: una sola fuente (nombre, puerto, rutas de datos, tipo de
   backup) alimenta dashboard, healthcheck, backup y restore. Nada de rutas ni puertos hardcodeados
   en varios lugares.
+- **Backups del v1 solo desde la herramienta dedicada** (decisión 2026-10-05): importar un
+  backup del HLI v1 se hace únicamente desde Herramientas → `import-v1`. Los módulos
+  `jellyfin`, `qbittorrent` y `adguard` no preguntan por backups del v1 (AdGuard sigue creando su
+  usuario admin en una instalación nueva, y no lo pide si el YAML ya trae usuarios).
 - **Idempotencia**: re-ejecutar cualquier módulo no rompe el sistema.
 - **Bash estricto**: `set -euo pipefail` y rutas siempre entre comillas.
 - **El instalador pregunta** lo que necesita; no asume valores.
@@ -134,8 +138,9 @@ en vez de dejar que el instalador oficial elija a ciegas.
       `qbittorrent/`, `adguard/` hacia `/srv/appdata/*` (con reescritura de rutas absolutas
       viejas en la config de Jellyfin y normalización del YAML de AdGuard a 0.0.0.0:3053), más
       fusión de `ssh/authorized_keys` y `samba/smb.conf` como referencia (nunca se aplica: Samba
-      lo genera el módulo `samba` de v2.0). Disponible como módulo standalone
-      (`modules/import-v1.sh`) y como paso opcional dentro de cada módulo de servicio. Solo
+      lo genera el módulo `samba` de v2.0). Disponible SOLO como herramienta
+      (Herramientas → `import-v1`, `modules/import-v1.sh`): detener → importar → redesplegar.
+      Los módulos de servicio ya no ofrecen la importación (decisión 2026-10-05). Solo
       corre con el contenedor destino detenido/ausente (fail-closed ante "activo"/"desconocido").
 - [x] Mapeo del layout nativo de Jellyfin/qBittorrent a las imágenes elegidas, verificado contra
       la documentación de cada imagen (2026-09-29): Jellyfin oficial usa
@@ -540,6 +545,8 @@ va detrás de Access) y lo que no es HTTP (Samba, DNS) necesitan una VPN
 - [ ] Capa local sobre `/srv/appdata` con la regla de consistencia.
 - [ ] Destino S3 externo configurado en Dokploy.
 - [ ] Restore único guiado por el registro de servicios.
+- [ ] El sistema de backup v2 debe ofrecer en el menú AMBAS acciones: **"hacer backup"** y
+      **"restaurar"** (no basta con generar el backup: restaurar es parte del entregable).
 
 ### v2.6 — Agente IA siempre activo (opcional)
 
@@ -644,6 +651,14 @@ Por definir antes de diseñar el módulo:
 - [ ] Respaldo: dumps de su base de datos (capa Dokploy) y archivos (capa HLI).
 
 ## Pendiente: uso diario
+
+- [ ] **Tests: punto ciego de `set -e`.** El harness corre cada test en un
+      contexto (`if`/`||`) donde bash ignora `set -e` incluso si un subshell lo
+      vuelve a activar. Los 24 usos de `( set -euo pipefail; … )` en
+      `tests/` no detectan un aborto por `set -e` que sí ocurriría en el
+      servidor. Pasarlos a un proceso aparte (`bash -c`) o hacer que el harness
+      ejecute cada test en su propio proceso. Los tests que corren módulos
+      completos (`bash modules/x.sh`) no están afectados.
 
 - [ ] **Módulo "copiar media"** (el v1 tenía `media-transfer`): copiar de un
       disco a otro del pool con `rsync` (progreso, reanudable, verificación al

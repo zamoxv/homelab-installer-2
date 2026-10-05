@@ -191,7 +191,7 @@ _importer_tar_extract() {
 # mínimamente (existe config.yml, y al menos una carpeta de componente
 # conocida). Deja la ruta del directorio extraído en la GLOBAL IMPORT_WORK_DIR
 # (no por stdout): así existe en el shell del llamador desde ANTES de empezar
-# a extraer y el trap EXIT de cada módulo (importer_exit_cleanup) puede
+# a extraer y el trap EXIT de import-v1 (importer_exit_cleanup) puede
 # borrarlo aunque se interrumpa con Ctrl+C — llamarla dentro de $(...)
 # perdería la variable. Llamar SIN command substitution. Falla
 # cerrado: ante cualquier duda sobre el contenido del tar (formato, miembros
@@ -302,7 +302,7 @@ importer_stopped_clear() {
   IMPORT_STOPPED_CONTAINERS="${IMPORT_STOPPED_CONTAINERS/#$1 /}"
 }
 
-# Trap EXIT de los módulos que importan: borra el directorio de extracción,
+# Trap EXIT de import-v1: borra el directorio de extracción,
 # vuelve a arrancar lo que quedó detenido y restaura el eco del teclado.
 # Vuelve a iniciar un contenedor detenido por la importación. Si falla (p. ej.
 # sudo sin contraseña en caché tras una espera larga), lo deja registrado en
@@ -318,7 +318,7 @@ importer_exit_cleanup() {
   local c
   if [[ -n "${IMPORT_WORK_DIR:-}" ]]; then importer_cleanup "$IMPORT_WORK_DIR"; fi
   for c in ${IMPORT_STOPPED_CONTAINERS:-}; do
-    _importer_restart_container "$c"
+    _importer_restart_container "$c" || true
   done
   IMPORT_STOPPED_CONTAINERS=""
   hli_busy_end
@@ -379,33 +379,6 @@ importer_gate_service() {
   esac
 }
 
-# Importación PENDIENTE de un servicio (módulos de servicio): el módulo
-# extrae y pregunta temprano, pero detiene+copia recién justo antes de
-# desplegar (importer_apply_pending), para minimizar el tiempo caído.
-IMPORT_PENDING=""
-
-importer_pending_set() {
-  IMPORT_PENDING="$1|$2|$3"
-}
-
-# Aplica la importación pendiente (si la hay): detener -> copiar. NO
-# redespliega: el módulo despliega inmediatamente después. 0 = aplicada o
-# nada pendiente; 1 = falló (ya se avisó).
-importer_apply_pending() {
-  [[ -n "$IMPORT_PENDING" ]] || return 0
-  local id fn label rc=0
-  IFS='|' read -r id fn label <<<"$IMPORT_PENDING"
-  IMPORT_PENDING=""
-  importer_apply_service "$id" "$fn" "$IMPORT_WORK_DIR" "$label" noredeploy || rc=$?
-  importer_cleanup "$IMPORT_WORK_DIR"
-  IMPORT_WORK_DIR=""
-  if [[ "$rc" -ne 0 ]]; then
-    msg "Falló la importación de $label (ver el log del módulo). Se cancela el despliegue."
-    return 1
-  fi
-  return 0
-}
-
 # ¿El usuario aceptó detener el servicio $1 en importer_gate_service?
 importer_will_stop() {
   [[ "${IMPORT_STOP_IDS:- }" == *" $1 "* ]]
@@ -427,14 +400,11 @@ importer_redeploy_service() {
 # Corre la importación $2 (función importer_*) sobre el directorio extraído $3
 # para el servicio $1 ($4 = nombre para mostrar), con el ciclo de
 # detener/volver a desplegar si el usuario lo aceptó en importer_gate_service.
-# $5 = "redeploy" (default) o "noredeploy": los módulos de servicio
-# (jellyfin.sh...) usan 'noredeploy' porque ellos mismos despliegan justo
-# después de ofrecer la importación.
 # Códigos: 0 = todo bien; 1 = falló la importación (se intenta dejar el
 # contenedor como estaba: se vuelve a arrancar); 10 = importado, pero el
 # redespliegue falló (la configuración YA está importada).
 importer_apply_service() {
-  local service_id="$1" fn="$2" dir="$3" label="$4" mode="${5:-redeploy}"
+  local service_id="$1" fn="$2" dir="$3" label="$4"
   local container rc=0 stopped=0
   container="$(service_get "$service_id" CONTAINER)" || container="$service_id"
 
@@ -464,7 +434,7 @@ importer_apply_service() {
     return 1
   fi
 
-  if [[ "$stopped" -eq 1 && "$mode" == "redeploy" ]]; then
+  if [[ "$stopped" -eq 1 ]]; then
     if importer_redeploy_service "$service_id"; then
       importer_stopped_clear "$container"
     else
