@@ -162,7 +162,13 @@ _tailscale_main() {
     _tailscale_install || return 1
   fi
 
-  msg "Ahora se iniciará sesión en Tailscale.\n\nAl aceptar, el comando 'tailscale up' mostrará en la terminal una dirección (https://login.tailscale.com/a/...). Ábrala en el navegador de cualquier dispositivo, inicie sesión (o cree la cuenta) y apruebe el equipo. El comando termina solo cuando se completa el inicio de sesión."
+  msg "Ahora se iniciará sesión en Tailscale.\n\nAl aceptar, el comando 'tailscale up' mostrará en la terminal una dirección (https://login.tailscale.com/a/...). Ábrala en el navegador de cualquier dispositivo, inicie sesión (o cree la cuenta) y apruebe el equipo. El comando termina solo cuando se completa el inicio de sesión.\n\nSi el enlace da 'Error 404', no use Ctrl+clic: seleccione la URL a mano, o en otra terminal corra:\n\nsudo tailscale status\n\ny copie la URL que muestra."
+
+  # Pantalla limpia: sin esto, la salida de 'tailscale up' se imprime sobre
+  # los restos del cuadro de dialog y la URL queda tapada o cortada (Ctrl+clic
+  # abría un enlace incompleto en el servidor real, Tailscale respondía 404).
+  clear 2>/dev/null || printf '\033[2J\033[H'
+  printf '\nIniciando sesión en Tailscale. Abra en el navegador la URL que aparece abajo:\n\n'
 
   # Primer plano, SIN $(...): la URL de login debe verse en la terminal y el
   # comando espera a que el usuario complete el inicio de sesión.
