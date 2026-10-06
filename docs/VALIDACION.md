@@ -157,6 +157,32 @@ desplegados.
 | 46 | Paso opcional de AdGuard: aceptar | Confirma que AdGuard escucha en `0.0.0.0:53` y explica los pasos del panel de Tailscale (DNS → Nameservers → IP de Tailscale → Override DNS servers) |
 | 47 | Tras configurar 46, en el teléfono con Tailscale | `ping` a un dominio de lista de bloqueo no resuelve; el resto de Internet funciona |
 
+### v2.5 — Backups (restic: local + R2)
+
+Requisitos: el disco de media montado **aparte** del disco del sistema, un
+bucket de R2 con su token (Cloudflare → R2 → Create bucket; Manage R2 API
+Tokens → permiso *Object Read & Write*, restringido a ese bucket) y
+Vaultwarden funcionando. Los valores de abajo son genéricos.
+
+| # | Prueba | Resultado esperado |
+|---|---|---|
+| 48 | `backup-setup`, aceptar R2 y cargar endpoint (`https://<ACCOUNT_ID>.r2.cloudflarestorage.com`), bucket, Access Key ID y Secret | Instala restic (`restic version` → 0.16.x en noble); muestra la contraseña **una vez** y no avanza hasta confirmar "guardada en Vaultwarden y en papel" (con "No" la muestra de nuevo) |
+| 49 | `sudo ls -l /etc/hli2/ && sudo ls -ld /srv/media/.hli2-backups` | `restic-password` y `restic.env` `-rw------- root`; el repositorio local `drwx------ root` |
+| 50 | `systemctl list-timers hli2-backup.timer`; `systemctl cat hli2-backup.service` | Próxima ejecución a las 04:00; `Type=oneshot`; `ExecStart=.../bin/hli2-backup run` |
+| 51 | Re-ejecutar `backup-setup` | No muestra otra contraseña ni reinicializa repositorios; ofrece reconfigurar R2 |
+| 52 | Herramientas → "Hacer backup ahora" | Se ve la salida de restic; Vaultwarden, Jellyfin, Home Assistant y AdGuard se detienen unos segundos y vuelven (`docker ps`); resultado "correcto" |
+| 53 | `sudo RESTIC_REPOSITORY=/srv/media/.hli2-backups RESTIC_PASSWORD_FILE=/etc/hli2/restic-password restic snapshots` | Dos fotos por corrida: tag `full` y tag `cloud`; la `cloud` no contiene `opencloud/data` (`restic ls <id> \| grep -c opencloud/data` → 0; en la `full` → mayor que 0) |
+| 54 | Lo mismo contra R2 (cargar `RESTIC_REPOSITORY` y las claves de `/etc/hli2/restic.env` en un shell root) | Solo fotos con tag `cloud`, mismos ids que en local; ningún archivo de `jellyfin/cache` en ninguna |
+| 55 | Dashboard | Bloque "Backups" con fecha, "Copia local: correcto" y "Copia externa: correcto"; `cat /var/lib/hli2/backup-status` legible sin sudo y sin secretos |
+| 56 | Dejar correr el timer de las 04:00 (o `sudo systemctl start hli2-backup.service`) | Termina con éxito; `journalctl -u hli2-backup` y `sudo less /var/log/hli2/backup.log` sin errores |
+| 57 | Cortar la red (o poner una clave de R2 errónea en `restic.env`) y repetir 52 | Los servicios igual quedan arriba; el estado marca `copia externa: ERROR` y `result=error`; el servicio systemd queda `failed` |
+| 58 | `sudo kill -TERM $(pgrep -f 'hli2-backup run')` apenas el log muestre "Deteniendo" (`sudo tail -f /var/log/hli2/backup.log`) | Los contenedores detenidos vuelven a iniciar solos (`docker ps`) |
+| 59 | Con el disco de media **desmontado** (`sudo umount /srv/media`), `sudo /ruta/hli2/bin/hli2-backup run` | Se niega ("está en el mismo disco que el sistema"); no detiene ningún contenedor ni escribe en el disco del sistema |
+| 60 | Tras varios días: `restic snapshots` en ambos repositorios | Retención aplicada (7 diarios, 4 semanales, 6 mensuales por tag); semanalmente aparece `restic check` en el log |
+| 61 | Samba: ver los recursos compartidos | Solo los de media; el repositorio de backups **no** aparece |
+
+Pendiente (parte 2 de v2.5): restaurar desde el menú.
+
 ### Energía (correr primero)
 
 | # | Prueba | Resultado esperado |

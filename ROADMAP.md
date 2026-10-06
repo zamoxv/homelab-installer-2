@@ -545,20 +545,27 @@ Especificación acordada con el usuario (2026-10-06):
       `opencloud/data` (tag `cloud`). Con los servicios ya levantados,
       `restic copy --tag cloud` lleva esa foto al repositorio de R2: la copia
       externa es idéntica a la local, sin una segunda parada.
-- [ ] **Repositorio local** en el SSD de media (`$BACKUP_ROOT`, p. ej.
-      `/srv/media/.hli2-backups`), carpeta root 0700 (`/srv/media` se comparte
-      por Samba). **Falla cerrado** si esa ruta no está en un punto de montaje
+- [ ] **Repositorio local** en el SSD de media (`$BACKUP_ROOT`, por defecto
+      `$MEDIA_ROOT/.hli2-backups`; el módulo `storage` ya no le cambia dueño
+      ni modo y Samba no lo comparte), carpeta root 0700 (`/srv/media` sí se
+      comparte por Samba). **Falla cerrado** si esa ruta no está en un punto de montaje
       distinto del disco del sistema (lección del 2026-10-06: un disco montado
       tarde deja escribir en la carpeta oculta del NVMe).
 - [ ] **Repositorio externo**: Cloudflare R2 (bucket propio, token S3 con
       permiso solo sobre ese bucket). Endpoint, bucket y claves en
-      `/etc/hli2/restic.env` root 0600, nunca en argv ni en logs.
+      `/etc/hli2/restic.env` root 0600 (`RESTIC_REPOSITORY`,
+      `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION=auto`),
+      nunca en argv ni en logs: llegan a restic solo por su entorno.
 - [ ] **Contraseña de restic**: generada al configurar, guardada root 0600,
       mostrada UNA vez con confirmación explícita de que el usuario la guardó
       en Vaultwarden **y en papel** (sin ella la copia externa es irrecuperable;
       si el servidor muere, Vaultwarden muere con él).
 - [ ] **Automático**: timer de systemd diario a las 04:00 (`Persistent=true`)
-      que corre el backup como root. **Manual**: "Hacer backup ahora" en el menú.
+      que corre `bin/hli2-backup run` como root (módulos `backup-setup` y
+      `backup-now`; la lógica vive en `lib/backup.sh`). Supuestos de restic
+      0.16.4 (noble): `restic copy --from-repo --from-password-file --tag`,
+      retención con `--group-by host,tags`; región `auto` de R2 sin verificar
+      en hardware. **Manual**: "Hacer backup ahora" en el menú.
 - [ ] **Retención** en ambos repositorios: `--keep-daily 7 --keep-weekly 4
       --keep-monthly 6`, más `prune`. Chequeo de integridad periódico
       (`restic check`, con una muestra de datos).
