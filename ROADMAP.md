@@ -77,17 +77,23 @@ servicios.
 Docker Engine, Samba, WOL, energía (sleep/lid), LVM, discos `/srv/mediaN`, systemd-resolved sin
 stub (puerto 53 libre), SSH y el propio HLI 2.
 
-## Backups: dos capas
+## Backups: dos copias, una herramienta (decidido 2026-10-06)
 
-| | HLI 2 (capa local) | Dokploy (capa externa) |
+Los servicios guardan todo en bind mounts de `/srv/appdata` (y SQLite), no en
+bases de datos ni volúmenes que administre Dokploy: los backups de Dokploy
+(solo dumps de sus DB y named volumes hacia S3) no cubren nada de esto. Por eso
+**el HLI 2 hace las dos copias** con **restic** (cifrado, incremental,
+deduplicado, restaurable por fecha):
+
+| | Copia local | Copia externa |
 |---|---|---|
-| Qué | Todo `/srv/appdata`, config Samba, config HLI, llaves SSH | Dumps de bases de datos + backup propio de Dokploy |
-| Dónde | Tar local (`$BACKUP_ROOT`) | S3-compatible fuera de casa (Cloudflare R2 / Backblaze B2) |
-| Para qué | Migrar o restaurar el servidor completo | Sobrevivir a la pérdida del disco o de la casa |
+| Dónde | Repositorio restic en el SSD de media (`$BACKUP_ROOT`), otro disco que el del sistema | Repositorio restic en Cloudflare R2 (S3), cifrado |
+| Qué | Todo lo respaldable (ver v2.5) | Lo mismo **menos** `opencloud/data` (decisión del usuario: los archivos de OpenCloud ya viven también en los clientes que sincronizan) |
+| Para qué | Restaurar rápido un servicio o el servidor si falla el NVMe | Sobrevivir a la pérdida del equipo o de la casa |
 
-**Regla de consistencia**: el HLI 2 nunca copia en caliente la carpeta de una base de datos.
-Postgres/MySQL se respaldan con dumps de Dokploy; SQLite (Vaultwarden, Jellyfin) se respalda
-deteniendo el contenedor o con `sqlite3 .backup`.
+**Regla de consistencia**: nunca se copia en caliente una carpeta con base de
+datos. Los contenedores con SQLite u otra base embebida se detienen durante la
+toma de la foto local (segundos) y se levantan siempre, aunque falle algo.
 
 ---
 
@@ -520,13 +526,53 @@ casa; puertos 80/443 cerrados en el router; con Tailscale activo, el panel de
 Dokploy y Jellyfin responden fuera de casa y el resto de Internet funciona
 normal.
 
-### v2.5 — Backups
+### v2.5 — Backups (restic: local + Cloudflare R2)
 
-- [ ] Capa local sobre `/srv/appdata` con la regla de consistencia.
-- [ ] Destino S3 externo configurado en Dokploy.
-- [ ] Restore único guiado por el registro de servicios.
-- [ ] El sistema de backup v2 debe ofrecer en el menú AMBAS acciones: **"hacer backup"** y
-      **"restaurar"** (no basta con generar el backup: restaurar es parte del entregable).
+Especificación acordada con el usuario (2026-10-06):
+
+- [ ] **Qué se respalda** (desde el registro de servicios, `SERVICE_DATA`):
+      todo `/srv/appdata` **excepto cachés** (`jellyfin/cache`), `/etc/samba/smb.conf`,
+      `/etc/hli2` (secretos, root 0600) y la configuración del HLI. La media
+      (`/srv/media*`) NO se respalda. Dokploy no se respalda: se reinstala y
+      los composes se regeneran con los módulos del HLI.
+- [ ] **Consistencia**: `SERVICE_BACKUP_KIND` gobierna. `sqlite` (o base
+      embebida) = detener el contenedor durante la foto local y levantarlo
+      siempre (trap). Corregir el registro: Home Assistant (SQLite) y AdGuard
+      (bbolt) pasan a ese tipo. Los contenedores parados lo menos posible: la
+      subida a R2 ocurre con los servicios ya levantados.
+- [ ] **Dos fotos en la misma ventana de parada**, ambas en el repositorio
+      local (deduplicadas, casi gratis): una completa (tag `full`) y otra sin
+      `opencloud/data` (tag `cloud`). Con los servicios ya levantados,
+      `restic copy --tag cloud` lleva esa foto al repositorio de R2: la copia
+      externa es idéntica a la local, sin una segunda parada.
+- [ ] **Repositorio local** en el SSD de media (`$BACKUP_ROOT`, p. ej.
+      `/srv/media/.hli2-backups`), carpeta root 0700 (`/srv/media` se comparte
+      por Samba). **Falla cerrado** si esa ruta no está en un punto de montaje
+      distinto del disco del sistema (lección del 2026-10-06: un disco montado
+      tarde deja escribir en la carpeta oculta del NVMe).
+- [ ] **Repositorio externo**: Cloudflare R2 (bucket propio, token S3 con
+      permiso solo sobre ese bucket). Endpoint, bucket y claves en
+      `/etc/hli2/restic.env` root 0600, nunca en argv ni en logs.
+- [ ] **Contraseña de restic**: generada al configurar, guardada root 0600,
+      mostrada UNA vez con confirmación explícita de que el usuario la guardó
+      en Vaultwarden **y en papel** (sin ella la copia externa es irrecuperable;
+      si el servidor muere, Vaultwarden muere con él).
+- [ ] **Automático**: timer de systemd diario a las 04:00 (`Persistent=true`)
+      que corre el backup como root. **Manual**: "Hacer backup ahora" en el menú.
+- [ ] **Retención** en ambos repositorios: `--keep-daily 7 --keep-weekly 4
+      --keep-monthly 6`, más `prune`. Chequeo de integridad periódico
+      (`restic check`, con una muestra de datos).
+- [ ] **Restaurar** desde el menú (parte del entregable, no opcional):
+      elegir origen (local o R2), fecha (snapshot) y servicio (o "todo",
+      para migrar a un equipo nuevo); detiene el contenedor, restaura sus
+      rutas, corrige dueños y lo levanta. Restaurar `opencloud/data` solo es
+      posible desde el local.
+- [ ] **Estado visible**: resultado del último backup (fecha, OK/error, qué
+      copia falló) legible por el usuario y mostrado en el dashboard del HLI.
+      Avisos por Telegram: v2.6.
+- [ ] Verificación en el M70q: backup manual, backup del timer, restaurar
+      Vaultwarden desde local y desde R2 a una fecha anterior, y un
+      "restaurar todo" de prueba en la X230.
 
 ### v2.6 — Agente IA siempre activo (opcional)
 
