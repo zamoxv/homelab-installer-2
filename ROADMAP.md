@@ -555,13 +555,20 @@ Especificación acordada con el usuario (2026-10-06):
       permiso solo sobre ese bucket). Endpoint, bucket y claves en
       `/etc/hli2/restic.env` root 0600 (`RESTIC_REPOSITORY`,
       `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION=auto`),
-      nunca en argv ni en logs: llegan a restic solo por su entorno.
+      nunca en argv ni en logs: llegan a restic solo por su entorno. El
+      archivo SÍ se respalda (cifrado): se necesita para recuperarse de un
+      desastre; la contraseña de restic NO se respalda.
 - [ ] **Contraseña de restic**: generada al configurar, guardada root 0600,
       mostrada UNA vez con confirmación explícita de que el usuario la guardó
       en Vaultwarden **y en papel** (sin ella la copia externa es irrecuperable;
       si el servidor muere, Vaultwarden muere con él).
 - [ ] **Automático**: timer de systemd diario a las 04:00 (`Persistent=true`)
-      que corre `bin/hli2-backup run` como root (módulos `backup-setup` y
+      que corre `bin/hli2-backup run` como root **desde una copia root-owned del
+      código** en `/usr/local/lib/hli2` (la deja `backup-setup` y la refresca
+      `backup-now`; root nunca ejecuta el checkout del usuario; el estado de
+      root vive en `/var/lib/hli2-root`). La primera corrida hace una pasada
+      previa en vivo para que la parada sea corta; una lista de recuperación
+      levanta lo que un backup interrumpido deje detenido (módulos `backup-setup` y
       `backup-now`; la lógica vive en `lib/backup.sh`). Supuestos de restic
       0.16.4 (noble): `restic copy --from-repo --from-password-file --tag`,
       retención con `--group-by host,tags`; región `auto` de R2 sin verificar
