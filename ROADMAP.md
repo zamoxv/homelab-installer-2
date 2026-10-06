@@ -422,8 +422,10 @@ Dokploy real desde acá):
 - ~~Que el login en `/admin` de Vaultwarden funcione con un hash de la CLI
   `argon2`~~ — **verificado** contra un Vaultwarden real descartable (ver
   arriba). Falta solo repetirlo en la X230 con el despliegue completo.
-- Consumo de RAM de OpenCloud y comportamiento real de sus clientes de
-  escritorio/móvil contra un dominio sin TLS válido todavía.
+- ~~Consumo de RAM de OpenCloud y comportamiento real de sus clientes de
+  escritorio/móvil~~ — **verificado** en el M70q (2026-10-05) con el dominio
+  público vía Cloudflare Tunnel: web, cliente de escritorio (Fedora) y app
+  Android inician sesión; ~230 MiB de RAM y <1 % de CPU en reposo.
 - Si `opencloud init` tolera bien corridas repetidas del módulo (el propio
   proyecto documenta que falla en la segunda vez y por eso se ignora con
   `|| true`, pero no se probó contra la imagen real).
