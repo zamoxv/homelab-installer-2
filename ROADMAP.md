@@ -632,6 +632,15 @@ Por definir antes de diseñar el módulo:
 
 ## Pendiente: uso diario
 
+- [ ] **Jellyfin importado del v1 no decodificaba HEVC 8 bits por hardware.**
+      En el M70q (UHD 730, 2026-10-06) el `encoding.xml` del v1 traía QSV
+      pero solo "HEVC 10bit" marcado: el log mostraba
+      `hevc (native) -> h264 (h264_qsv)` y la CPU iba al 80–100 %. Marcando
+      HEVC, MPEG2, VP9, AV1 y HEVC RExt (VP8 no: Gen12 no lo decodifica) más
+      "Throttle Transcodes", bajó a ~10–20 % (también con HDR). Evaluar que
+      el importador o el módulo `jellyfin` avisen (o ajusten) los códecs de
+      decodificación según la GPU detectada.
+
 - [ ] **Montar un disco de media con los contenedores ya corriendo los deja
       ciegos.** Docker fija los bind mounts al arrancar el contenedor: si
       después se monta un disco sobre `/srv/media` (o `/srv/mediaN`),
