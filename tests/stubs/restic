@@ -43,23 +43,14 @@ for f in ${STUB_RESTIC_FAIL:-}; do
   if [[ "$f" == "$sub" || "$f" == "$key" ]]; then fail=1; fi
 done
 
+# STUB_RESTIC_PROBE=<archivo>: en cada 'backup' copia ahí el archivo de estado
+# tal como está en ese instante (para afirmar que dice 'running').
+if [[ -n "${STUB_RESTIC_PROBE:-}" && "$sub" == "backup" ]]; then
+  cat "${HLI2_BACKUP_STATE_DIR:-/nonexistent}/backup-status" > "$STUB_RESTIC_PROBE" 2>/dev/null || true
+fi
+
 if [[ -n "${STUB_RESTIC_KILL_ON:-}" && "$sub" == "${STUB_RESTIC_KILL_ON}" ]]; then
-  # Sube por los ancestros: el entrypoint y los subshells de sus pipelines
-  # comparten cmdline; se mata al más alto de esa cadena contigua (el proceso
-  # principal) y se deja de subir apenas la cadena termina, para no alcanzar
-  # al shell del test.
-  top=""
-  p="$PPID"
-  while [[ "$p" -gt 1 ]]; do
-    if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q 'bin/hli2-backup run'; then
-      top="$p"
-    elif [[ -n "$top" ]]; then
-      break
-    fi
-    p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
-    [[ -n "$p" ]] || break
-  done
-  [[ -n "$top" ]] && kill -TERM "$top"
+  stub_kill_entrypoint || true
   sleep 0.2
   exit 1
 fi
@@ -86,8 +77,14 @@ case "$sub" in
       [[ -f "${STUB_SAFE_ROOT:-/nonexistent}/r2-initialized" || -n "${STUB_RESTIC_R2_INITIALIZED:-}" ]] || exit 1
     fi
     ;;
+  snapshots)
+    # STUB_RESTIC_HAS_FULL=1: ya existe una foto 'full' (sin esto, la primera
+    # corrida hace la pasada previa en vivo).
+    if [[ -n "${STUB_RESTIC_HAS_FULL:-}" ]]; then echo '[{"short_id":"ab12cd00"}]'; else echo '[]'; fi
+    ;;
   backup)
     case "$tag" in
+      warmup) echo "snapshot ab12cd03 saved" ;;
       full) echo "snapshot ab12cd01 saved" ;;
       cloud) echo "snapshot ab12cd02 saved" ;;
       *) echo "snapshot ab12cd99 saved" ;;

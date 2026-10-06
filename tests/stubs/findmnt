@@ -9,6 +9,17 @@ log_call findmnt "$@"
 
 : "${LSBLK_SYSDISK:=/dev/sda}"
 
+# 'findmnt -n -o TARGET -T <ruta>' (lib/backup.sh): punto de montaje que contiene
+# la ruta. Bajo el scratch -> ${STUB_FAKE_MOUNT_TARGET:-/srv/fake-media-mount};
+# bajo STUB_FAKE_ROOT_PREFIX (simula un directorio del disco del sistema) y
+# fuera del scratch -> '/'.
+if [[ "${1:-}" == "-n" && "${2:-}" == "-o" && "${3:-}" == "TARGET" && "${4:-}" == "-T" ]]; then
+  path="${5:-}"
+  if [[ -n "${STUB_FAKE_ROOT_PREFIX:-}" && "$path" == "$STUB_FAKE_ROOT_PREFIX"* ]]; then echo "/"; exit 0; fi
+  if _stub_path_is_safe "$path"; then echo "${STUB_FAKE_MOUNT_TARGET:-/srv/fake-media-mount}"; else echo "/"; fi
+  exit 0
+fi
+
 case "$*" in
   "-no SOURCE /")
     echo "${LSBLK_SYSDISK}1"

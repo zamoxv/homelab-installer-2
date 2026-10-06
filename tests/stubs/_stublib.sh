@@ -66,3 +66,22 @@ _stub_relock_root_area() {
   [[ -n "${STUB_ROOT_AREA:-}" && -d "$STUB_ROOT_AREA" ]] || return 0
   chmod 000 "$STUB_ROOT_AREA" 2>/dev/null || true
 }
+
+# Envía TERM al proceso principal de bin/hli2-backup (el ancestro más alto de la
+# cadena contigua cuyo cmdline contiene 'bin/hli2-backup'; el entrypoint y los
+# subshells de sus pipelines comparten cmdline). Se deja de subir apenas la
+# cadena termina, para no alcanzar al shell del test. Devuelve 1 si no lo halló.
+stub_kill_entrypoint() {
+  local top="" p="$PPID"
+  while [[ "$p" -gt 1 ]]; do
+    if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q 'bin/hli2-backup'; then
+      top="$p"
+    elif [[ -n "$top" ]]; then
+      break
+    fi
+    p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+    [[ -n "$p" ]] || break
+  done
+  [[ -n "$top" ]] || return 1
+  kill -TERM "$top"
+}

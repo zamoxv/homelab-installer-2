@@ -48,13 +48,24 @@ _backup_trim() {
 
 # --- Contraseña de restic ----------------------------------------------------------
 
+# Archivo temporal con la contraseña en claro: se borra SIEMPRE (salida normal,
+# error o señal), nunca queda en disco si el módulo se interrumpe.
+_BACKUP_PW_TMP=""
+_backup_pw_cleanup() {
+  [[ -z "$_BACKUP_PW_TMP" ]] || rm -f -- "$_BACKUP_PW_TMP"
+  _BACKUP_PW_TMP=""
+}
+
 # Muestra la contraseña con 'dialog --textbox' sobre un archivo temporal 0600
 # (nunca en argv, a diferencia de --msgbox) y no sale de acá hasta que el
 # usuario confirme que la guardó en Vaultwarden Y en papel.
 _backup_show_password_until_confirmed() {
-  local pw="$1" tmp
-  tmp="$(mktemp)"
-  chmod 0600 "$tmp"
+  local pw="$1"
+  trap _backup_pw_cleanup EXIT
+  trap '_backup_pw_cleanup; exit 130' INT HUP
+  trap '_backup_pw_cleanup; exit 143' TERM
+  _BACKUP_PW_TMP="$(mktemp)"
+  chmod 0600 "$_BACKUP_PW_TMP"
   {
     printf 'CONTRASEÑA DE CIFRADO DE LOS BACKUPS (se muestra UNA sola vez)\n\n'
     printf '    %s\n\n' "$pw"
@@ -63,15 +74,15 @@ _backup_show_password_until_confirmed() {
     printf '1. Guárdela en Vaultwarden.\n'
     printf '2. Escríbala también EN PAPEL y guárdelo en un lugar seguro: si el\n'
     printf '   servidor se pierde, Vaultwarden se pierde con él.\n'
-  } > "$tmp"
+  } > "$_BACKUP_PW_TMP"
   while true; do
     hli_busy_end
-    dialog --title "Contraseña de backups" --textbox "$tmp" 18 76 || true
+    dialog --title "Contraseña de backups" --textbox "$_BACKUP_PW_TMP" 18 76 || true
     if confirm "¿Guardó la contraseña en Vaultwarden Y en papel?\n\nSi elige 'No', se mostrará de nuevo."; then
       break
     fi
   done
-  rm -f "$tmp"
+  _backup_pw_cleanup
   pw=""
   mark_done "$BACKUP_PW_CONFIRMED_KEY"
 }
@@ -82,27 +93,57 @@ _backup_generate_password() {
   head -c 32 /dev/urandom | base64 -w0 | tr '+/' '-_' | tr -d '='
 }
 
+# ¿Existe el repositorio local? ($BACKUP_ROOT es root 0700: se pregunta con sudo.)
+_backup_repo_exists() {
+  sudo -n test -f "$BACKUP_ROOT/config" 2>/dev/null
+}
+
+# Escribe la contraseña de forma atómica: archivo temporal root 0600 en el mismo
+# directorio y 'mv' (nunca queda un archivo vacío o a medias en la ruta final).
+_backup_write_password() {
+  local pw="$1" pw_stage="$SECRETS_DIR/.restic-password.$$"
+  sudo install -d -m 0700 -o root -g root "$SECRETS_DIR" || return 1
+  sudo install -m 0600 -o root -g root /dev/null "$pw_stage" || return 1
+  if ! printf '%s\n' "$pw" | sudo tee "$pw_stage" >/dev/null; then
+    sudo rm -f "$pw_stage"
+    return 1
+  fi
+  sudo mv -f "$pw_stage" "$BACKUP_PASSWORD_FILE"
+}
+
 _backup_ensure_password() {
-  local pw
+  local pw=""
   if priv_file_exists "$BACKUP_PASSWORD_FILE"; then
-    if is_done "$BACKUP_PW_CONFIRMED_KEY"; then
-      log "Contraseña de restic ya existente y confirmada: se conserva."
+    pw="$(priv_file_read "$BACKUP_PASSWORD_FILE" 2>/dev/null || true)"
+    pw="${pw%%$'\n'*}"
+    if [[ "${#pw}" -ge 16 && "$pw" != *[[:space:]]* ]]; then
+      if is_done "$BACKUP_PW_CONFIRMED_KEY"; then
+        log "Contraseña de restic ya existente y confirmada: se conserva."
+        pw=""
+        return 0
+      fi
+      # Existe pero nunca se confirmó (el módulo se interrumpió): mostrarla de nuevo.
+      _backup_show_password_until_confirmed "$pw"
+      pw=""
       return 0
     fi
-    # Existe pero nunca se confirmó (el módulo se interrumpió): mostrarla de nuevo.
-    pw="$(priv_file_read "$BACKUP_PASSWORD_FILE")" || { msg "No se pudo leer la contraseña guardada de restic."; return 1; }
-    pw="${pw%%$'\n'*}"
-    _backup_show_password_until_confirmed "$pw"
+    # Archivo vacío o inválido. Con un repositorio ya creado NO se regenera: la
+    # contraseña nueva no abriría los backups existentes.
     pw=""
-    return 0
+    if _backup_repo_exists; then
+      msg "El archivo de la contraseña de restic ($BACKUP_PASSWORD_FILE) está vacío o es inválido, y ya existe un repositorio de backups.\n\nNo se genera otra contraseña: no abriría los backups existentes. Restaure el archivo con la contraseña guardada en Vaultwarden o en papel y vuelva a correr este módulo."
+      return 1
+    fi
+    log "Archivo de contraseña de restic vacío o inválido y sin repositorio: se genera de nuevo."
   fi
 
   pw="$(_backup_generate_password)"
   [[ -n "$pw" ]] || { msg "No se pudo generar la contraseña de restic."; return 1; }
-  sudo install -d -m 0700 -o root -g root "$SECRETS_DIR"
-  sudo install -m 0600 -o root -g root /dev/null "$BACKUP_PASSWORD_FILE"
-  printf '%s\n' "$pw" | sudo tee "$BACKUP_PASSWORD_FILE" >/dev/null \
-    || { pw=""; msg "No se pudo guardar la contraseña de restic."; return 1; }
+  if ! _backup_write_password "$pw"; then
+    pw=""
+    msg "No se pudo guardar la contraseña de restic."
+    return 1
+  fi
   log "Contraseña de restic generada y guardada root-only (no se loguea el valor)."
   _backup_show_password_until_confirmed "$pw"
   pw=""
@@ -172,13 +213,17 @@ AWS_DEFAULT_REGION=auto"; then
 
 # --- Unidades systemd -------------------------------------------------------------------
 
+# Todas apuntan a la copia root-owned ($BACKUP_INSTALL_DIR), nunca al checkout.
+# Sin NoNewPrivileges: el backup usa 'sudo' (hli_docker, lib/secrets.sh) aun
+# corriendo como root, y ese flag lo rompería.
 _backup_install_units() {
-  case "$SCRIPT_DIR" in
+  case "$BACKUP_INSTALL_DIR" in
     *[[:space:]%\"\']*)
-      msg "La ruta del HLI 2 ($SCRIPT_DIR) tiene espacios o caracteres que systemd no admite en ExecStart. Muévalo a una ruta simple y vuelva a correr este módulo."
+      msg "La ruta de instalación del backup ($BACKUP_INSTALL_DIR) tiene espacios o caracteres que systemd no admite en ExecStart."
       return 1
       ;;
   esac
+  local exe="$BACKUP_INSTALL_DIR/bin/hli2-backup"
 
   printf '%s\n' \
     "[Unit]" \
@@ -190,7 +235,9 @@ _backup_install_units() {
     "[Service]" \
     "Type=oneshot" \
     "Environment=USER=root HOME=/root" \
-    "ExecStart=$SCRIPT_DIR/bin/hli2-backup run" \
+    "ExecStart=$exe run" \
+    "ExecStopPost=$exe recover" \
+    "PrivateTmp=yes" \
     "TimeoutStartSec=6h" \
     "Nice=10" \
     "IOSchedulingClass=idle" \
@@ -208,8 +255,26 @@ _backup_install_units() {
     "WantedBy=timers.target" \
     | sudo tee "$BACKUP_SYSTEMD_DIR/hli2-backup.timer" >/dev/null
 
+  # Tras un corte de luz a mitad de la ventana de parada, 'restart:
+  # unless-stopped' no levanta lo parado a mano: esta unidad lo hace al arrancar.
+  printf '%s\n' \
+    "[Unit]" \
+    "Description=HLI 2: levantar contenedores que un backup interrumpido dejó detenidos" \
+    "After=docker.service" \
+    "Wants=docker.service" \
+    "" \
+    "[Service]" \
+    "Type=oneshot" \
+    "Environment=USER=root HOME=/root" \
+    "ExecStart=$exe recover" \
+    "" \
+    "[Install]" \
+    "WantedBy=multi-user.target" \
+    | sudo tee "$BACKUP_SYSTEMD_DIR/hli2-backup-recover.service" >/dev/null
+
   sudo systemctl daemon-reload
   sudo systemctl enable --now hli2-backup.timer
+  sudo systemctl enable hli2-backup-recover.service
 }
 
 _backup_setup_main() {
@@ -219,9 +284,14 @@ _backup_setup_main() {
   _backup_ensure_password || return 1
   _backup_configure_r2 || true
 
-  # Como root (la lógica y las credenciales no pasan por este proceso).
+  # Copia root-owned del código y, desde ahí, inicialización como root (la
+  # lógica y las credenciales no pasan por este proceso).
+  if ! backup_refresh_install; then
+    msg "No se pudo instalar la copia del código del backup en $BACKUP_INSTALL_DIR."
+    return 1
+  fi
   local out
-  if ! out="$(sudo -n "$SCRIPT_DIR/bin/hli2-backup" init 2>&1)"; then
+  if ! out="$(sudo -n "$BACKUP_INSTALL_DIR/bin/hli2-backup" init 2>&1)"; then
     hli_error "inicialización de repositorios: $(printf '%s' "$out" | tail -n 3)"
     msg "No se pudieron inicializar los repositorios de backup:\n\n$(printf '%s' "$out" | tail -n 5)\n\nSi el disco de media no está montado aparte del sistema, móntelo y vuelva a correr este módulo."
     return 1
@@ -231,7 +301,7 @@ _backup_setup_main() {
 
   local r2_note="Solo hay copia local (R2 sin configurar): vuelva a correr este módulo para agregarla."
   if _backup_r2_configured; then r2_note="La copia externa en R2 está configurada."; fi
-  msg "Backups listos.\n\n- Repositorio local: $BACKUP_ROOT\n- $r2_note\n- Se ejecutan todos los días a las 04:00 (hli2-backup.timer).\n- Para probar ahora: Herramientas -> 'Hacer backup ahora'.\n\nRecuerde: sin la contraseña de restic los backups no se pueden restaurar."
+  msg "Backups listos.\n\n- Repositorio local: $BACKUP_ROOT\n- $r2_note\n- Se ejecutan todos los días a las 04:00 (hli2-backup.timer).\n- El código del backup se instaló en $BACKUP_INSTALL_DIR (copia de root). Tras actualizar el HLI 2 con git, vuelva a correr este módulo o 'Hacer backup ahora' para refrescarla.\n- Para probar ahora: Herramientas -> 'Hacer backup ahora'.\n\nRecuerde: sin la contraseña de restic los backups no se pueden restaurar."
 
   mark_done backup-setup
   return 0

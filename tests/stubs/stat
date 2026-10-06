@@ -7,7 +7,7 @@
 set -uo pipefail
 if [[ "${1:-}" == "-c" && "${2:-}" == "%d" ]]; then
   path="${*: -1}"
-  if [[ "$path" == "/" ]]; then echo 1; else echo "${STUB_FAKE_MEDIA_DEV:-2}"; fi
+  if [[ "$path" == "/" || ( -n "${STUB_FAKE_ROOT_PREFIX:-}" && "$path" == "$STUB_FAKE_ROOT_PREFIX"* ) ]]; then echo 1; else echo "${STUB_FAKE_MEDIA_DEV:-2}"; fi
   exit 0
 fi
 exec "$(command -p -v stat 2>/dev/null || echo /usr/bin/stat)" "$@"

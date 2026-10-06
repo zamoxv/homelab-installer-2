@@ -133,6 +133,12 @@ harness_setup_env() {
   export BACKUP_ROOT="$scratch/backups"
   export MEDIA_ROOT="$scratch/media"
   export SECRETS_DIR="$scratch/etc-hli2"
+  # Backups: estado escrito por root (/var/lib/hli2-root) y copia root-owned del
+  # código (/usr/local/lib/hli2), ambos redirigidos al scratch.
+  export BACKUP_STATE_DIR="$scratch/backup-state"
+  export HLI2_BACKUP_STATE_DIR="$BACKUP_STATE_DIR"
+  export BACKUP_INSTALL_DIR="$scratch/install"
+  export HLI2_BACKUP_INSTALL_DIR="$BACKUP_INSTALL_DIR"
   export DOKPLOY_ENV_FILE="$scratch/etc-hli2/dokploy.env"
   export DOKPLOY_STATE_FILE="$scratch/state/dokploy-compose-ids"
   export DNS_PORT_STATE_DIR="$scratch/state"

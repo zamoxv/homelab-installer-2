@@ -44,6 +44,9 @@ case "$widget" in
     if [[ -n "${STUB_TEXTBOX_LOG:-}" ]]; then
       for a in "$@"; do [[ -f "$a" ]] && cat "$a" >> "$STUB_TEXTBOX_LOG"; done
     fi
+    # STUB_TEXTBOX_KILL=1: manda TERM al módulo que lo llamó (interrupción con
+    # el archivo temporal de la contraseña en disco).
+    if [[ -n "${STUB_TEXTBOX_KILL:-}" ]]; then kill -TERM "$PPID"; sleep 0.3; fi
     exit 0
     ;;
   --msgbox)

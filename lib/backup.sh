@@ -31,13 +31,26 @@
 set -euo pipefail
 
 BACKUP_PASSWORD_FILE="${HLI2_BACKUP_PASSWORD_FILE:-$SECRETS_DIR/restic-password}"
-BACKUP_STATUS_FILE="${HLI2_BACKUP_STATUS_FILE:-$STATE_DIR/backup-status}"
-BACKUP_CHECK_STAMP="${HLI2_BACKUP_CHECK_STAMP:-$STATE_DIR/backup-last-check}"
+# Estado escrito por ROOT: nunca en STATE_DIR (de propiedad del usuario: un
+# enlace simbólico plantado ahí haría que root escribiera donde el usuario
+# quiera). Dir root 0755; el estado (0644, sin secretos) lo lee el usuario.
+BACKUP_STATE_DIR="${HLI2_BACKUP_STATE_DIR:-/var/lib/hli2-root}"
+BACKUP_STATUS_FILE="$BACKUP_STATE_DIR/backup-status"
+BACKUP_CHECK_STAMP="$BACKUP_STATE_DIR/backup-last-check"
+BACKUP_RECOVERY_FILE="$BACKUP_STATE_DIR/recovery-containers"
+# Copia root-owned del código que ejecuta root (servicio y 'sudo'): root nunca
+# ejecuta lib/*.sh, config ni services de un checkout del usuario.
+BACKUP_INSTALL_DIR="${HLI2_BACKUP_INSTALL_DIR:-/usr/local/lib/hli2}"
 BACKUP_CACHE_DIR="${HLI2_BACKUP_CACHE_DIR:-/var/cache/hli2/restic}"
 BACKUP_CHECK_EVERY_DAYS=7
 BACKUP_CHECK_SUBSET="5%"
 BACKUP_STOP_TIMEOUT=30
 BACKUP_STALE_HOURS=36
+# Reinicio de contenedores: espera total, intervalo y pausa de "asentamiento"
+# (un 'docker stop' de un cliente muerto puede seguir en el daemon).
+BACKUP_RESTART_WAIT="${HLI2_BACKUP_RESTART_WAIT:-60}"
+BACKUP_RESTART_POLL="${HLI2_BACKUP_RESTART_POLL:-5}"
+BACKUP_RESTART_SETTLE="${HLI2_BACKUP_RESTART_SETTLE:-2}"
 BACKUP_KEEP=(--keep-daily 7 --keep-weekly 4 --keep-monthly 6)
 
 # Contenedores que ESTE proceso detuvo y todavía no volvieron a arrancar
@@ -51,9 +64,11 @@ _BK_R2_KEY=""
 _BK_R2_SECRET=""
 _BK_R2_REGION=""
 
-# Resultado de la corrida (lo vuelca _backup_status_write).
+# Resultado de la corrida (lo vuelca _backup_status_write). BK_ACTIVE=1 mientras
+# haya una corrida en curso: si el proceso muere, el trap deja 'interrupted'.
 BK_RESULT="ok" BK_LOCAL="ok" BK_CLOUD="not-configured" BK_CHECK="skipped"
-BK_ID_FULL="" BK_ID_CLOUD="" BK_MSG=""
+BK_ID_FULL="" BK_ID_CLOUD="" BK_MSG="" BK_ACTIVE=0 BK_WARMUP_ID=""
+BK_TMP_FILES=()
 
 _backup_log() {
   printf '[%s] %s\n' "$(date '+%F %T')" "$*"
@@ -74,6 +89,46 @@ _backup_worse() {
   return 0
 }
 
+# --- Estado de root y copia del código ---------------------------------------------
+
+# Crea (si falta) el directorio de estado de root y comprueba que es nuestro y
+# no un enlace simbólico. Como root, 'install -d' lo deja root:root.
+_backup_state_dir_ensure() {
+  install -d -m 0755 "$BACKUP_STATE_DIR" 2>/dev/null || true
+  if [[ -L "$BACKUP_STATE_DIR" || ! -d "$BACKUP_STATE_DIR" || ! -O "$BACKUP_STATE_DIR" ]]; then
+    _backup_msg_add "el directorio de estado $BACKUP_STATE_DIR no es válido (debe ser propio y no un enlace)"
+    return 1
+  fi
+}
+
+# Copia ROOT-OWNED del código (bin/, lib/, services/, config/) en
+# $BACKUP_INSTALL_DIR. La corre el USUARIO (con sudo en cada operación: nunca
+# ejecuta nada del checkout como root) desde backup-setup y backup-now, y deja
+# todo root:root, directorios 0755 y archivos 0644 (el entrypoint 0755). Solo
+# archivos regulares (los enlaces simbólicos se omiten). La copia se arma en un
+# directorio de paso y se intercambia entera. 'source-dir' guarda de dónde
+# salió, para respaldar también la configuración real del usuario.
+backup_refresh_install() {
+  local src="$SCRIPT_DIR" dst="$BACKUP_INSTALL_DIR" stage f sub mode
+  [[ "$(cd "$src" && pwd -P)" != "$(cd "$dst" 2>/dev/null && pwd -P || echo /nonexistent)" ]] || return 0
+  stage="$dst.new"
+  sudo rm -rf "$stage"
+  sudo install -d -m 0755 -o root -g root "$stage" "$stage/bin" "$stage/lib" "$stage/services" "$stage/config" || return 1
+  for f in "$src/bin/hli2-backup" "$src"/lib/*.sh "$src"/services/*.conf "$src/config/default.conf"; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    sub="${f#"$src"/}"
+    mode=0644
+    [[ "$sub" == bin/* ]] && mode=0755
+    sudo install -m "$mode" -o root -g root "$f" "$stage/$sub" || return 1
+  done
+  printf '%s\n' "$src" | sudo tee "$stage/source-dir" >/dev/null || return 1
+  sudo rm -rf "$dst.old"
+  if [[ -e "$dst" ]]; then sudo mv "$dst" "$dst.old" || return 1; fi
+  sudo mv "$stage" "$dst" || return 1
+  sudo rm -rf "$dst.old"
+  return 0
+}
+
 # --- Seguridad del destino ---------------------------------------------------
 
 # Id de dispositivo del sistema de archivos que contiene $1. Función aparte
@@ -82,30 +137,68 @@ _backup_devid() {
   stat -c %d -- "$1"
 }
 
-# Falla cerrado si $BACKUP_ROOT está en el mismo dispositivo que '/': un
-# disco de media montado tarde (o no montado) deja escribir en la carpeta
-# oculta del disco del sistema, que se llenaría en silencio y, peor, los
-# contenedores seguirían escribiendo ahí (lección del 2026-10-06). Se
-# evalúa el ancestro existente más cercano, sin crear nada antes.
+# Falla cerrado si $BACKUP_ROOT no está en un disco de datos montado aparte del
+# sistema: un disco de media montado tarde (o no montado) deja escribir en la
+# carpeta oculta del disco del sistema (lección del 2026-10-06). Se resuelve la
+# ruta real (enlaces simbólicos) y se evalúa su ancestro existente más cercano,
+# sin crear nada antes:
+#   1. el punto de montaje que la contiene no puede ser '/' ni compartir
+#      dispositivo con '/';
+#   2. si queda bajo $MEDIA_ROOT, $MEDIA_ROOT tiene que ser un punto de montaje
+#      (con /srv en otra partición y el disco de media sin montar, el punto 1
+#      solo no alcanza).
 _backup_guard_fs() {
-  local p="$BACKUP_ROOT" root_dev dev
+  local rp p target root_dev dev media_rp
+  rp="$(realpath -m -- "$BACKUP_ROOT")" || { _backup_msg_add "no se pudo resolver $BACKUP_ROOT"; return 1; }
+  p="$rp"
   while [[ ! -e "$p" && "$p" != "/" ]]; do p="$(dirname "$p")"; done
+  target="$(findmnt -n -o TARGET -T "$p" 2>/dev/null)" || target=""
+  if [[ -z "$target" || "$target" == "/" ]]; then
+    _backup_msg_add "$BACKUP_ROOT está en el mismo disco que el sistema (¿falta montar el disco de media?). No se hace backup"
+    return 1
+  fi
   root_dev="$(_backup_devid /)" || { _backup_msg_add "no se pudo leer el disco de /"; return 1; }
   dev="$(_backup_devid "$p")" || { _backup_msg_add "no se pudo leer el disco de $p"; return 1; }
   if [[ -z "$root_dev" || -z "$dev" || "$dev" == "$root_dev" ]]; then
     _backup_msg_add "$BACKUP_ROOT está en el mismo disco que el sistema (¿falta montar el disco de media?). No se hace backup"
     return 1
   fi
+  media_rp="$(realpath -m -- "$MEDIA_ROOT")" || media_rp="$MEDIA_ROOT"
+  case "$rp/" in
+    "$media_rp/"*)
+      if ! mountpoint -q "$media_rp"; then
+        _backup_msg_add "$MEDIA_ROOT no es un punto de montaje (disco de media sin montar). No se hace backup"
+        return 1
+      fi
+      ;;
+  esac
   return 0
+}
+
+# Carpeta del repositorio: root:root 0700, siempre (otros flujos, como
+# create_media_skeleton, pudieron haberla tocado).
+_backup_secure_repo_dir() {
+  chmod 0700 "$BACKUP_ROOT"
+  chmod g-s,u-s "$BACKUP_ROOT"
+  chown root:root "$BACKUP_ROOT"
+}
+
+# La contraseña existe y es utilizable (no vacía, sin espacios, >= 16 caracteres).
+_backup_password_ok() {
+  local pw
+  pw="$(priv_file_read "$BACKUP_PASSWORD_FILE" 2>/dev/null)" || return 1
+  pw="${pw%%$'\n'*}"
+  [[ "${#pw}" -ge 16 && "$pw" != *[[:space:]]* ]]
 }
 
 # --- Selección de rutas desde el registro de servicios ------------------------
 
 # Llena BK_PATHS (foto full), BK_CLOUD_PATHS (foto cloud: sin las rutas solo
 # local), BK_EXCLUDE_ARGS y BK_LOCAL_ONLY. Solo rutas que existen. Nunca
-# /srv/media*.
+# /srv/media*. SCRIPT_DIR es la copia root-owned; si existe 'source-dir' se
+# respalda además la configuración real del usuario (solo como DATOS).
 _backup_collect() {
-  local id p
+  local id p src=""
   local -a all=() excl=() lonly=()
   local -A seen=() is_excl=() is_lonly=()
   BK_PATHS=() BK_CLOUD_PATHS=() BK_EXCLUDE_ARGS=() BK_LOCAL_ONLY=()
@@ -124,7 +217,13 @@ _backup_collect() {
   done < <(service_list)
 
   all+=("/etc/samba/smb.conf" "$SECRETS_DIR" "$STATE_DIR" "$SCRIPT_DIR/config")
+  if [[ -f "$SCRIPT_DIR/source-dir" ]]; then
+    IFS= read -r src < "$SCRIPT_DIR/source-dir" || true
+    if [[ "$src" == /* ]]; then all+=("$src/config"); fi
+  fi
   # La contraseña de restic nunca viaja dentro de sus propios repositorios.
+  # (restic.env SÍ se respalda, cifrado: hace falta para recuperarse de un
+  # desastre; ver ROADMAP v2.5.)
   excl+=("$BACKUP_PASSWORD_FILE")
 
   for p in "${excl[@]}"; do is_excl[$p]=1; BK_EXCLUDE_ARGS+=("--exclude=$p"); done
@@ -153,40 +252,92 @@ _backup_sqlite_containers() {
   done < <(service_list)
 }
 
+# 0 = corriendo; 1 = detenido o inexistente; 2 = error de docker (no se sabe).
 _backup_container_running() {
-  local out
-  out="$(hli_docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" || return 1
-  [[ "$out" == "true" ]]
+  local out rc=0
+  out="$(hli_docker inspect -f '{{.State.Running}}' "$1" 2>&1)" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    [[ "$out" == "true" ]] && return 0
+    return 1
+  fi
+  case "$out" in
+    *"No such"*|*"no such"*) return 1 ;;
+  esac
+  return 2
+}
+
+# Lista de contenedores a detener, guardada ANTES de detener nada: si el proceso
+# muere (o el equipo se reinicia) a mitad de la ventana, 'recover' sabe qué
+# levantar ('restart: unless-stopped' no reinicia un contenedor parado a mano).
+_backup_recovery_write() {
+  local tmp
+  tmp="$(mktemp "$BACKUP_STATE_DIR/.recovery.XXXXXX")" || return 1
+  printf '%s\n' "$@" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f -- "$tmp" "$BACKUP_RECOVERY_FILE"
+}
+
+_backup_recovery_clear() {
+  rm -f -- "$BACKUP_RECOVERY_FILE"
 }
 
 # Detiene los contenedores sqlite que estén corriendo. Cada nombre se anota
 # ANTES de detenerlo: si 'docker stop' falla a medias, igual se intenta
 # levantarlo después. Devuelve 1 si alguno no se pudo detener (la foto sería
-# inconsistente: el llamador no la toma).
+# inconsistente: el llamador no la toma). Un error de docker al consultar el
+# estado NO es "detenido": queda como aviso (podría haberse copiado en vivo).
 _backup_stop_sqlite() {
-  local c
+  local c rc
+  local -a todo=()
   while read -r c; do
     [[ -n "$c" ]] || continue
-    _backup_container_running "$c" || continue
+    rc=0
+    _backup_container_running "$c" || rc=$?
+    case "$rc" in
+      0) todo+=("$c") ;;
+      1) ;;
+      *)
+        _backup_worse warning
+        _backup_msg_add "no se pudo consultar el estado de '$c': puede haberse copiado en vivo"
+        ;;
+    esac
+  done < <(_backup_sqlite_containers)
+
+  if [[ ${#todo[@]} -gt 0 ]]; then
+    _backup_recovery_write "${todo[@]}" || { hli_error "no se pudo guardar la lista de recuperación"; return 1; }
+  fi
+  for c in "${todo[@]}"; do
     BACKUP_STOPPED_CONTAINERS+="$c "
     _backup_log "Deteniendo '$c' para la copia consistente"
     if ! hli_docker stop -t "$BACKUP_STOP_TIMEOUT" "$c" >/dev/null 2>&1; then
       hli_error "no se pudo detener '$c'"
       return 1
     fi
-  done < <(_backup_sqlite_containers)
+  done
   return 0
 }
 
-# Vuelve a levantar lo que este proceso detuvo. Nunca falla (se usa dentro de
-# un trap EXIT): lo que no arranca queda registrado con el comando exacto.
+# Levanta un contenedor y comprueba que de verdad queda corriendo (con
+# reintentos): un 'docker stop' de un cliente ya muerto puede seguir
+# deteniéndolo en el daemon, y 'docker start' sobre algo "a medio parar" no
+# sirve. Devuelve 1 si no queda corriendo dentro de BACKUP_RESTART_WAIT.
 _backup_restart_container() {
-  local c="$1"
-  hli_docker start "$c" >/dev/null 2>&1 && return 0
+  local c="$1" waited=0 rc
+  while true; do
+    hli_docker start "$c" >/dev/null 2>&1 || true
+    sleep "$BACKUP_RESTART_SETTLE"
+    rc=0
+    _backup_container_running "$c" || rc=$?
+    [[ "$rc" -eq 0 ]] && return 0
+    (( waited >= BACKUP_RESTART_WAIT )) && break
+    sleep "$BACKUP_RESTART_POLL"
+    waited=$(( waited + BACKUP_RESTART_POLL ))
+  done
   hli_error "no se pudo volver a iniciar '$c'. Inícielo a mano: sudo docker start $c"
   return 1
 }
 
+# Vuelve a levantar lo que este proceso detuvo. Devuelve 1 si alguno no volvió
+# (queda en la lista de recuperación y en BACKUP_STOPPED_CONTAINERS).
 backup_restart_stopped() {
   local c remaining=""
   for c in $BACKUP_STOPPED_CONTAINERS; do
@@ -194,13 +345,49 @@ backup_restart_stopped() {
     if ! _backup_restart_container "$c"; then remaining+="$c "; fi
   done
   BACKUP_STOPPED_CONTAINERS="$remaining"
-  [[ -z "$remaining" ]]
+  if [[ -z "$remaining" ]]; then
+    _backup_recovery_clear
+    return 0
+  fi
+  return 1
 }
 
-# Trap EXIT de bin/hli2-backup: lo detenido SIEMPRE se levanta, y las
-# credenciales cargadas no sobreviven al proceso.
+# Levanta lo que una corrida anterior dejó detenido (proceso muerto, corte de
+# luz). Al inicio de cada 'run', en 'hli2-backup recover' (ExecStopPost y
+# arranque del equipo). Devuelve 1 si algo no pudo levantarse.
+backup_recover() {
+  local c rest="" bad=0
+  [[ -s "$BACKUP_RECOVERY_FILE" ]] || return 0
+  while IFS= read -r c; do
+    [[ "$c" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || continue
+    _backup_log "Recuperación: iniciando '$c' (quedó detenido por un backup anterior)"
+    if ! _backup_restart_container "$c"; then rest+="$c"$'\n'; bad=1; fi
+  done < "$BACKUP_RECOVERY_FILE"
+  if [[ "$bad" -eq 0 ]]; then
+    _backup_recovery_clear
+    return 0
+  fi
+  printf '%s' "$rest" > "$BACKUP_RECOVERY_FILE"
+  return 1
+}
+
+# Trap EXIT de bin/hli2-backup: lo detenido SIEMPRE se levanta, una corrida
+# cortada deja 'interrupted' en el estado, y las credenciales cargadas no
+# sobreviven al proceso. Lo PRIMERO es ignorar nuevas señales: una segunda
+# Ctrl+C/TERM no puede abortar el bucle de reinicio.
 backup_exit_cleanup() {
-  backup_restart_stopped || true
+  trap '' INT TERM HUP
+  local rc=0 f
+  backup_restart_stopped || rc=1
+  if [[ "$BK_ACTIVE" == "1" ]]; then
+    BK_RESULT=interrupted BK_LOCAL=unknown BK_CLOUD=unknown BK_CHECK=unknown
+    _backup_msg_add "el backup se interrumpió antes de terminar"
+    [[ "$rc" -eq 0 ]] || _backup_msg_add "algún contenedor no volvió a iniciar (revise el log)"
+    _backup_status_write || true
+    BK_ACTIVE=0
+  fi
+  for f in "${BK_TMP_FILES[@]}"; do rm -f -- "$f"; done
+  BK_TMP_FILES=()
   _BK_R2_REPO="" _BK_R2_KEY="" _BK_R2_SECRET="" _BK_R2_REGION=""
   return 0
 }
@@ -241,8 +428,8 @@ _backup_tee() {
   return "$rc"
 }
 
-# Toma la foto con tag $1 (full|cloud). Deja el id en BK_LAST_ID. Devuelve el
-# código de restic (3 = foto creada pero con archivos ilegibles).
+# Toma la foto con tag $1 (full|cloud|warmup). Deja el id en BK_LAST_ID. Devuelve
+# el código de restic (3 = foto creada pero con archivos ilegibles).
 _backup_snapshot() {
   local tag="$1" out rc=0
   local -a paths excl=("${BK_EXCLUDE_ARGS[@]}")
@@ -255,8 +442,9 @@ _backup_snapshot() {
     paths=("${BK_PATHS[@]}")
   fi
   out="$(mktemp)"
+  BK_TMP_FILES+=("$out")
   _backup_log "Foto local '$tag' (${#paths[@]} rutas)"
-  _backup_tee "$out" _backup_restic_local backup --tag "$tag" "${excl[@]}" -- "${paths[@]}" || rc=$?
+  _backup_tee "$out" _backup_restic_local backup --tag "$tag" --exclude-caches "${excl[@]}" -- "${paths[@]}" || rc=$?
   BK_LAST_ID="$(sed -n 's/^snapshot \([0-9a-f]\{6,\}\) saved.*/\1/p' "$out" | tail -n1)"
   rm -f "$out"
   return "$rc"
@@ -281,6 +469,42 @@ _backup_take() {
       ;;
   esac
   if [[ "$tag" == "full" ]]; then BK_ID_FULL="$BK_LAST_ID"; else BK_ID_CLOUD="$BK_LAST_ID"; fi
+  return 0
+}
+
+# 0 = ya hay una foto 'full'; 1 = ninguna; 2 = no se pudo saber.
+_backup_has_full_snapshot() {
+  local out n
+  out="$(_backup_restic_local snapshots --tag full --json 2>/dev/null)" || return 2
+  n="$(printf '%s' "$out" | jq 'length' 2>/dev/null)" || return 2
+  [[ "$n" =~ ^[0-9]+$ ]] || return 2
+  (( n > 0 ))
+}
+
+# Primera corrida: una pasada EN VIVO (servicios arriba, foto 'warmup' que se
+# olvida al final) para que la pasada con los servicios detenidos sea corta
+# (restic la toma como foto previa y solo relee lo que cambió).
+_backup_warmup() {
+  local rc=0
+  BK_WARMUP_ID=""
+  _backup_has_full_snapshot || rc=$?
+  [[ "$rc" -eq 1 ]] || return 0
+  _backup_log "Primera copia: pasada previa con los servicios en marcha"
+  rc=0
+  _backup_snapshot warmup || rc=$?
+  if [[ "$rc" -eq 0 || "$rc" -eq 3 ]]; then
+    BK_WARMUP_ID="$BK_LAST_ID"
+  else
+    _backup_worse warning
+    _backup_msg_add "falló la pasada previa (la parada será más larga)"
+  fi
+  return 0
+}
+
+_backup_warmup_forget() {
+  [[ -n "$BK_WARMUP_ID" ]] || return 0
+  _backup_restic_local forget "$BK_WARMUP_ID" || { _backup_worse warning; _backup_msg_add "no se pudo olvidar la foto previa"; }
+  BK_WARMUP_ID=""
   return 0
 }
 
@@ -331,8 +555,8 @@ _backup_check() {
 # --- Estado --------------------------------------------------------------------
 
 _backup_status_write() {
-  local tmp="$BACKUP_STATUS_FILE.tmp"
-  install -m 0644 /dev/null "$tmp"
+  local tmp
+  tmp="$(mktemp "$BACKUP_STATE_DIR/.status.XXXXXX")" || return 1
   {
     printf 'timestamp=%s\n' "$(date -Is)"
     printf 'result=%s\n' "$BK_RESULT"
@@ -343,6 +567,7 @@ _backup_status_write() {
     printf 'snapshot_cloud=%s\n' "$BK_ID_CLOUD"
     printf 'message=%s\n' "$BK_MSG"
   } > "$tmp"
+  chmod 0644 "$tmp"
   mv -f -- "$tmp" "$BACKUP_STATUS_FILE"
 }
 
@@ -362,6 +587,10 @@ _backup_res_es() {
     ok) echo "correcto" ;;
     warning) echo "con avisos" ;;
     error) echo "ERROR" ;;
+    running) echo "en curso" ;;
+    interrupted) echo "INTERRUMPIDO" ;;
+    pending) echo "pendiente" ;;
+    unknown) echo "desconocido" ;;
     not-configured) echo "no configurada" ;;
     skipped) echo "omitido" ;;
     *) echo "${1:-N/D}" ;;
@@ -393,10 +622,10 @@ backup_status_summary() {
 
 _backup_preflight() {
   command -v restic >/dev/null 2>&1 || { _backup_msg_add "restic no está instalado (ejecute backup-setup)"; return 1; }
-  priv_file_exists "$BACKUP_PASSWORD_FILE" || { _backup_msg_add "falta la contraseña de restic (ejecute backup-setup)"; return 1; }
+  _backup_password_ok || { _backup_msg_add "falta la contraseña de restic o es inválida (ejecute backup-setup)"; return 1; }
   _backup_guard_fs || return 1
   [[ -f "$BACKUP_ROOT/config" ]] || { _backup_msg_add "el repositorio local no está inicializado (ejecute backup-setup)"; return 1; }
-  chmod 0700 "$BACKUP_ROOT"
+  _backup_secure_repo_dir
   return 0
 }
 
@@ -404,20 +633,45 @@ _backup_preflight() {
 # contenedores detenidos se levantan acá mismo apenas terminan las fotos, y
 # además el trap de bin/hli2-backup (backup_exit_cleanup) cubre cualquier
 # salida anormal.
+#
+# Orden (decidido a propósito):
+#   [pasada previa en vivo, solo la primera vez] -> parada -> foto full ->
+#   foto cloud -> reinicio -> olvidar la previa -> copia a R2 -> retención de
+#   R2 (solo si se copió una foto nueva) -> retención local (después de la
+#   copia, para que nada envejezca localmente sin haber llegado a R2) ->
+#   chequeo semanal.
 backup_run() {
+  BK_ACTIVE=1
   BK_RESULT=ok BK_LOCAL=ok BK_CLOUD=not-configured BK_CHECK=skipped
-  BK_ID_FULL="" BK_ID_CLOUD="" BK_MSG=""
-  local r2=0
+  BK_ID_FULL="" BK_ID_CLOUD="" BK_MSG="" BK_WARMUP_ID=""
+  local r2=0 copied=0 rc=0
+
+  if ! _backup_state_dir_ensure; then
+    _backup_log "ERROR: $BK_MSG"
+    BK_ACTIVE=0
+    return 1
+  fi
+  # Estado 'running' desde el principio: una corrida cortada no deja un 'ok' viejo.
+  BK_RESULT=running BK_LOCAL=pending BK_CLOUD=pending BK_CHECK=pending
+  _backup_status_write || true
+  BK_RESULT=ok BK_LOCAL=ok BK_CLOUD=not-configured BK_CHECK=skipped
   _backup_log "Inicio del backup"
+
+  if ! backup_recover; then
+    _backup_worse warning
+    _backup_msg_add "quedaron contenedores sin iniciar de una corrida anterior"
+  fi
 
   if ! _backup_preflight; then
     BK_RESULT=error BK_LOCAL=error BK_CLOUD=skipped
     _backup_log "ERROR: $BK_MSG"
-    _backup_status_write
+    _backup_status_write || true
+    BK_ACTIVE=0
     return 1
   fi
 
   _backup_collect
+  _backup_warmup
 
   # Ventana de parada: lo mínimo (las dos fotos locales, deduplicadas).
   if _backup_stop_sqlite; then
@@ -431,27 +685,35 @@ backup_run() {
     _backup_worse error
     _backup_msg_add "algún contenedor no volvió a iniciar (revise el log)"
   fi
-
-  _backup_forget local
+  _backup_warmup_forget
 
   if backup_r2_load; then
     r2=1
     BK_CLOUD=ok
     _backup_log "Copia externa (R2)"
-    local rc=0
     _backup_restic_r2 copy --from-repo "$BACKUP_ROOT" --from-password-file "$BACKUP_PASSWORD_FILE" --tag cloud || rc=$?
     if [[ "$rc" -ne 0 ]]; then
       BK_CLOUD=error
       _backup_worse error
       _backup_msg_add "falló la copia externa a R2 (código $rc)"
     else
-      _backup_forget r2
+      copied=1
     fi
+  fi
+  # Sin foto cloud nueva copiada, no se poda R2 (prune es caro y no hay nada
+  # nuevo que justificarlo).
+  if [[ "$copied" -eq 1 && -n "$BK_ID_CLOUD" ]]; then _backup_forget r2; fi
+  if [[ "$BK_CLOUD" == "error" ]]; then
+    _backup_worse warning
+    _backup_msg_add "retención local omitida hasta que la copia externa funcione"
+  else
+    _backup_forget local
   fi
 
   _backup_check "$r2"
 
   _backup_status_write
+  BK_ACTIVE=0
   _backup_log "Fin del backup: $BK_RESULT (local=$BK_LOCAL, externa=$BK_CLOUD)"
   [[ "$BK_RESULT" != "error" ]]
 }
@@ -461,10 +723,11 @@ backup_init() {
   local rc=0
   BK_MSG=""
   command -v restic >/dev/null 2>&1 || { echo "ERROR: restic no está instalado." >&2; return 1; }
-  priv_file_exists "$BACKUP_PASSWORD_FILE" || { echo "ERROR: falta la contraseña de restic ($BACKUP_PASSWORD_FILE)." >&2; return 1; }
+  _backup_state_dir_ensure || { echo "ERROR: $BK_MSG" >&2; return 1; }
+  _backup_password_ok || { echo "ERROR: falta la contraseña de restic o es inválida ($BACKUP_PASSWORD_FILE)." >&2; return 1; }
   if ! _backup_guard_fs; then echo "ERROR: $BK_MSG" >&2; return 1; fi
   install -d -m 0700 "$BACKUP_ROOT"
-  chmod 0700 "$BACKUP_ROOT"
+  _backup_secure_repo_dir
   if [[ ! -f "$BACKUP_ROOT/config" ]]; then
     _backup_log "Inicializando el repositorio local"
     _backup_restic_local init || { echo "ERROR: no se pudo inicializar el repositorio local." >&2; return 1; }
@@ -472,7 +735,9 @@ backup_init() {
   if backup_r2_load; then
     if ! _backup_restic_r2 cat config >/dev/null 2>&1; then
       _backup_log "Inicializando el repositorio en R2"
-      _backup_restic_r2 init || rc=$?
+      # Mismos parámetros de chunking que el repo local: 'restic copy'
+      # deduplica entre repos solo así.
+      _backup_restic_r2 init --from-repo "$BACKUP_ROOT" --from-password-file "$BACKUP_PASSWORD_FILE" --copy-chunker-params || rc=$?
       if [[ "$rc" -ne 0 ]]; then
         echo "ERROR: no se pudo inicializar el repositorio en R2 (revise endpoint, bucket y claves)." >&2
         return 1

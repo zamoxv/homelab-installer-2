@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stub de 'chown': nunca cambia dueños (los tests no corren como root); solo
+# registra los argumentos, para que un test pueda afirmar sobre QUÉ rutas se
+# pidió cambiar el dueño (ej. que el repo de backups quede fuera de un chown -R).
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call chown "$@"
+exit 0

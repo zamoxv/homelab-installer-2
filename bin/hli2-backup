@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Entrada NO interactiva del backup (sin TTY ni dialog). La usan el servicio
 # systemd hli2-backup.service, la herramienta backup-now y backup-setup, siempre
-# como root.
+# como root y SIEMPRE desde la copia root-owned en /usr/local/lib/hli2 (la deja
+# backup_refresh_install): root nunca ejecuta código de un checkout del usuario.
 #
-#   hli2-backup run    Backup completo (fotos locales + copia a R2 + retención).
-#   hli2-backup init   Inicializa los repositorios que falten (idempotente).
+#   hli2-backup run      Backup completo (fotos locales + copia a R2 + retención).
+#   hli2-backup init     Inicializa los repositorios que falten (idempotente).
+#   hli2-backup recover  Levanta lo que un backup interrumpido dejó detenido.
 #
 # Registra en $LOG_DIR/backup.log (0640 root; sin secretos) y, si hay
 # terminal, también la muestra.
@@ -14,17 +16,35 @@ set -euo pipefail
 export USER="${USER:-root}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$HERE/../lib/core.sh"
+ROOT_DIR="$(cd "$HERE/.." && pwd)"
 
-# 'HLI2_BACKUP_ALLOW_NONROOT' existe solo para los tests (corren como usuario
-# normal y con restic/docker/sudo simulados).
+# Guardia: todo lo que se va a sourcear debe ser de root y no escribible por
+# otros (si no, es el mismo agujero que se evita con la copia root-owned).
+# 'HLI2_BACKUP_EXPECT_UID' y 'HLI2_BACKUP_ALLOW_NONROOT' existen solo para los
+# tests (corren como usuario normal con restic/docker/sudo simulados).
+_expect_uid="${HLI2_BACKUP_EXPECT_UID:-0}"
+_bad=""
+for _f in "$ROOT_DIR" "$HERE" "$ROOT_DIR/lib" "$ROOT_DIR/services" "$ROOT_DIR/config" \
+          "$HERE"/* "$ROOT_DIR"/lib/* "$ROOT_DIR"/services/* "$ROOT_DIR"/config/*; do
+  [[ -e "$_f" ]] || continue
+  read -r _uid _mode < <(stat -c '%u %a' -- "$_f")
+  if [[ "$_uid" != "$_expect_uid" ]]; then _bad="$_f"; break; fi
+  if [[ "$_expect_uid" == "0" ]] && (( 8#$_mode & 8#022 )); then _bad="$_f"; break; fi
+done
+if [[ -n "$_bad" ]]; then
+  echo "ERROR: $_bad no es de root o es escribible por otros: hli2-backup solo corre desde la copia root-owned (ejecute backup-setup)." >&2
+  exit 1
+fi
+
+source "$ROOT_DIR/lib/core.sh"
+
 if [[ "$(id -u)" -ne 0 && -z "${HLI2_BACKUP_ALLOW_NONROOT:-}" ]]; then
   echo "ERROR: hli2-backup debe correr como root (use sudo)." >&2
   exit 1
 fi
 
 umask 027
-mkdir -p "$LOG_DIR" "$STATE_DIR"
+mkdir -p "$LOG_DIR"
 if [[ -t 1 ]]; then
   exec > >(tee -a "$LOG_DIR/backup.log") 2>&1
 else
@@ -32,6 +52,25 @@ else
 fi
 
 case "${1:-}" in
+  run|recover|init) ;;
+  *) echo "Uso: hli2-backup {run|init|recover}" >&2; exit 2 ;;
+esac
+
+if ! _backup_state_dir_ensure; then
+  echo "ERROR: $BK_MSG" >&2
+  exit 1
+fi
+
+# Un solo proceso a la vez (timer + manual, o ExecStopPost): sin esto, el
+# 'recover' de uno levantaría contenedores que el otro detuvo a propósito.
+exec 9>"$BACKUP_STATE_DIR/lock"
+if ! flock -n 9; then
+  echo "Otro backup está en curso; no se hace nada."
+  [[ "$1" == "recover" ]] && exit 0
+  exit 1
+fi
+
+case "$1" in
   run)
     # Lo detenido se levanta SIEMPRE: salida normal, error de 'set -e' o señal.
     trap backup_exit_cleanup EXIT
@@ -39,11 +78,11 @@ case "${1:-}" in
     trap 'exit 130' INT HUP
     backup_run
     ;;
+  recover)
+    trap backup_exit_cleanup EXIT
+    backup_recover
+    ;;
   init)
     backup_init
-    ;;
-  *)
-    echo "Uso: hli2-backup {run|init}" >&2
-    exit 2
     ;;
 esac

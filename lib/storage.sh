@@ -110,9 +110,13 @@ create_media_skeleton() {
   local root="$1" f
   sudo mkdir -p "$root"
   for f in "${MEDIA_FOLDERS[@]}"; do sudo mkdir -p "$root/$f"; done
-  sudo chown -R "$SERVER_USER:$MEDIA_GROUP" "$root"
+  # El repositorio de backups (restic, root 0700) puede vivir dentro de la raíz
+  # de media ($BACKUP_ROOT, carpeta oculta .hli2-backups): se EXCLUYE (-prune) de
+  # todo chown/chmod, o este flujo se lo entregaría al usuario con 2775/0664.
+  local -a skip=(-path "$BACKUP_ROOT" -o -name .hli2-backups)
+  sudo find "$root" \( "${skip[@]}" \) -prune -o -exec chown "$SERVER_USER:$MEDIA_GROUP" {} + 2>/dev/null || true
   # setgid en directorios (el grupo se hereda) y 0664 en archivos: no marca
   # como ejecutables archivos de media si el disco ya traía contenido.
-  sudo find "$root" -type d -exec chmod 2775 {} + 2>/dev/null || true
-  sudo find "$root" -type f -exec chmod 0664 {} + 2>/dev/null || true
+  sudo find "$root" \( "${skip[@]}" \) -prune -o -type d -exec chmod 2775 {} + 2>/dev/null || true
+  sudo find "$root" \( "${skip[@]}" \) -prune -o -type f -exec chmod 0664 {} + 2>/dev/null || true
 }

@@ -120,7 +120,7 @@ case "$sub" in
     fi
     exit 1
     ;;
-  tee|mkdir|install|cp|touch|chmod)
+  tee|mkdir|install|cp|touch|chmod|mv)
     if _stub_all_paths_safe "${args[@]:1}"; then
       _stub_unlock_root_area
       if [[ "$sub" == "install" ]]; then
@@ -165,6 +165,16 @@ case "$sub" in
       fi
       exit 0
     fi
+    ;;
+  find)
+    # 'sudo find ... -exec chmod/chown ...': se corre de verdad solo bajo el
+    # scratch (los -exec resuelven por PATH: 'chown' es el stub que solo
+    # registra, 'chmod' el real).
+    if _stub_all_paths_safe "${args[@]:1}"; then
+      "${args[@]}"
+      exit $?
+    fi
+    exit 0
     ;;
   rm)
     if _stub_all_paths_safe "${args[@]:1}"; then

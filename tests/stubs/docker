@@ -22,6 +22,38 @@ if [[ -n "${STUB_DOCKER_FAIL_STOP:-}" && "${1:-}" == "stop" ]]; then
   fi
 fi
 
+# STUB_DOCKER_INSPECT_ERROR="a": 'inspect' falla con un error de docker (no es
+# "no existe"); STUB_DOCKER_NOT_FOUND="a": falla con "No such object".
+if [[ "${1:-}" == "inspect" ]]; then
+  last="${*: -1}"
+  if [[ " ${STUB_DOCKER_INSPECT_ERROR:-} " == *" $last "* ]]; then
+    echo "permission denied while trying to connect to the Docker daemon socket" >&2; exit 1
+  fi
+  if [[ " ${STUB_DOCKER_NOT_FOUND:-} " == *" $last "* ]]; then
+    echo "Error: No such object: $last" >&2; exit 1
+  fi
+fi
+# STUB_RECOVERY_FILE: al hacer 'stop' registra si ese archivo ya existía.
+if [[ "${1:-}" == "stop" && -n "${STUB_RECOVERY_FILE:-}" ]]; then
+  printf 'recovery-at-stop\t%s\t%s\n' "${*: -1}" "$([[ -s "$STUB_RECOVERY_FILE" ]] && echo yes || echo no)" >> "$STUB_CALL_LOG"
+fi
+# STUB_DOCKER_START_IGNORED=N: los primeros N 'start' de cada contenedor
+# devuelven 0 pero no lo levantan (un 'docker stop' viejo aún en curso).
+# STUB_DOCKER_KILL_ON_START=1: el primer 'start' manda TERM al entrypoint
+# (segunda señal en pleno cleanup).
+if [[ "${1:-}" == "start" && -n "${STUB_DOCKER_STATE_DIR:-}" ]]; then
+  last="${*: -1}"
+  if [[ -n "${STUB_DOCKER_START_IGNORED:-}" ]]; then
+    n=0; [[ -f "$STUB_DOCKER_STATE_DIR/.startcount.$last" ]] && n="$(cat "$STUB_DOCKER_STATE_DIR/.startcount.$last")"
+    if (( n < STUB_DOCKER_START_IGNORED )); then echo $((n + 1)) > "$STUB_DOCKER_STATE_DIR/.startcount.$last"; exit 0; fi
+  fi
+  if [[ -n "${STUB_DOCKER_KILL_ON_START:-}" && ! -f "$STUB_DOCKER_STATE_DIR/.killed" ]]; then
+    : > "$STUB_DOCKER_STATE_DIR/.killed"
+    stub_kill_entrypoint || true
+    sleep 0.3
+  fi
+fi
+
 # STUB_DOCKER_NOT_RUNNING="a b": esos contenedores existen pero están
 # detenidos ('inspect -f {{.State.Running}}' -> false). STUB_DOCKER_STATE_DIR:
 # si existe, 'stop'/'start' lo reflejan en archivos para que un test pueda
