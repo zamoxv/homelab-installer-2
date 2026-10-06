@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Stub de 'restic' para tests: nunca toca un repositorio real. Registra el
+# argv completo (log_call) y, en una línea aparte 'restic-env', QUÉ variables
+# de entorno recibió (repositorio, archivo de contraseña y solo el LARGO de las
+# claves de R2: así un test puede afirmar que el secreto jamás aparece en el
+# log y, a la vez, que llegó por el entorno).
+#
+# Interruptores:
+#   STUB_RESTIC_FAIL="copy backup:cloud ..."  subcomandos que fallan; para
+#                    'backup' se puede filtrar por tag ('backup:cloud').
+#   STUB_RESTIC_FAIL_RC                       código de salida (default 1).
+#   STUB_RESTIC_KILL_ON="backup"              envía TERM al proceso bin/hli2-backup
+#                    (el ancestro más alto) al correr ese subcomando: simula
+#                    una interrupción en plena ventana de parada.
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call restic "$@"
+
+{
+  printf 'restic-env\tREPO=%s\tPW_FILE=%s\tAWS_KEY_LEN=%s\tAWS_SECRET_LEN=%s\tREGION=%s\n' \
+    "${RESTIC_REPOSITORY:-}" "${RESTIC_PASSWORD_FILE:-}" \
+    "$(printf %s "${AWS_ACCESS_KEY_ID:-}" | wc -c | tr -d " ")" "$(printf %s "${AWS_SECRET_ACCESS_KEY:-}" | wc -c | tr -d " ")" "${AWS_DEFAULT_REGION:-}"
+} >> "$STUB_CALL_LOG" 2>/dev/null || true
+
+sub=""
+for a in "$@"; do
+  case "$a" in
+    init|backup|copy|forget|check|cat|snapshots|restore) sub="$a"; break ;;
+  esac
+done
+
+tag=""
+prev=""
+for a in "$@"; do
+  [[ "$prev" == "--tag" ]] && tag="$a"
+  prev="$a"
+done
+
+key="$sub"
+[[ "$sub" == "backup" && -n "$tag" ]] && key="backup:$tag"
+fail=0
+for f in ${STUB_RESTIC_FAIL:-}; do
+  if [[ "$f" == "$sub" || "$f" == "$key" ]]; then fail=1; fi
+done
+
+if [[ -n "${STUB_RESTIC_KILL_ON:-}" && "$sub" == "${STUB_RESTIC_KILL_ON}" ]]; then
+  # Sube por los ancestros: el entrypoint y los subshells de sus pipelines
+  # comparten cmdline; se mata al más alto de esa cadena contigua (el proceso
+  # principal) y se deja de subir apenas la cadena termina, para no alcanzar
+  # al shell del test.
+  top=""
+  p="$PPID"
+  while [[ "$p" -gt 1 ]]; do
+    if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q 'bin/hli2-backup run'; then
+      top="$p"
+    elif [[ -n "$top" ]]; then
+      break
+    fi
+    p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+    [[ -n "$p" ]] || break
+  done
+  [[ -n "$top" ]] && kill -TERM "$top"
+  sleep 0.2
+  exit 1
+fi
+
+if [[ "$fail" -eq 1 ]]; then
+  echo "Fatal: stub restic: $sub falla (simulado)" >&2
+  exit "${STUB_RESTIC_FAIL_RC:-1}"
+fi
+
+is_r2=0
+[[ "${RESTIC_REPOSITORY:-}" == s3:* ]] && is_r2=1
+
+case "$sub" in
+  init)
+    if [[ "$is_r2" -eq 1 ]]; then
+      : > "${STUB_SAFE_ROOT:-/nonexistent}/r2-initialized"
+    elif _stub_path_is_safe "${RESTIC_REPOSITORY:-}"; then
+      mkdir -p "$RESTIC_REPOSITORY" && : > "$RESTIC_REPOSITORY/config"
+    fi
+    echo "created restic repository (stub)"
+    ;;
+  cat)
+    if [[ "$is_r2" -eq 1 ]]; then
+      [[ -f "${STUB_SAFE_ROOT:-/nonexistent}/r2-initialized" || -n "${STUB_RESTIC_R2_INITIALIZED:-}" ]] || exit 1
+    fi
+    ;;
+  backup)
+    case "$tag" in
+      full) echo "snapshot ab12cd01 saved" ;;
+      cloud) echo "snapshot ab12cd02 saved" ;;
+      *) echo "snapshot ab12cd99 saved" ;;
+    esac
+    ;;
+esac
+exit 0

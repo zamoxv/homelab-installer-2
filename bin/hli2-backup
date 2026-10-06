@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Entrada NO interactiva del backup (sin TTY ni dialog). La usan el servicio
+# systemd hli2-backup.service, la herramienta backup-now y backup-setup, siempre
+# como root.
+#
+#   hli2-backup run    Backup completo (fotos locales + copia a R2 + retención).
+#   hli2-backup init   Inicializa los repositorios que falten (idempotente).
+#
+# Registra en $LOG_DIR/backup.log (0640 root; sin secretos) y, si hay
+# terminal, también la muestra.
+set -euo pipefail
+
+# Bajo systemd no hay $USER y lib/core.sh lo exige.
+export USER="${USER:-root}"
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/../lib/core.sh"
+
+# 'HLI2_BACKUP_ALLOW_NONROOT' existe solo para los tests (corren como usuario
+# normal y con restic/docker/sudo simulados).
+if [[ "$(id -u)" -ne 0 && -z "${HLI2_BACKUP_ALLOW_NONROOT:-}" ]]; then
+  echo "ERROR: hli2-backup debe correr como root (use sudo)." >&2
+  exit 1
+fi
+
+umask 027
+mkdir -p "$LOG_DIR" "$STATE_DIR"
+if [[ -t 1 ]]; then
+  exec > >(tee -a "$LOG_DIR/backup.log") 2>&1
+else
+  exec >>"$LOG_DIR/backup.log" 2>&1
+fi
+
+case "${1:-}" in
+  run)
+    # Lo detenido se levanta SIEMPRE: salida normal, error de 'set -e' o señal.
+    trap backup_exit_cleanup EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT HUP
+    backup_run
+    ;;
+  init)
+    backup_init
+    ;;
+  *)
+    echo "Uso: hli2-backup {run|init}" >&2
+    exit 2
+    ;;
+esac

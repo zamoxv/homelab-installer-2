@@ -35,6 +35,9 @@ show_dashboard() {
     services_block+="$(printf '  %-16s: %-18s %s' "$name" "$state" "$url")"$'\n'
   done < <(service_list)
 
+  local backup_block
+  backup_block="$(backup_status_summary)"
+
   cat > /tmp/hli2-dashboard.txt <<EOF
 ========================================================
             HLI 2 — HomeLab Installer
@@ -53,11 +56,14 @@ IP        : ${ip:-sin IP}
 
 Servicios
 $services_block
+Backups
+$backup_block
+
 Espacio en /
   $disk_use
 
 Discos de media
-${media_block}  Backups       : $BACKUP_ROOT
+${media_block}  Repo backups  : $BACKUP_ROOT
   Appdata       : $APPDATA_ROOT
   Logs          : $LOG_DIR
 ========================================================

@@ -13,6 +13,35 @@ if [[ -n "${STUB_DOCKER_FAIL_START:-}" && "${1:-}" == "start" ]]; then
   exit 1
 fi
 
+# STUB_DOCKER_FAIL_STOP="all" o una lista de nombres: 'docker stop' falla para
+# esos contenedores (simula un contenedor que no se deja detener).
+if [[ -n "${STUB_DOCKER_FAIL_STOP:-}" && "${1:-}" == "stop" ]]; then
+  last="${*: -1}"
+  if [[ "$STUB_DOCKER_FAIL_STOP" == "all" || " $STUB_DOCKER_FAIL_STOP " == *" $last "* ]]; then
+    exit 1
+  fi
+fi
+
+# STUB_DOCKER_NOT_RUNNING="a b": esos contenedores existen pero están
+# detenidos ('inspect -f {{.State.Running}}' -> false). STUB_DOCKER_STATE_DIR:
+# si existe, 'stop'/'start' lo reflejan en archivos para que un test pueda
+# afirmar el estado FINAL de cada contenedor.
+if [[ "${1:-}" == "inspect" && "$*" == *"State.Running"* ]]; then
+  last="${*: -1}"
+  if [[ " ${STUB_DOCKER_NOT_RUNNING:-} " == *" $last "* ]]; then
+    echo "false"; exit 0
+  fi
+  if [[ -n "${STUB_DOCKER_STATE_DIR:-}" && -f "${STUB_DOCKER_STATE_DIR}/$last.stopped" ]]; then
+    echo "false"; exit 0
+  fi
+fi
+if [[ -n "${STUB_DOCKER_STATE_DIR:-}" ]]; then
+  case "${1:-}" in
+    stop) : > "${STUB_DOCKER_STATE_DIR}/${*: -1}.stopped"; exit 0 ;;
+    start) rm -f "${STUB_DOCKER_STATE_DIR}/${*: -1}.stopped"; exit 0 ;;
+  esac
+fi
+
 case "$*" in
   "run --rm -i httpd:2-alpine htpasswd -n -i -B -C 10 "*)
     # Lee y descarta la contraseña de stdin (igual que haría el htpasswd

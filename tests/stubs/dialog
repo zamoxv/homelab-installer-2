@@ -38,7 +38,15 @@ for a in "$@"; do
 done
 
 case "$widget" in
-  --msgbox|--textbox)
+  --textbox)
+    # STUB_TEXTBOX_LOG: copia el contenido del archivo mostrado (los tests
+    # verifican qué se le mostró al usuario sin que viaje por argv).
+    if [[ -n "${STUB_TEXTBOX_LOG:-}" ]]; then
+      for a in "$@"; do [[ -f "$a" ]] && cat "$a" >> "$STUB_TEXTBOX_LOG"; done
+    fi
+    exit 0
+    ;;
+  --msgbox)
     exit 0
     ;;
   --yesno)

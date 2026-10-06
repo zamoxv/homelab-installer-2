@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Stub de 'stat': solo intercepta 'stat -c %d <ruta>' (id de dispositivo, lo
+# usa lib/backup.sh para comprobar que BACKUP_ROOT NO está en el disco de '/').
+# '/' -> 1; cualquier otra ruta -> ${STUB_FAKE_MEDIA_DEV:-2}. Con
+# STUB_FAKE_MEDIA_DEV=1 el "disco de media" es el mismo que '/' (disco montado
+# tarde). Todo lo demás se delega al 'stat' real.
+set -uo pipefail
+if [[ "${1:-}" == "-c" && "${2:-}" == "%d" ]]; then
+  path="${*: -1}"
+  if [[ "$path" == "/" ]]; then echo 1; else echo "${STUB_FAKE_MEDIA_DEV:-2}"; fi
+  exit 0
+fi
+exec "$(command -p -v stat 2>/dev/null || echo /usr/bin/stat)" "$@"
