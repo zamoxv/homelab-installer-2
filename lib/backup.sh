@@ -124,7 +124,12 @@ backup_refresh_install() {
   printf '%s\n' "$src" | sudo tee "$stage/source-dir" >/dev/null || return 1
   sudo rm -rf "$dst.old"
   if [[ -e "$dst" ]]; then sudo mv "$dst" "$dst.old" || return 1; fi
-  sudo mv "$stage" "$dst" || return 1
+  if ! sudo mv "$stage" "$dst"; then
+    # El intercambio no es atómico: si falla el segundo mv, se restaura lo
+    # anterior para no dejar el backup sin código instalado.
+    if [[ -e "$dst.old" && ! -e "$dst" ]]; then sudo mv "$dst.old" "$dst" || true; fi
+    return 1
+  fi
   sudo rm -rf "$dst.old"
   return 0
 }
@@ -180,7 +185,7 @@ _backup_guard_fs() {
 _backup_secure_repo_dir() {
   chmod 0700 "$BACKUP_ROOT"
   chmod g-s,u-s "$BACKUP_ROOT"
-  chown root:root "$BACKUP_ROOT"
+  chown -R -h root:root "$BACKUP_ROOT"
 }
 
 # La contraseña existe y es utilizable (no vacía, sin espacios, >= 16 caracteres).
@@ -224,7 +229,7 @@ _backup_collect() {
   # La contraseña de restic nunca viaja dentro de sus propios repositorios.
   # (restic.env SÍ se respalda, cifrado: hace falta para recuperarse de un
   # desastre; ver ROADMAP v2.5.)
-  excl+=("$BACKUP_PASSWORD_FILE")
+  excl+=("$BACKUP_PASSWORD_FILE" "$SECRETS_DIR/.restic-password.*")
 
   for p in "${excl[@]}"; do is_excl[$p]=1; BK_EXCLUDE_ARGS+=("--exclude=$p"); done
   for p in "${lonly[@]}"; do is_lonly[$p]=1; BK_LOCAL_ONLY+=("$p"); done
@@ -252,16 +257,28 @@ _backup_sqlite_containers() {
   done < <(service_list)
 }
 
-# 0 = corriendo; 1 = detenido o inexistente; 2 = error de docker (no se sabe).
-_backup_container_running() {
+# Estado de un contenedor: 0 corriendo; 1 detenido; 2 error de docker (no se
+# sabe); 3 no existe ("No such object/container").
+_backup_container_state() {
   local out rc=0
-  out="$(hli_docker inspect -f '{{.State.Running}}' "$1" 2>&1)" || rc=$?
+  out="$(hli_docker inspect -f '{{.State.Running}}' "$1" 2>&1 </dev/null)" || rc=$?
   if [[ "$rc" -eq 0 ]]; then
     [[ "$out" == "true" ]] && return 0
     return 1
   fi
   case "$out" in
-    *"No such"*|*"no such"*) return 1 ;;
+    *"No such"*|*"no such"*) return 3 ;;
+  esac
+  return 2
+}
+
+# 0 = corriendo; 1 = detenido o inexistente; 2 = error de docker (no se sabe).
+_backup_container_running() {
+  local rc=0
+  _backup_container_state "$1" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1|3) return 1 ;;
   esac
   return 2
 }
@@ -270,14 +287,39 @@ _backup_container_running() {
 # muere (o el equipo se reinicia) a mitad de la ventana, 'recover' sabe qué
 # levantar ('restart: unless-stopped' no reinicia un contenedor parado a mano).
 _backup_recovery_write() {
-  local tmp
+  local tmp c
+  local -A seen=()
+  local -a all=()
   tmp="$(mktemp "$BACKUP_STATE_DIR/.recovery.XXXXXX")" || return 1
-  printf '%s\n' "$@" > "$tmp" || { rm -f "$tmp"; return 1; }
+  # Unión con lo que una corrida anterior dejó sin levantar: nunca se pisa.
+  if [[ -s "$BACKUP_RECOVERY_FILE" ]]; then
+    while IFS= read -r c; do
+      if [[ -n "$c" && -z "${seen[$c]:-}" ]]; then seen[$c]=1; all+=("$c"); fi
+    done < "$BACKUP_RECOVERY_FILE"
+  fi
+  for c in "$@"; do
+    if [[ -z "${seen[$c]:-}" ]]; then seen[$c]=1; all+=("$c"); fi
+  done
+  printf '%s\n' "${all[@]}" > "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f -- "$tmp" "$BACKUP_RECOVERY_FILE"
 }
 
-_backup_recovery_clear() {
-  rm -f -- "$BACKUP_RECOVERY_FILE"
+# Saca $1 de la lista de recuperación (ya está corriendo, o ya no existe); si
+# no queda nada, borra el archivo. Lo demás se conserva.
+_backup_recovery_drop() {
+  local c tmp
+  local -a keep=()
+  [[ -f "$BACKUP_RECOVERY_FILE" ]] || return 0
+  while IFS= read -r c; do
+    if [[ -n "$c" && "$c" != "$1" ]]; then keep+=("$c"); fi
+  done < "$BACKUP_RECOVERY_FILE"
+  if [[ ${#keep[@]} -eq 0 ]]; then
+    rm -f -- "$BACKUP_RECOVERY_FILE"
+    return 0
+  fi
+  tmp="$(mktemp "$BACKUP_STATE_DIR/.recovery.XXXXXX")" || return 1
+  printf '%s\n' "${keep[@]}" > "$tmp"
+  mv -f -- "$tmp" "$BACKUP_RECOVERY_FILE"
 }
 
 # Detiene los contenedores sqlite que estén corriendo. Cada nombre se anota
@@ -308,7 +350,7 @@ _backup_stop_sqlite() {
   for c in "${todo[@]}"; do
     BACKUP_STOPPED_CONTAINERS+="$c "
     _backup_log "Deteniendo '$c' para la copia consistente"
-    if ! hli_docker stop -t "$BACKUP_STOP_TIMEOUT" "$c" >/dev/null 2>&1; then
+    if ! hli_docker stop -t "$BACKUP_STOP_TIMEOUT" "$c" >/dev/null 2>&1 </dev/null; then
       hli_error "no se pudo detener '$c'"
       return 1
     fi
@@ -321,9 +363,16 @@ _backup_stop_sqlite() {
 # deteniéndolo en el daemon, y 'docker start' sobre algo "a medio parar" no
 # sirve. Devuelve 1 si no queda corriendo dentro de BACKUP_RESTART_WAIT.
 _backup_restart_container() {
-  local c="$1" waited=0 rc
+  local c="$1" waited=0 rc=0
+  # Si el contenedor ya no existe (se redesplegó con otro nombre, se borró), no
+  # hay nada que levantar: no se espera ni se queda en la lista para siempre.
+  _backup_container_state "$c" || rc=$?
+  if [[ "$rc" -eq 3 ]]; then
+    _backup_log "'$c' ya no existe: se descarta de la lista de recuperación"
+    return 0
+  fi
   while true; do
-    hli_docker start "$c" >/dev/null 2>&1 || true
+    hli_docker start "$c" >/dev/null 2>&1 </dev/null || true
     sleep "$BACKUP_RESTART_SETTLE"
     rc=0
     _backup_container_running "$c" || rc=$?
@@ -342,33 +391,46 @@ backup_restart_stopped() {
   local c remaining=""
   for c in $BACKUP_STOPPED_CONTAINERS; do
     _backup_log "Iniciando '$c'"
-    if ! _backup_restart_container "$c"; then remaining+="$c "; fi
+    if _backup_restart_container "$c"; then
+      _backup_recovery_drop "$c" || true
+    else
+      remaining+="$c "
+    fi
   done
   BACKUP_STOPPED_CONTAINERS="$remaining"
-  if [[ -z "$remaining" ]]; then
-    _backup_recovery_clear
-    return 0
-  fi
-  return 1
+  [[ -z "$remaining" ]]
 }
 
 # Levanta lo que una corrida anterior dejó detenido (proceso muerto, corte de
 # luz). Al inicio de cada 'run', en 'hli2-backup recover' (ExecStopPost y
 # arranque del equipo). Devuelve 1 si algo no pudo levantarse.
 backup_recover() {
-  local c rest="" bad=0
+  local c bad=0
+  local -a names=()
   [[ -s "$BACKUP_RECOVERY_FILE" ]] || return 0
   while IFS= read -r c; do
-    [[ "$c" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || continue
-    _backup_log "Recuperación: iniciando '$c' (quedó detenido por un backup anterior)"
-    if ! _backup_restart_container "$c"; then rest+="$c"$'\n'; bad=1; fi
+    if [[ "$c" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then names+=("$c"); fi
   done < "$BACKUP_RECOVERY_FILE"
-  if [[ "$bad" -eq 0 ]]; then
-    _backup_recovery_clear
-    return 0
-  fi
-  printf '%s' "$rest" > "$BACKUP_RECOVERY_FILE"
-  return 1
+  for c in "${names[@]}"; do
+    _backup_log "Recuperación: iniciando '$c' (quedó detenido por un backup anterior)"
+    # Lo que levanta sale de la lista; lo que no, se conserva para el próximo intento.
+    if _backup_restart_container "$c" </dev/null; then
+      _backup_recovery_drop "$c" || true
+    else
+      bad=1
+    fi
+  done
+  [[ "$bad" -eq 0 ]]
+}
+
+# Boot/ExecStopPost: una corrida que murió dejó 'running' en el estado; se
+# reescribe como 'interrupted' (llamar solo con el bloqueo tomado).
+backup_status_mark_stale() {
+  [[ "$(backup_status_get result)" == "running" ]] || return 0
+  BK_RESULT=interrupted BK_LOCAL=unknown BK_CLOUD=unknown BK_CHECK=unknown
+  BK_ID_FULL="$(backup_status_get snapshot_full)" BK_ID_CLOUD="$(backup_status_get snapshot_cloud)"
+  BK_MSG="el backup anterior quedó interrumpido (reinicio, corte de luz o proceso terminado)"
+  _backup_status_write
 }
 
 # Trap EXIT de bin/hli2-backup: lo detenido SIEMPRE se levanta, una corrida

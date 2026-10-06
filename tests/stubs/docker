@@ -9,8 +9,9 @@ source "$(dirname "$0")/_stublib.sh"
 log_call docker "$@"
 
 # STUB_DOCKER_FAIL_START=1: 'docker start' falla (p. ej. sudo sin caché).
+# (STUB_DOCKER_FAIL_START=1 o una lista de nombres.)
 if [[ -n "${STUB_DOCKER_FAIL_START:-}" && "${1:-}" == "start" ]]; then
-  exit 1
+  if [[ "$STUB_DOCKER_FAIL_START" == "1" || " $STUB_DOCKER_FAIL_START " == *" ${*: -1} "* ]]; then exit 1; fi
 fi
 
 # STUB_DOCKER_FAIL_STOP="all" o una lista de nombres: 'docker stop' falla para

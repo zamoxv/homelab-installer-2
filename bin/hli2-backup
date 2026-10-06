@@ -64,10 +64,18 @@ fi
 # Un solo proceso a la vez (timer + manual, o ExecStopPost): sin esto, el
 # 'recover' de uno levantaría contenedores que el otro detuvo a propósito.
 exec 9>"$BACKUP_STATE_DIR/lock"
-if ! flock -n 9; then
-  echo "Otro backup está en curso; no se hace nada."
-  [[ "$1" == "recover" ]] && exit 0
-  exit 1
+# Si hay otro proceso (el timer y 'recover' al arrancar pueden coincidir), se
+# espera un rato en vez de fallar sin dejar rastro.
+if [[ "$1" == "recover" ]]; then _wait="${HLI2_BACKUP_LOCK_WAIT:-30}"; else _wait="${HLI2_BACKUP_LOCK_WAIT:-120}"; fi
+if ! flock -w "$_wait" 9; then
+  echo "Otro backup mantiene el bloqueo desde hace más de ${_wait} s."
+  if [[ "$1" == "run" ]]; then
+    BK_RESULT=error BK_LOCAL=skipped BK_CLOUD=skipped BK_CHECK=skipped BK_ID_FULL="" BK_ID_CLOUD=""
+    BK_MSG="no se pudo iniciar: otro backup mantiene el bloqueo"
+    _backup_status_write || true
+    exit 1
+  fi
+  exit 0
 fi
 
 case "$1" in
@@ -80,6 +88,7 @@ case "$1" in
     ;;
   recover)
     trap backup_exit_cleanup EXIT
+    backup_status_mark_stale || true
     backup_recover
     ;;
   init)

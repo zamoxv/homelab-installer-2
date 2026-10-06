@@ -387,6 +387,7 @@ test_backup_setup_fresh_install_with_r2() {
   assert_file_not_contains "$svc" "$REPO_ROOT" "nada del checkout del usuario" || return 1
   assert_file_contains "$svc" "ExecStopPost=$BACKUP_INSTALL_DIR/bin/hli2-backup recover" || return 1
   assert_file_contains "$svc" "PrivateTmp=yes" || return 1
+  assert_file_contains "$svc" "TimeoutStopSec=300" "tiempo para el cleanup y ExecStopPost" || return 1
   assert_file_contains "$tmr" "OnCalendar=*-*-* 04:00:00" || return 1
   assert_file_contains "$tmr" "Persistent=true" || return 1
   [[ -n "$(_bk_calls '^sudo\tsystemctl\tenable\t--now\thli2-backup.timer$')" ]] || { fail "no habilitó el timer"; return 1; }
@@ -578,6 +579,7 @@ test_create_media_skeleton_leaves_backup_repo_alone() {
   assert_eq "600" "$(stat -c %a "$BACKUP_ROOT/data/pack")" || return 1
   if _bk_calls '^chown\t' | grep -qF ".hli2-backups"; then fail "chown alcanzó el repo de backups"; return 1; fi
   [[ -n "$(_bk_calls '^chown\t')" ]] || { fail "el chown de media no se ejecutó (test vacío)"; return 1; }
+  [[ -z "$(_bk_calls '^chown\t' | grep -vP '^chown\t-h\t')" ]] || { fail "chown debe usar -h (no seguir enlaces simbólicos)"; return 1; }
 }
 
 test_backup_enforces_repo_dir_owner_and_mode() {
@@ -585,7 +587,7 @@ test_backup_enforces_repo_dir_owner_and_mode() {
   chmod 2775 "$BACKUP_ROOT"
   _bk_run run || return 1
   assert_eq "700" "$(stat -c %a "$BACKUP_ROOT")" || return 1
-  [[ -n "$(_bk_calls "^chown\troot:root\t$BACKUP_ROOT\$")" ]] || { fail "no forzó root:root sobre el repo"; return 1; }
+  [[ -n "$(_bk_calls "^chown\t-R\t-h\troot:root\t$BACKUP_ROOT\$")" ]] || { fail "no forzó root:root (recursivo) sobre el repo"; return 1; }
 }
 
 # --- W1/W2/W3: reinicio robusto ------------------------------------------------------------
@@ -657,10 +659,12 @@ test_backup_concurrent_run_is_refused_without_touching_containers() {
   local holder=$!
   sleep 0.3
   local rc=0
-  _bk_run run || rc=$?
+  HLI2_BACKUP_LOCK_WAIT=1 _bk_run run || rc=$?
   kill "$holder" 2>/dev/null || true
   [[ "$rc" -ne 0 ]] || { fail "debió negarse con otro backup en curso"; return 1; }
   [[ -z "$(_bk_calls '^(docker|restic)\t')" ]] || { fail "no debió tocar nada"; return 1; }
+  assert_eq "error" "$(_bk_status result)" "deja rastro en el estado" || return 1
+  assert_contains "$(_bk_status message)" "bloqueo" || return 1
 }
 
 # --- W4: primera corrida ----------------------------------------------------------------------
@@ -856,4 +860,85 @@ test_backup_uses_exclude_caches_and_r2_init_copies_chunker_params() {
   _bk_has_arg "$init" "--copy-chunker-params" || return 1
   _bk_has_arg "$init" "--from-password-file" || return 1
   assert_file_not_contains "$STUB_CALL_LOG" "$_BK_SECRET_VAL" || return 1
+}
+
+# =====================================================================================
+# Segunda revisión
+# =====================================================================================
+
+test_backup_failed_recover_keeps_the_recovery_list() {
+  _bk_prepare
+  : > "$STUB_DOCKER_STATE_DIR/vaultwarden.stopped"; : > "$STUB_DOCKER_STATE_DIR/adguard.stopped"
+  printf 'vaultwarden\nadguard\n' > "$BACKUP_STATE_DIR/recovery-containers"
+  export STUB_DOCKER_FAIL_START="vaultwarden"
+  if _bk_run recover; then :; fi
+  # adguard sí subió y sale de la lista; vaultwarden NO subió y se conserva
+  # (el trap EXIT ya no borra la lista).
+  assert_eq "vaultwarden" "$(cat "$BACKUP_STATE_DIR/recovery-containers")" || return 1
+}
+
+test_backup_run_keeps_unrecoverable_leftovers_in_the_list() {
+  _bk_prepare
+  : > "$STUB_DOCKER_STATE_DIR/legacy.stopped"
+  printf 'legacy\n' > "$BACKUP_STATE_DIR/recovery-containers"
+  export STUB_DOCKER_FAIL_START="legacy"
+  _bk_run run || true
+  assert_eq "legacy" "$(cat "$BACKUP_STATE_DIR/recovery-containers")" "lo no recuperable no se pisa ni se borra" || return 1
+  assert_contains "$(_bk_status message)" "sin iniciar" || return 1
+  # Lo detenido por esta corrida sí volvió.
+  assert_eq "" "$(rg --files "$STUB_DOCKER_STATE_DIR" 2>/dev/null | rg -v '/\.|legacy' || true)" || return 1
+}
+
+test_backup_recover_drops_containers_that_no_longer_exist() {
+  _bk_prepare
+  printf 'ghost\n' > "$BACKUP_STATE_DIR/recovery-containers"
+  export STUB_DOCKER_NOT_FOUND="ghost"
+  _bk_run recover || { fail "un contenedor inexistente no debe hacer fallar recover"; return 1; }
+  [[ -z "$(_bk_calls '^docker\tstart\tghost$')" ]] || { fail "no hay nada que iniciar"; return 1; }
+  [[ ! -s "$BACKUP_STATE_DIR/recovery-containers" ]] || { fail "el nombre viejo quedó en la lista"; return 1; }
+}
+
+test_backup_recover_marks_stale_running_status_as_interrupted() {
+  _bk_prepare
+  printf 'timestamp=%s\nresult=running\nlocal=pending\ncloud=pending\ncheck=pending\n' "$(date -Is)" > "$BACKUP_STATE_DIR/backup-status"
+  _bk_run recover || return 1
+  assert_eq "interrupted" "$(_bk_status result)" || return 1
+  # Un estado terminado no se toca.
+  printf 'timestamp=%s\nresult=ok\nlocal=ok\ncloud=ok\n' "$(date -Is)" > "$BACKUP_STATE_DIR/backup-status"
+  _bk_run recover || return 1
+  assert_eq "ok" "$(_bk_status result)" || return 1
+}
+
+test_backup_excludes_password_stage_files() {
+  _bk_prepare
+  _bk_run run || return 1
+  _bk_has_arg "$(_bk_snapshot_line full)" "--exclude=$SECRETS_DIR/.restic-password.*" || { fail "los temporales de la contraseña no deben respaldarse"; return 1; }
+}
+
+test_backup_refresh_install_restores_previous_copy_if_swap_fails() {
+  local co="$HLI2_TEST_SCRATCH/checkout"
+  mkdir -p "$co"/{bin,lib,services,config}
+  cp "$REPO_ROOT/bin/hli2-backup" "$co/bin/"; cp "$REPO_ROOT"/lib/*.sh "$co/lib/"
+  cp "$REPO_ROOT"/services/*.conf "$co/services/"; cp "$REPO_ROOT/config/default.conf" "$co/config/"
+  mkdir -p "$BACKUP_INSTALL_DIR"; echo previa > "$BACKUP_INSTALL_DIR/marca"
+  export STUB_SUDO_MV_FAIL_TARGET="$BACKUP_INSTALL_DIR"
+  if ( cd / && source "$co/lib/core.sh" && backup_refresh_install ); then fail "debió fallar el intercambio"; return 1; fi
+  assert_eq "previa" "$(cat "$BACKUP_INSTALL_DIR/marca" 2>/dev/null)" "la copia anterior se restauró" || return 1
+}
+
+test_backup_setup_aborts_confirmation_loop_without_a_terminal() {
+  _bk_setup_env
+  export TMPDIR="$HLI2_TEST_SCRATCH/tmp"; mkdir -p "$TMPDIR"
+  : > "$DIALOG_YESNO_QUEUE"                       # cola vacía: confirm siempre falla
+  if timeout 30 bash "$REPO_ROOT/modules/backup-setup.sh"; then fail "debió abortar tras N intentos"; return 1; fi
+  assert_eq "10" "$(grep -c "CONTRASEÑA DE CIFRADO" "$STUB_TEXTBOX_LOG")" "tope de intentos" || return 1
+  assert_file_not_contains "$STATE_FILE" "backup-password-confirmed" "sin confirmar no se marca" || return 1
+  assert_eq "" "$(rg --files "$TMPDIR" 2>/dev/null || true)" || return 1
+}
+
+test_backup_setup_cleans_password_stage_when_move_fails() {
+  _bk_setup_env
+  export STUB_SUDO_MV_FAIL_TARGET="$SECRETS_DIR/restic-password"
+  if timeout 30 bash "$REPO_ROOT/modules/backup-setup.sh"; then fail "debió fallar"; return 1; fi
+  [[ -n "$(_bk_calls "^sudo\trm\t-f\t$SECRETS_DIR/\.restic-password\.[0-9]+\$")" ]] || { fail "no limpió el temporal de la contraseña"; return 1; }
 }

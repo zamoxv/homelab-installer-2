@@ -186,6 +186,13 @@ Vaultwarden funcionando. Los valores de abajo son genéricos.
 | 65 | `sudo chown -R $USER /srv/media` y re-ejecutar `storage` | `sudo ls -ld /srv/media/.hli2-backups` sigue `root` y `drwx------` |
 | 66 | Samba: ver los recursos compartidos | Solo los de media; el repositorio de backups **no** aparece | Samba: ver los recursos compartidos | Solo los de media; el repositorio de backups **no** aparece |
 
+Notas sobre el disco: si el repositorio queda bajo `MEDIA_ROOT`, **`MEDIA_ROOT`
+tiene que ser un punto de montaje** (`mountpoint /srv/media`); si no, el backup
+se niega a correr. Con el disco ausente al arrancar, `RequiresMountsFor=` impide
+que el servicio arranque y eso **no** deja un estado de error: solo se nota por
+el aviso de "más de 36 horas" del dashboard. Revisar `systemctl status
+hli2-backup.timer` si aparece.
+
 Nota: `/etc/hli2/restic.env` (claves de R2) **sí** se respalda, cifrado dentro de
 los repositorios: hace falta para recuperarse de un desastre. La contraseña de
 restic **no** se respalda (vive en Vaultwarden y en papel).

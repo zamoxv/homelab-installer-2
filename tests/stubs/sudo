@@ -121,6 +121,12 @@ case "$sub" in
     exit 1
     ;;
   tee|mkdir|install|cp|touch|chmod|mv)
+    # STUB_SUDO_MV_FAIL_TARGET=<ruta>: 'sudo mv ... <ruta>' falla (solo la primera vez).
+    if [[ "$sub" == "mv" && -n "${STUB_SUDO_MV_FAIL_TARGET:-}" && "${args[-1]}" == "$STUB_SUDO_MV_FAIL_TARGET" && ! -f "$STUB_SAFE_ROOT/.mv-failed" ]]; then
+      # Falla una sola vez: el 'mv' de restauración posterior sí tiene que poder correr.
+      : > "$STUB_SAFE_ROOT/.mv-failed"
+      exit 1
+    fi
     if _stub_all_paths_safe "${args[@]:1}"; then
       _stub_unlock_root_area
       if [[ "$sub" == "install" ]]; then

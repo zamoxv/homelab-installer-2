@@ -23,6 +23,7 @@ source "$(dirname "$0")/../lib/core.sh"
 # systemd real (mismo criterio HLI2_* que el resto del proyecto).
 BACKUP_SYSTEMD_DIR="${HLI2_SYSTEMD_DIR:-/etc/systemd/system}"
 BACKUP_PW_CONFIRMED_KEY="backup-password-confirmed"
+BACKUP_PW_MAX_TRIES=10
 
 # --- Validaciones de forma (nunca de red) -------------------------------------
 
@@ -75,11 +76,21 @@ _backup_show_password_until_confirmed() {
     printf '2. Escríbala también EN PAPEL y guárdelo en un lugar seguro: si el\n'
     printf '   servidor se pierde, Vaultwarden se pierde con él.\n'
   } > "$_BACKUP_PW_TMP"
+  # Tope de intentos: sin terminal (o con un dialog roto) 'confirm' falla siempre
+  # y el bucle sería infinito. Sin confirmar no se marca nada: al volver a correr
+  # el módulo se muestra de nuevo.
+  local tries=0
   while true; do
     hli_busy_end
     dialog --title "Contraseña de backups" --textbox "$_BACKUP_PW_TMP" 18 76 || true
     if confirm "¿Guardó la contraseña en Vaultwarden Y en papel?\n\nSi elige 'No', se mostrará de nuevo."; then
       break
+    fi
+    tries=$(( tries + 1 ))
+    if [[ "$tries" -ge "$BACKUP_PW_MAX_TRIES" ]]; then
+      _backup_pw_cleanup
+      msg "No se confirmó que la contraseña esté guardada. Se cancela la configuración: vuelva a correr este módulo cuando pueda anotarla (se mostrará de nuevo)."
+      return 1
     fi
   done
   _backup_pw_cleanup
@@ -108,7 +119,10 @@ _backup_write_password() {
     sudo rm -f "$pw_stage"
     return 1
   fi
-  sudo mv -f "$pw_stage" "$BACKUP_PASSWORD_FILE"
+  if ! sudo mv -f "$pw_stage" "$BACKUP_PASSWORD_FILE"; then
+    sudo rm -f "$pw_stage"
+    return 1
+  fi
 }
 
 _backup_ensure_password() {
@@ -123,7 +137,7 @@ _backup_ensure_password() {
         return 0
       fi
       # Existe pero nunca se confirmó (el módulo se interrumpió): mostrarla de nuevo.
-      _backup_show_password_until_confirmed "$pw"
+      _backup_show_password_until_confirmed "$pw" || { pw=""; return 1; }
       pw=""
       return 0
     fi
@@ -145,7 +159,7 @@ _backup_ensure_password() {
     return 1
   fi
   log "Contraseña de restic generada y guardada root-only (no se loguea el valor)."
-  _backup_show_password_until_confirmed "$pw"
+  _backup_show_password_until_confirmed "$pw" || { pw=""; return 1; }
   pw=""
 }
 
@@ -239,6 +253,7 @@ _backup_install_units() {
     "ExecStopPost=$exe recover" \
     "PrivateTmp=yes" \
     "TimeoutStartSec=6h" \
+    "TimeoutStopSec=300" \
     "Nice=10" \
     "IOSchedulingClass=idle" \
     | sudo tee "$BACKUP_SYSTEMD_DIR/hli2-backup.service" >/dev/null
