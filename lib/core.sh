@@ -24,7 +24,9 @@ SERVER_USER="${SERVER_USER:-$USER}"
 MEDIA_GROUP="${MEDIA_GROUP:-media}"
 MEDIA_ROOT="${MEDIA_ROOT:-/srv/media}"
 APPDATA_ROOT="${APPDATA_ROOT:-/srv/appdata}"
-BACKUP_ROOT="${BACKUP_ROOT:-/srv/backups}"
+# Repositorio restic local (root 0700, oculto, en el disco de media: lib/backup.sh
+# falla cerrado si queda en el mismo disco que el sistema).
+BACKUP_ROOT="${BACKUP_ROOT:-$MEDIA_ROOT/.hli2-backups}"
 
 # Si config/default.conf no definió el array (o no existe el archivo), usar
 # este valor por defecto.
@@ -398,5 +400,6 @@ source "$SCRIPT_DIR/lib/dokploy_api.sh"
 source "$SCRIPT_DIR/lib/compose.sh"
 source "$SCRIPT_DIR/lib/importer.sh"
 source "$SCRIPT_DIR/lib/canary.sh"
+source "$SCRIPT_DIR/lib/backup.sh"
 
 hli_require_sudo

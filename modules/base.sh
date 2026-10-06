@@ -18,7 +18,7 @@ hli_apt install \
   ethtool smartmontools lm-sensors ca-certificates gnupg \
   net-tools lsof ncdu jq
 
-sudo mkdir -p "$BACKUP_ROOT" "$APPDATA_ROOT"
-sudo chown "$SERVER_USER:$SERVER_USER" "$BACKUP_ROOT" "$APPDATA_ROOT" 2>/dev/null || true
+sudo mkdir -p "$APPDATA_ROOT"
+sudo chown "$SERVER_USER:$SERVER_USER" "$APPDATA_ROOT" 2>/dev/null || true
 
 mark_done base

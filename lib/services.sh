@@ -15,6 +15,13 @@
 #   SERVICE_URL_SCHEME   Esquema de la URL (http, smb...), vacío si no aplica.
 #   SERVICE_DATA         Array de rutas de datos persistentes bajo APPDATA_ROOT.
 #   SERVICE_BACKUP_KIND  "files" | "sqlite" | "db-dump-dokploy" | "none".
+#                        "sqlite" cubre cualquier base embebida (SQLite,
+#                        bbolt...): el backup detiene el contenedor durante
+#                        la foto local (lib/backup.sh).
+#   SERVICE_BACKUP_EXCLUDE     Array de rutas de SERVICE_DATA que NUNCA se
+#                        respaldan (cachés regenerables).
+#   SERVICE_BACKUP_LOCAL_ONLY  Array de rutas de SERVICE_DATA que solo van a
+#                        la copia local, no a la externa (R2).
 set -euo pipefail
 
 SERVICES_DIR="$SCRIPT_DIR/services"
@@ -37,18 +44,25 @@ _service_load() {
   unset SERVICE_NAME SERVICE_KIND SERVICE_UNIT SERVICE_CONTAINER \
         SERVICE_PORT SERVICE_URL_SCHEME SERVICE_BACKUP_KIND 2>/dev/null || true
   SERVICE_DATA=()
+  SERVICE_BACKUP_EXCLUDE=()
+  SERVICE_BACKUP_LOCAL_ONLY=()
   # shellcheck disable=SC1090
   source "$f"
 }
 
 # Valor de un campo (NAME, KIND, UNIT, CONTAINER, PORT, URL_SCHEME,
-# BACKUP_KIND) del servicio $1. DATA es un array: se imprime una ruta por
-# línea.
+# BACKUP_KIND) del servicio $1. DATA, BACKUP_EXCLUDE y BACKUP_LOCAL_ONLY son
+# arrays: se imprime una ruta por línea (nada si el array está vacío; DATA
+# conserva su comportamiento histórico).
 service_get() {
   local id="$1" field="$2"
   _service_load "$id" || return 1
   if [[ "$field" == "DATA" ]]; then
     printf '%s\n' "${SERVICE_DATA[@]}"
+  elif [[ "$field" == "BACKUP_EXCLUDE" ]]; then
+    [[ ${#SERVICE_BACKUP_EXCLUDE[@]} -eq 0 ]] || printf '%s\n' "${SERVICE_BACKUP_EXCLUDE[@]}"
+  elif [[ "$field" == "BACKUP_LOCAL_ONLY" ]]; then
+    [[ ${#SERVICE_BACKUP_LOCAL_ONLY[@]} -eq 0 ]] || printf '%s\n' "${SERVICE_BACKUP_LOCAL_ONLY[@]}"
   else
     local var="SERVICE_${field}"
     printf '%s\n' "${!var:-}"

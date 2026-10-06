@@ -51,8 +51,10 @@ sudo usermod -aG "$MEDIA_GROUP" "$SERVER_USER" || true
 # pool con datadisk). Idempotente: re-correrlo crea las carpetas que falten.
 while read -r mroot; do create_media_skeleton "$mroot"; done < <(media_roots)
 
-sudo mkdir -p "$BACKUP_ROOT" "$APPDATA_ROOT"
-sudo chown -R "$SERVER_USER:$MEDIA_GROUP" "$BACKUP_ROOT" "$APPDATA_ROOT"
-sudo chmod -R 2775 "$BACKUP_ROOT" "$APPDATA_ROOT"
+# BACKUP_ROOT (repositorio restic, root 0700) NO se toca acá: lo crea
+# backup-setup. Un chown/chmod -R lo dejaría legible por el grupo de media.
+sudo mkdir -p "$APPDATA_ROOT"
+sudo chown -R "$SERVER_USER:$MEDIA_GROUP" "$APPDATA_ROOT"
+sudo chmod -R 2775 "$APPDATA_ROOT"
 
 mark_done storage

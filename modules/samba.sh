@@ -24,7 +24,8 @@ EOF
 }
 
 # (Re)escribe el bloque de recursos de HLI 2 en smb.conf: un recurso por
-# disco de media (media_roots) + backups. Idempotente: reemplaza el bloque
+# disco de media (media_roots). El repositorio de backups (restic, root 0700)
+# no se comparte. Idempotente: reemplaza el bloque
 # entre marcadores en vez de acumular entradas.
 #
 # Devuelve 1 (y avisa con msg, sin dejar el sistema peor de lo que estaba) si:
@@ -61,7 +62,6 @@ _samba_write_shares() {
       [[ -n "$root" ]] || continue
       _samba_share_block "$(basename "$root")" "$root"
     done < <(media_roots)
-    _samba_share_block backups "$BACKUP_ROOT"
     echo "### HLI2-SAMBA END"
   } > "$tmp_new"
 
@@ -89,6 +89,6 @@ sudo systemctl enable smbd
 
 _samba_write_shares
 
-msg "Samba configurado: un recurso por disco de media (media, media2, ...) + backups.\n\nUsuario: $SERVER_USER"
+msg "Samba configurado: un recurso por disco de media (media, media2, ...).\n\nUsuario: $SERVER_USER"
 
 mark_done samba

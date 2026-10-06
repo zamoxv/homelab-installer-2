@@ -21,7 +21,7 @@ Esqueleto del instalador y módulos base del host:
   puertos, rutas de datos y tipo de backup para el dashboard y el healthcheck.
 - Módulos de host: `base`, `power`, `wol`, `storage` (grupo `media`, pool de
   media, expansión de LVM), `datadisk` (sumar un disco al pool), `samba`
-  (recursos por disco de media + backups).
+  (un recurso por disco de media).
 
 Docker, Dokploy y los servicios en contenedor (Jellyfin, qBittorrent,
 AdGuard, Vaultwarden, Home Assistant, OpenCloud, Dokploy) llegan en las fases
