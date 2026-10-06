@@ -480,11 +480,24 @@ implementa. Requiere un dominio con su DNS en Cloudflare.
       a https en bucle — verificado en el M70q); `casa.<dominio>` →
       `http://<IP LAN>:8123`.
       Nada más: lo no listado no existe desde fuera.
-      Estado (2026-10-05, M70q): `vault` (con `/admin` 404) y `cloud`
-      publicados y verificados con datos móviles; falta `casa`.
-- [ ] Home Assistant antes de publicarlo: 2FA en cada usuario y en
+      Estado (2026-10-06, M70q): `vault` (con `/admin` 404), `cloud` y
+      `casa` publicados y verificados con datos móviles.
+- [x] Home Assistant antes de publicarlo: 2FA en cada usuario y en
       `configuration.yaml` `use_x_forwarded_for`, `trusted_proxies` (red de
       Docker de `cloudflared`), `ip_ban_enabled`, `login_attempts_threshold: 5`.
+      Hecho en el M70q (2026-10-06). Hallazgos:
+      - Las versiones nuevas de Home Assistant migran el bloque `http:` de
+        YAML a la interfaz (Configuración → Sistema → Red → Servidor HTTP) y
+        piden borrarlo del archivo (deja de funcionar en 2027.2).
+      - La migración copió `trusted_proxies` pero dejó APAGADO "Confiar en
+        X-Forwarded-For": sin eso, todo Internet llega como la IP del túnel y
+        el bloqueo de IP castigaría al túnel entero. Revisarlo siempre.
+      - El proxy de confianza es la subred de `docker_gwbridge`
+        (`172.18.0.0/16` en el M70q), no `dokploy-network`: `cloudflared`
+        llega a `<IP LAN>:8123` saliendo por esa red. Se obtiene del propio
+        Home Assistant: publicar la ruta, abrirla (400 esperado) y leer la
+        IP en `docker logs homeassistant` ("A request from a reverse proxy
+        was received from ...").
 - [x] `tailscale`: instala Tailscale en el host desde su repositorio oficial
       (con `hli_apt`), ejecuta `tailscale up` mostrando la URL de inicio de
       sesión, y explica cómo instalar la app en los dispositivos. Opcional:
