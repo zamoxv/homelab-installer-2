@@ -619,6 +619,17 @@ Por definir antes de diseñar el módulo:
 
 ## Pendiente: uso diario
 
+- [ ] **Montar un disco de media con los contenedores ya corriendo los deja
+      ciegos.** Docker fija los bind mounts al arrancar el contenedor: si
+      después se monta un disco sobre `/srv/media` (o `/srv/mediaN`),
+      Jellyfin y qBittorrent siguen viendo la carpeta vacía del disco del
+      sistema que quedó debajo, y qBittorrent descarga ahí (oculto para Samba).
+      Pasó en la migración del M70q (2026-10-06); se resolvió con
+      `docker restart qbittorrent jellyfin`. `datadisk` (y `storage`) deben,
+      tras montar, reiniciar los contenedores que usan rutas de media (y
+      Jellyfin/qBittorrent deberían avisar si se despliegan con una raíz de
+      media que no es punto de montaje mientras hay un disco de datos
+      configurado en `fstab`).
 - [ ] **Herramienta "Cambiar usuario/contraseña de AdGuard"**: AdGuard no permite
       cambiarla desde su panel (solo editando `AdGuardHome.yaml`). Reusar la
       generación de hash de la instalación (htpasswd en contenedor, contraseña

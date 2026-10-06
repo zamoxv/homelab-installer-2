@@ -14,6 +14,10 @@ services:
       - PUID=__UID__
       - PGID=__GID__
       - TZ=__TZ__
+      # 002: archivos 0664 / carpetas 0775, igual que Samba (create mask 0664),
+      # para que todo el grupo de media pueda mover o borrar las descargas.
+      # Sin esto la imagen usa 022 y deja 0644 (verificado en el M70q).
+      - UMASK=002
       - WEBUI_PORT=__PORT__
     ports:
       - "__PORT__:__PORT__"
