@@ -464,7 +464,7 @@ implementa. Requiere un dominio con su DNS en Cloudflare.
 | Panel de Dokploy, qBittorrent, Seerr, Jellyfin, Samba, AdGuard | Privado | Tailscale |
 
 **v2.4a — módulos (primero):**
-- [ ] `cloudflared`: túnel **administrado remotamente**, creado por el usuario en
+- [x] `cloudflared`: túnel **administrado remotamente**, creado por el usuario en
       Cloudflare (Zero Trust → Networks → Tunnels). El módulo pide el token,
       lo guarda root-only y despliega `cloudflare/cloudflared` como compose de
       Dokploy en `dokploy-network` (`tunnel --no-autoupdate run`, token por el
@@ -478,14 +478,16 @@ implementa. Requiere un dominio con su DNS en Cloudflare.
       a https en bucle — verificado en el M70q); `casa.<dominio>` →
       `http://<IP LAN>:8123`.
       Nada más: lo no listado no existe desde fuera.
+      Estado (2026-10-05, M70q): `vault` (con `/admin` 404) y `cloud`
+      publicados y verificados con datos móviles; falta `casa`.
 - [ ] Home Assistant antes de publicarlo: 2FA en cada usuario y en
       `configuration.yaml` `use_x_forwarded_for`, `trusted_proxies` (red de
       Docker de `cloudflared`), `ip_ban_enabled`, `login_attempts_threshold: 5`.
-- [ ] `tailscale`: instala Tailscale en el host desde su repositorio oficial
+- [x] `tailscale`: instala Tailscale en el host desde su repositorio oficial
       (con `hli_apt`), ejecuta `tailscale up` mostrando la URL de inicio de
       sesión, y explica cómo instalar la app en los dispositivos. Opcional:
       AdGuard como DNS de la tailnet (bloqueo de publicidad en el teléfono).
-- [ ] Vaultwarden y OpenCloud con su dominio final (`https://`); OpenCloud
+- [x] Vaultwarden y OpenCloud con su dominio final (`https://`); OpenCloud
       necesita la URL pública fija desde su primer arranque.
 
 **v2.4b — sincronización (después):** herramienta que mantiene los nombres
@@ -584,7 +586,7 @@ Pasos:
 
 ## Orden acordado (2026-10-02)
 
-1. Repositorio remoto en GitHub (respaldo del código antes de tocar servidores).
+1. ~~Repositorio remoto en GitHub~~ (hecho).
 2. Migración del M70q (sección anterior).
 3. JASJIC: de la Raspberry Pi al M70q, en su propio proyecto de Dokploy.
 4. v2.4 — Cloudflare Tunnel.
@@ -647,5 +649,5 @@ Por definir antes de diseñar el módulo:
       versión nueva del paquete.
 - [ ] **Lanzador en el Fedora** (`.desktop` con ícono): abre una terminal con
       `ssh -t <servidor> hli2`. Requiere acceso SSH por clave.
-- [ ] **Repositorio remoto en GitHub** para el HLI 2 (hoy los commits viven solo
+- [x] **Repositorio remoto en GitHub** para el HLI 2 (hoy los commits viven solo
       en el Fedora y se copian con `git bundle`).
