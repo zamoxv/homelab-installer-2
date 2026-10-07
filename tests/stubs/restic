@@ -17,7 +17,9 @@
 #                    exista ahí (lo que no está "no está en la foto").
 #                    STUB_RESTIC_FIXTURE_R2 lo reemplaza para los repos s3.
 #   STUB_RESTIC_CAT_WRONG_PW=1                'cat config' falla con "wrong password".
-#   STUB_RESTIC_CAT_ERROR=1                   'cat config' de R2 falla por red (sin señal de "no hay repo").
+#   STUB_RESTIC_CAT_ERROR=<403|badkey|sig|timeout|refused|bucket|dns|1>
+#                    'cat config' de R2 falla por acceso/red (NO es "no hay repositorio").
+#   STUB_RESTIC_CAT_EXIT10=1                  'cat config' de R2 sale con 10 (restic >= 0.17: no existe).
 #   STUB_RESTIC_KILL_ON="backup"              envía TERM al proceso bin/hli2-backup
 #                    (el ancestro más alto) al correr ese subcomando: simula
 #                    una interrupción en plena ventana de parada.
@@ -87,9 +89,22 @@ case "$sub" in
       exit 1
     fi
     if [[ "$is_r2" -eq 1 ]]; then
-      if [[ -n "${STUB_RESTIC_CAT_ERROR:-}" ]]; then
-        echo "Fatal: unable to open config file: dial tcp: lookup r2: no such host" >&2
-        exit 1
+      # STUB_RESTIC_CAT_ERROR=<tipo>: fallos de 'cat config' que NO son "no hay repositorio"
+      # (restic imprime igual el aviso "Is there a repository..." en todos).
+      case "${STUB_RESTIC_CAT_ERROR:-}" in
+        "") ;;
+        403) printf 'Fatal: unable to open config file: Stat: 403 Forbidden: Access Denied.\nIs there a repository at the following location?\n%s\n' "${RESTIC_REPOSITORY:-}" >&2; exit 1 ;;
+        badkey) printf 'Fatal: unable to open config file: Stat: The AWS Access Key Id you provided does not exist in our records. (InvalidAccessKeyId)\nIs there a repository at the following location?\n%s\n' "${RESTIC_REPOSITORY:-}" >&2; exit 1 ;;
+        sig) printf 'Fatal: unable to open config file: Stat: SignatureDoesNotMatch\nIs there a repository at the following location?\n' >&2; exit 1 ;;
+        timeout) printf 'Fatal: unable to open config file: Stat: Get "https://r2": context deadline exceeded (i/o timeout)\nIs there a repository at the following location?\n' >&2; exit 1 ;;
+        refused) printf 'Fatal: unable to open config file: dial tcp 127.0.0.1:443: connect: connection refused\nIs there a repository at the following location?\n' >&2; exit 1 ;;
+        bucket) printf 'Fatal: unable to open config file: Stat: The specified bucket does not exist.\nIs there a repository at the following location?\n' >&2; exit 1 ;;
+        *) printf 'Fatal: unable to open config file: dial tcp: lookup r2: no such host\nIs there a repository at the following location?\n' >&2; exit 1 ;;
+      esac
+      # restic >= 0.17: código 10 = el repositorio no existe.
+      if [[ -n "${STUB_RESTIC_CAT_EXIT10:-}" && ! -f "${STUB_SAFE_ROOT:-/nonexistent}/r2-initialized" && -z "${STUB_RESTIC_R2_INITIALIZED:-}" ]]; then
+        echo "Fatal: repository does not exist: unable to open config file" >&2
+        exit 10
       fi
       if [[ ! -f "${STUB_SAFE_ROOT:-/nonexistent}/r2-initialized" && -z "${STUB_RESTIC_R2_INITIALIZED:-}" ]]; then
         # Mensaje real de restic 0.16 ante una clave S3 inexistente (no hay repositorio).

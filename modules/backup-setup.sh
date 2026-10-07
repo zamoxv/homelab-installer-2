@@ -135,13 +135,14 @@ _BACKUP_DR=0
 # abre el repositorio (o el usuario elige generar una nueva).
 BACKUP_DR_PENDING_KEY="backup-dr-pending"
 
+# Saca la línea $1 del estado del HLI de forma atómica (archivo temporal vecino y
+# 'mv'): una interrupción nunca deja el estado truncado.
 _backup_unmark() {
   local tmp
   [[ -f "$STATE_FILE" ]] || return 0
-  tmp="$(mktemp)"
+  tmp="$(mktemp "$STATE_FILE.XXXXXX")" || return 1
   grep -vxF -- "$1" "$STATE_FILE" > "$tmp" || true
-  cat "$tmp" > "$STATE_FILE"
-  rm -f "$tmp"
+  mv -f -- "$tmp" "$STATE_FILE"
 }
 
 # Menú de modo de contraseña: new (generar) o existing (la de backups existentes).
@@ -365,9 +366,38 @@ _backup_install_units() {
     "WantedBy=multi-user.target" \
     | sudo tee "$BACKUP_SYSTEMD_DIR/hli2-backup-recover.service" >/dev/null
 
+  # Deshace una restauración interrumpida (corte de luz entre los dos 'mv') ANTES de que
+  # Docker inicie ningún contenedor: si no, Docker crearía una carpeta de datos vacía
+  # y el servicio arrancaría sin datos. No usa docker: solo mueve carpetas.
+  local mounts="$APPDATA_ROOT $BACKUP_STATE_DIR $SECRETS_DIR"
+  case "$mounts" in
+    *[%\"\']*)
+      msg "Alguna ruta de datos tiene caracteres que systemd no admite en RequiresMountsFor."
+      return 1
+      ;;
+  esac
+  printf '%s\n' \
+    "[Unit]" \
+    "Description=HLI 2: deshacer una restauración interrumpida antes de iniciar Docker" \
+    "DefaultDependencies=no" \
+    "After=local-fs.target" \
+    "Before=docker.service shutdown.target" \
+    "Conflicts=shutdown.target" \
+    "RequiresMountsFor=$mounts" \
+    "" \
+    "[Service]" \
+    "Type=oneshot" \
+    "Environment=USER=root HOME=/root" \
+    "ExecStart=$exe journal-recover" \
+    "" \
+    "[Install]" \
+    "WantedBy=multi-user.target" \
+    | sudo tee "$BACKUP_SYSTEMD_DIR/hli2-restore-journal.service" >/dev/null
+
   sudo systemctl daemon-reload
   sudo systemctl enable --now hli2-backup.timer
   sudo systemctl enable hli2-backup-recover.service
+  sudo systemctl enable hli2-restore-journal.service
 }
 
 _backup_setup_main() {
@@ -381,6 +411,14 @@ _backup_setup_main() {
   # lógica y las credenciales no pasan por este proceso).
   if ! backup_refresh_install; then
     msg "No se pudo instalar la copia del código del backup en $BACKUP_INSTALL_DIR."
+    return 1
+  fi
+  # Recuperación ante un desastre sin verificar: necesita R2 (donde están los backups)
+  # o un repositorio local existente contra el cual comprobar la contraseña. Sin
+  # ninguno de los dos, 'init' crearía un repositorio nuevo y vacío con una contraseña
+  # que nadie verificó: no se hace, y la marca de "pendiente" se conserva.
+  if is_done "$BACKUP_DR_PENDING_KEY" && ! _backup_r2_configured && ! _backup_repo_exists; then
+    msg "La recuperación ante un desastre necesita la copia externa (R2) con los backups existentes, o un repositorio local existente, para comprobar la contraseña.\n\nConfigure R2 (mismo bucket) volviendo a correr este módulo; no se creó ningún repositorio nuevo."
     return 1
   fi
   local out

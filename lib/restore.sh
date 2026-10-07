@@ -36,8 +36,9 @@
 #      se borran. Nunca se borra nada de una corrida que terminó en error ni si la
 #      restauración anterior quedó interrumpida. --discard-old (el módulo lo pasa
 #      solo si acaba de hacer un backup de seguridad verificado) las borra todas.
-#      Las copias de los .env de /etc/hli2 se guardan FUERA de /etc/hli2 (en
-#      restore-old-secrets, 0700): así los secretos viejos no entran en los backups.
+#      Las copias de los .env de /etc/hli2 se guardan FUERA de /etc/hli2 pero en el
+#      mismo sistema de archivos (/etc/hli2-old-secrets, 0700): así el 'mv' es un
+#      renombrado atómico y los secretos viejos no entran en los backups.
 #
 # "Todo" (--target all): todos los servicios con datos + /etc/samba/smb.conf
 # (es el dato de 'smbd') + los .env de /etc/hli2. NUNCA toca restic-password
@@ -70,11 +71,18 @@ RS_PLAN_CONTAINERS=()              # contenedores a detener
 RS_SECRET_FILES=()                 # .env de /etc/hli2 ya en carpeta de paso
 RS_DONE=""                         # servicios ya restaurados (para los mensajes)
 RS_PREV_RESULT=""                  # resultado de la restauración anterior
+RS_REVERTED=0                      # 1 si el estado es el de una restauración revertida por la recuperación
+RS_JOURNAL_FAILED=0                # 1 si la recuperación no pudo deshacer un intercambio
+RS_JOURNAL_REVERTED=""             # rutas que la recuperación devolvió a su lugar
 declare -A RS_STAGED=()            # servicio -> rutas en carpeta de paso (una por línea)
 
 RESTORE_JOURNAL="$BACKUP_STATE_DIR/restore-swap-journal"
 RESTORE_OLD_REGISTRY="$BACKUP_STATE_DIR/restore-old-copies"
-RESTORE_OLD_SECRETS_DIR="$BACKUP_STATE_DIR/restore-old-secrets"
+# Junto a /etc/hli2 (mismo sistema de archivos: el 'mv' es un renombrado, nunca una
+# copia a medias) y fuera de él (no entra en los backups, que respaldan /etc/hli2).
+RESTORE_OLD_SECRETS_DIR="${SECRETS_DIR}-old-secrets"
+RESTORE_OLD_TS_RE='[0-9]{8}-[0-9]{6}'
+RESTORE_JOURNAL_FAILED="$BACKUP_STATE_DIR/restore-swap-journal.failed"
 RESTORE_SPACE_MARGIN_PCT=10
 RESTORE_SPACE_MARGIN_BYTES=67108864
 
@@ -192,21 +200,28 @@ restore_parse_args() {
 
 # --- Estado ------------------------------------------------------------------------------------
 
-_restore_status_write() {
+# Escribe el estado con los valores dados (resultado, origen, foto, fecha de la foto,
+# destino, módulos, mensaje, revertida). 0644, sin secretos.
+_restore_status_write_raw() {
   local tmp
   tmp="$(mktemp "$BACKUP_STATE_DIR/.rstatus.XXXXXX")" || return 1
   {
     printf 'timestamp=%s\n' "$(date -Is)"
-    printf 'result=%s\n' "$RS_RESULT"
-    printf 'source=%s\n' "$RS_SOURCE"
-    printf 'snapshot=%s\n' "$RS_SNAPSHOT"
-    printf 'snapshot_time=%s\n' "$RS_STIME"
-    printf 'target=%s\n' "$RS_TARGET"
-    printf 'modules=%s\n' "$RS_MODULES"
-    printf 'message=%s\n' "$RS_MSG"
+    printf 'result=%s\n' "$1"
+    printf 'source=%s\n' "$2"
+    printf 'snapshot=%s\n' "$3"
+    printf 'snapshot_time=%s\n' "$4"
+    printf 'target=%s\n' "$5"
+    printf 'modules=%s\n' "$6"
+    printf 'message=%s\n' "${7//$'\n'/ }"
+    printf 'reverted=%s\n' "$8"
   } > "$tmp"
   chmod 0644 "$tmp"
   mv -f -- "$tmp" "$RESTORE_STATUS_FILE"
+}
+
+_restore_status_write() {
+  _restore_status_write_raw "$RS_RESULT" "$RS_SOURCE" "$RS_SNAPSHOT" "$RS_STIME" "$RS_TARGET" "$RS_MODULES" "$RS_MSG" "$RS_REVERTED"
 }
 
 # Valor de una clave del estado de la restauración (archivo 0644, sin secretos;
@@ -248,6 +263,8 @@ restore_status_summary() {
   printf '  Qué          : %s\n' "$([[ "$(restore_status_get target)" == "all" ]] && echo "todo" || restore_status_get target)"
   msg="$(restore_status_get message)"
   [[ -z "$msg" ]] || printf '  Detalle      : %s\n' "$msg"
+  [[ "$(restore_status_get reverted)" != "1" ]] || printf '  AVISO        : la última restauración se revirtió (quedó a medias); lo anterior volvió a su lugar\n'
+
   mods="$(restore_status_get modules)"
   [[ -z "$mods" ]] || printf '  Falta        : los contenedores de estos servicios no existen todavía; ejecute sus módulos: %s\n' "$mods"
   return 0
@@ -642,6 +659,23 @@ _restore_service_stage() {
   return 0
 }
 
+# Prepara la carpeta de copias previas de los .env: junto a /etc/hli2, en su mismo
+# sistema de archivos (así el 'mv' es un renombrado atómico: nunca una copia a medias
+# que luego se tome por completa), root 0700, no un enlace. Si no cumple, no se
+# restauran secretos (se comprueba en la fase 1, antes de detener ni cambiar nada).
+_restore_secrets_old_dir_prepare() {
+  if _restore_priv test -L "$RESTORE_OLD_SECRETS_DIR"; then
+    _restore_msg_add "$RESTORE_OLD_SECRETS_DIR es un enlace simbólico: no se restauran los secretos"
+    return 1
+  fi
+  _restore_priv install -d -m 0700 "$RESTORE_OLD_SECRETS_DIR" || return 1
+  if ! _restore_same_fs "$RESTORE_OLD_SECRETS_DIR" "$SECRETS_DIR"; then
+    _restore_msg_add "$RESTORE_OLD_SECRETS_DIR no está en el mismo sistema de archivos que $SECRETS_DIR: no se restauran los secretos"
+    return 1
+  fi
+  return 0
+}
+
 # Fase 1 de /etc/hli2 (solo 'todo'): deja en RS_SECRET_FILES los '<servicio>.env'
 # restaurados en la carpeta de paso. Se salta restic.env (salvo --with-restic-env),
 # dokploy.env y todo lo que no sea un '<servicio>.env' regular. La contraseña de
@@ -675,10 +709,25 @@ _restore_secrets_stage() {
     esac
     RS_SECRET_FILES+=("$f")
   done
+  if [[ ${#RS_SECRET_FILES[@]} -gt 0 ]]; then _restore_secrets_old_dir_prepare || return 1; fi
   return 0
 }
 
 # --- Fase 2: intercambio -----------------------------------------------------------------------
+
+# ¿$1 y $2 están en el mismo sistema de archivos (mismo id de dispositivo)?
+_restore_same_fs() {
+  local a b
+  a="$(_restore_priv stat -c %d -- "$1" 2>/dev/null)" || return 1
+  b="$(_restore_priv stat -c %d -- "$2" 2>/dev/null)" || return 1
+  [[ -n "$a" && "$a" == "$b" ]]
+}
+
+# 'sync' del archivo/sistema de archivos: el diario tiene que estar en disco ANTES
+# del primer 'mv' (si se corta la luz con el diario en el caché, no habría nada que deshacer).
+_restore_sync() {
+  sync "$@" 2>/dev/null || true
+}
 
 # Diario del intercambio en curso (estado de root): una línea 'destino<TAB>copia<TAB>había'
 # por ruta. Si el proceso muere a medias, restore_journal_recover lo deshace.
@@ -688,25 +737,83 @@ _restore_journal_write() {
   for (( i = 0; i < ${#RS_PLAN_DST[@]}; i++ )); do
     printf '%s\t%s\t%s\n' "${RS_PLAN_DST[$i]}" "${RS_PLAN_OLD[$i]}" "${RS_PLAN_HAD[$i]}"
   done > "$tmp" || { rm -f "$tmp"; return 1; }
-  mv -f -- "$tmp" "$RESTORE_JOURNAL"
+  # Duradero antes del primer 'mv': archivo, renombrado y entrada de directorio.
+  _restore_sync -- "$tmp"
+  mv -f -- "$tmp" "$RESTORE_JOURNAL" || return 1
+  _restore_sync -f -- "$BACKUP_STATE_DIR"
 }
 
 _restore_journal_clear() {
   rm -f -- "$RESTORE_JOURNAL"
+  _restore_sync -f -- "$BACKUP_STATE_DIR"
+}
+
+# ¿$1 es una ruta que una restauración puede tocar? Solo las rutas de datos del
+# registro de servicios (de la copia root-owned) o '<SECRETS_DIR>/<servicio>.env'.
+_restore_dst_allowed() {
+  local dst="$1" id p name
+  if [[ "$dst" == "$SECRETS_DIR/"* ]]; then
+    name="${dst#"$SECRETS_DIR"/}"
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*\.env$ ]]
+    return
+  fi
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    while IFS= read -r p; do
+      [[ "$p" == "$dst" ]] && return 0
+    done < <(service_get "$id" DATA)
+  done < <(service_list)
+  return 1
+}
+
+# ¿$2 es exactamente el nombre de copia previa que esta biblioteca le da a $1?
+# '<destino>.hli2-before-restore-<AAAAMMDD-HHMMSS>' o, para un .env,
+# '<SECRETS_DIR>-old-secrets/<archivo>.hli2-before-restore-<AAAAMMDD-HHMMSS>'.
+_restore_old_name_ok() {
+  local dst="$1" old="$2" ts
+  if [[ "$dst" == "$SECRETS_DIR/"* ]]; then
+    [[ "$old" == "$RESTORE_OLD_SECRETS_DIR/$(basename -- "$dst")$RESTORE_OLD_SUFFIX-"* ]] || return 1
+    ts="${old##*"$RESTORE_OLD_SUFFIX"-}"
+  else
+    [[ "$old" == "$dst$RESTORE_OLD_SUFFIX-"* ]] || return 1
+    ts="${old#"$dst$RESTORE_OLD_SUFFIX"-}"
+  fi
+  [[ "$ts" =~ ^$RESTORE_OLD_TS_RE$ ]]
+}
+
+# Destino al que pertenece una copia previa ($1), o vacío si no tiene la forma esperada.
+_restore_old_to_dst() {
+  local old="$1" base name
+  [[ "$old" =~ ^(.+)\.hli2-before-restore-$RESTORE_OLD_TS_RE$ ]] || return 1
+  base="${BASH_REMATCH[1]}"
+  if [[ "$base" == "$RESTORE_OLD_SECRETS_DIR/"* ]]; then
+    printf '%s/%s' "$SECRETS_DIR" "${base#"$RESTORE_OLD_SECRETS_DIR"/}"
+  else
+    printf '%s' "$base"
+  fi
 }
 
 # Deshace el intercambio que un proceso muerto dejó a medias (diario presente): para
 # cada ruta, de atrás hacia adelante, devuelve lo apartado a su lugar. Corre ANTES
-# de iniciar ningún contenedor (backup_recover lo llama primero): sin esto, Docker
-# crearía una carpeta vacía en el lugar que falta y el servicio arrancaría sin datos.
-# Cada línea se valida antes de tocar nada.
+# de iniciar ningún contenedor (backup_recover y el servicio hli2-restore-journal lo
+# llaman primero): sin esto, Docker crearía una carpeta vacía en el lugar que falta y
+# el servicio arrancaría sin datos. Cada línea se valida antes de tocar nada: el
+# destino tiene que estar en la lista del registro de servicios (o ser un .env de
+# /etc/hli2) y la copia llamarse exactamente como la nombra esta biblioteca. Nunca se
+# borra un destino si la copia previa no existe (un renombrado en el mismo sistema de
+# archivos garantiza que, si existe, está completa).
+#
+# 0 = nada que hacer o deshecho (queda constancia en el estado de la restauración:
+# 'interrumpida', 'revertida'); 1 = algún 'mv' falló: el diario se conserva como
+# restore-swap-journal.failed (0600) y el estado queda en error con las rutas.
 restore_journal_recover() {
+  RS_JOURNAL_FAILED=0
   [[ -s "$RESTORE_JOURNAL" ]] || return 0
-  local dst old had i
+  local dst old had i failed="" reverted=""
   local -a D=() O=() H=()
   while IFS=$'\t' read -r dst old had; do
     if _restore_path_ok "$dst" && _restore_path_ok "$old" && [[ "$had" =~ ^[01]$ ]] \
-       && [[ "$old" == "$dst$RESTORE_OLD_SUFFIX-"* || "$old" == "$RESTORE_OLD_SECRETS_DIR/"* ]]; then
+       && _restore_dst_allowed "$dst" && _restore_old_name_ok "$dst" "$old"; then
       D+=("$dst") O+=("$old") H+=("$had")
     else
       _backup_log "Recuperación: línea inválida en el diario de restauración, se ignora"
@@ -716,19 +823,54 @@ restore_journal_recover() {
   for (( i = ${#D[@]} - 1; i >= 0; i-- )); do
     if [[ "${H[$i]}" == "1" ]]; then
       if _restore_exists "${O[$i]}"; then
-        if _restore_exists "${D[$i]}"; then _restore_priv rm -rf -- "${D[$i]}" || true; fi
+        # Un .env con la copia en otro sistema de archivos no es un renombrado: no
+        # se puede garantizar que esté completa.
+        if [[ "${D[$i]}" == "$SECRETS_DIR/"* ]] && ! _restore_same_fs "$(dirname -- "${O[$i]}")" "$SECRETS_DIR"; then
+          hli_error "la copia ${O[$i]} no está en el mismo sistema de archivos que $SECRETS_DIR: no se revierte ${D[$i]}"
+          failed+="${failed:+, }${D[$i]}"
+          continue
+        fi
+        if _restore_exists "${D[$i]}" && ! _restore_priv rm -rf -- "${D[$i]}"; then
+          hli_error "no se pudo quitar ${D[$i]}; lo anterior sigue en ${O[$i]}"
+          failed+="${failed:+, }${D[$i]}"
+          continue
+        fi
         if _restore_priv mv -T -- "${O[$i]}" "${D[$i]}"; then
           _backup_log "Recuperación: ${D[$i]} vuelve a su estado anterior"
+          reverted+="${reverted:+, }${D[$i]}"
         else
           hli_error "no se pudo devolver ${D[$i]} a su lugar; lo anterior está en ${O[$i]}"
+          failed+="${failed:+, }${D[$i]} (lo anterior en ${O[$i]})"
         fi
       fi
     elif _restore_exists "${D[$i]}"; then
-      _restore_priv rm -rf -- "${D[$i]}" || true
+      if _restore_priv rm -rf -- "${D[$i]}"; then
+        reverted+="${reverted:+, }${D[$i]}"
+      else
+        failed+="${failed:+, }${D[$i]}"
+      fi
     fi
   done
-  rm -f -- "$RESTORE_JOURNAL"
+  if [[ -n "$failed" ]]; then
+    mv -f -- "$RESTORE_JOURNAL" "$RESTORE_JOURNAL_FAILED" && chmod 0600 "$RESTORE_JOURNAL_FAILED" || true
+    _restore_sync -f -- "$BACKUP_STATE_DIR"
+    RS_JOURNAL_FAILED=1
+    _restore_status_write_raw error "$(restore_status_get source)" "$(restore_status_get snapshot)" "$(restore_status_get snapshot_time)" \
+      "$(restore_status_get target)" "" "no se pudo revertir una restauración interrumpida: $failed. El diario se conservó en $RESTORE_JOURNAL_FAILED: devuelva a mano cada carpeta desde su copia '.hli2-before-restore-*'" 0 || true
+    return 1
+  fi
+  _restore_journal_clear
+  RS_JOURNAL_REVERTED="$reverted"
+  _restore_status_write_raw interrupted "$(restore_status_get source)" "$(restore_status_get snapshot)" "$(restore_status_get snapshot_time)" \
+    "$(restore_status_get target)" "" "la restauración quedó a medias (corte de luz o proceso terminado) y se revirtió: ${reverted:-nada que devolver}" 1 || true
   return 0
+}
+
+# Subcomando 'journal-recover': solo deshace el intercambio interrumpido, SIN docker.
+# Lo corre hli2-restore-journal.service antes de iniciar Docker, en el arranque.
+restore_journal_recover_main() {
+  restore_status_mark_stale || true
+  restore_journal_recover
 }
 
 # Intercambia $1 (ya restaurado en la carpeta de paso) por $2 (destino): lo actual
@@ -821,14 +963,13 @@ _restore_service_swap() {
 }
 
 # Fase 2 de /etc/hli2: uno por uno dentro de un solo diario. Las copias previas
-# van FUERA de /etc/hli2 (restore-old-secrets, 0700) para que los secretos viejos
+# van FUERA de /etc/hli2 (/etc/hli2-old-secrets, 0700, mismo sistema de archivos) para que los secretos viejos
 # no entren en los backups.
 _restore_secrets_swap() {
   local f name dst had
   local -a srcs=()
   RS_PLAN_DST=() RS_PLAN_OLD=() RS_PLAN_HAD=()
   [[ ${#RS_SECRET_FILES[@]} -gt 0 ]] || return 0
-  _restore_priv install -d -m 0700 "$RESTORE_OLD_SECRETS_DIR" || return 1
   for f in "${RS_SECRET_FILES[@]}"; do
     name="$(basename -- "$f")"
     dst="$SECRETS_DIR/$name"
@@ -860,7 +1001,9 @@ _restore_registry_add() {
 # Borra la copia previa $1 (solo si tiene la forma esperada) y la saca del registro.
 _restore_old_drop() {
   local o="$1" tmp d x
-  if [[ "$o" == *"$RESTORE_OLD_SUFFIX-"* ]] && _restore_path_ok "$o"; then
+  local dst_of
+  dst_of="$(_restore_old_to_dst "$o")" || dst_of=""
+  if [[ -n "$dst_of" ]] && _restore_path_ok "$o" && _restore_dst_allowed "$dst_of" && _restore_old_name_ok "$dst_of" "$o"; then
     _restore_priv rm -rf -- "$o" || true
   fi
   [[ -f "$RESTORE_OLD_REGISTRY" ]] || return 0
@@ -973,10 +1116,27 @@ restore_run() {
   RS_RESULT=ok
   _backup_log "Inicio de la restauración: origen=$RS_SOURCE foto=$RS_SNAPSHOT destino=$RS_TARGET"
 
+  # Un diario que no se pudo deshacer bloquea toda restauración nueva hasta resolverlo a mano.
+  if [[ -e "$RESTORE_JOURNAL_FAILED" ]]; then
+    _restore_msg_add "hay una restauración anterior sin revertir ($RESTORE_JOURNAL_FAILED): devuelva a mano las carpetas desde sus copias '.hli2-before-restore-*', borre ese archivo y reintente"
+    _restore_abort
+    return 1
+  fi
   # Primero lo que un proceso muerto dejó a medias (intercambio y contenedores).
+  RS_JOURNAL_REVERTED=""
   if ! backup_recover; then
+    if [[ "$RS_JOURNAL_FAILED" -eq 1 ]]; then
+      _restore_msg_add "no se pudo revertir una restauración interrumpida anterior (ver $RESTORE_JOURNAL_FAILED)"
+      _restore_abort
+      return 1
+    fi
     _restore_worse warning
     _restore_msg_add "quedaron contenedores sin iniciar de una corrida anterior"
+  fi
+  if [[ -n "$RS_JOURNAL_REVERTED" ]]; then
+    _restore_worse warning
+    _restore_msg_add "antes de empezar se revirtió una restauración anterior que quedó a medias: $RS_JOURNAL_REVERTED"
+    RS_PREV_RESULT="interrupted"
   fi
 
   if ! _restore_open_repo || ! _restore_resolve_snapshot; then

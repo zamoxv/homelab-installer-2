@@ -613,10 +613,21 @@ Especificación acordada con el usuario (2026-10-06):
         de hacer el backup de seguridad **y su estado lo confirma** (resultado
         correcto, con foto, de esa corrida) pasa `--discard-old` y se borran
         todas. Las copias de los `.env` de `/etc/hli2` van fuera de `/etc/hli2`
-        (estado de root, 0700): los secretos viejos no entran en los backups.
+        pero en su mismo sistema de archivos (`/etc/hli2-old-secrets`, 0700; se
+        comprueba el dispositivo): el `mv` es un renombrado y los secretos viejos
+        no entran en los backups.
+      - El diario se sincroniza (`sync`) antes del primer `mv`; al recuperar solo
+        se aceptan destinos del registro de servicios (o `<servicio>.env`) y
+        copias con el nombre exacto que genera la biblioteca. La recuperación
+        corre también en el arranque, antes de Docker
+        (`hli2-restore-journal.service` → `hli2-backup journal-recover`, sin
+        docker), deja constancia (`reverted=1`; el dashboard y el módulo avisan) y,
+        si un `mv` falla, conserva el diario como `.failed`, deja el estado en
+        `error` y bloquea nuevas restauraciones y el inicio de contenedores.
       - Un backup (timer) que espera el bloqueo durante una restauración
-        queda `skipped` ("restauración en curso", omitido en el dashboard), no
-        `error`.
+        termina bien: no refresca la fecha del último backup real ni pisa su
+        resultado, solo anota `last_skip` ("restauración en curso") en el estado y
+        el dashboard.
       - `opencloud/data` solo desde la copia local: desde R2 no se pide ni se
         toca y el resultado queda "con avisos" explicando por qué.
       - "Todo": todos los servicios con datos, `smb.conf` (unidad `smbd` se
@@ -629,7 +640,10 @@ Especificación acordada con el usuario (2026-10-06):
         `backup-setup` con la **misma contraseña de restic** ("Recuperación
         ante un desastre"). `hli2-backup init` comprueba R2 primero (`restic cat
         config`) y no inicializa nada si la contraseña no lo abre o no se puede
-        comprobar (solo inicializa ante un "no hay repositorio" positivo);
+        comprobar (solo inicializa ante un "no hay repositorio" explícito: código 10 de
+        restic >= 0.17, o "specified key does not exist"/NoSuchKey sin marcadores de
+        acceso o red); con un repositorio local existente, la contraseña se verifica
+        contra él; sin R2 ni repositorio local no se crea uno nuevo en silencio;
         con R2 existente, el repositorio local nuevo copia sus parámetros de
         troceado. Se puede reingresar la contraseña tras un fallo. Luego,
         restaurar "todo" desde R2 (procedimiento completo en docs/VALIDACION.md,

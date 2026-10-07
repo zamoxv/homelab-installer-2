@@ -8,6 +8,9 @@
 #                        Backup completo (fotos locales + copia a R2 + retención).
 #   hli2-backup init     Inicializa los repositorios que falten (idempotente).
 #   hli2-backup recover  Levanta lo que un backup interrumpido dejó detenido.
+#   hli2-backup journal-recover
+#                        Deshace un intercambio de restauración interrumpido, SIN
+#                        docker (hli2-restore-journal.service, antes de Docker).
 #   hli2-backup snapshots --source local|r2
 #                        Lista las fotos restaurables (id y fecha, la más nueva
 #                        primero) por stdout; no usa el log ni el bloqueo.
@@ -52,11 +55,11 @@ if [[ "$(id -u)" -ne 0 && -z "${HLI2_BACKUP_ALLOW_NONROOT:-}" ]]; then
 fi
 
 _usage() {
-  echo "Uso: hli2-backup {run [--no-retention]|init|recover|snapshots --source local|r2|restore --source local|r2 --snapshot <id> --target <servicio|all>}" >&2
+  echo "Uso: hli2-backup {run [--no-retention]|init|recover|journal-recover|snapshots --source local|r2|restore --source local|r2 --snapshot <id> --target <servicio|all>}" >&2
   exit 2
 }
 case "${1:-}" in
-  run|recover|init|restore|snapshots) ;;
+  run|recover|journal-recover|init|restore|snapshots) ;;
   *) _usage ;;
 esac
 
@@ -107,7 +110,7 @@ fi
 exec 9>"$BACKUP_STATE_DIR/lock"
 # Si hay otro proceso (el timer y 'recover' al arrancar pueden coincidir), se
 # espera un rato en vez de fallar sin dejar rastro.
-if [[ "$1" == "recover" ]]; then _wait="${HLI2_BACKUP_LOCK_WAIT:-30}"; else _wait="${HLI2_BACKUP_LOCK_WAIT:-120}"; fi
+if [[ "$1" == "recover" || "$1" == "journal-recover" ]]; then _wait="${HLI2_BACKUP_LOCK_WAIT:-30}"; else _wait="${HLI2_BACKUP_LOCK_WAIT:-120}"; fi
 if ! flock -w "$_wait" 9; then
   echo "Otro backup o restauración mantiene el bloqueo desde hace más de ${_wait} s."
   if [[ "$1" == "restore" ]]; then
@@ -119,11 +122,21 @@ if ! flock -w "$_wait" 9; then
   if [[ "$1" == "run" ]]; then
     if [[ "$(restore_status_get result)" == "running" ]]; then
       # El bloqueo lo tiene una restauración (puede ser larga): no es un error del
-      # backup. Se registra como 'skipped' (el dashboard lo muestra como omitido) y
-      # el servicio termina bien; el próximo backup corre cuando termine.
-      BK_RESULT=skipped BK_LOCAL=skipped BK_CLOUD=skipped BK_CHECK=skipped
+      # backup. El servicio termina bien y el próximo backup corre cuando termine.
+      # El estado NO refresca la fecha del último intento real (el aviso de "más de
+      # N horas" sigue valiendo) ni pisa su resultado (un error previo sigue siendo
+      # un error): solo anota 'last_skip' y lo agrega al mensaje.
+      BK_RESULT="$(backup_status_get result)"; [[ -n "$BK_RESULT" ]] || BK_RESULT=skipped
+      BK_LOCAL="$(backup_status_get local)"; [[ -n "$BK_LOCAL" ]] || BK_LOCAL=skipped
+      BK_CLOUD="$(backup_status_get cloud)"; [[ -n "$BK_CLOUD" ]] || BK_CLOUD=skipped
+      BK_CHECK="$(backup_status_get check)"; [[ -n "$BK_CHECK" ]] || BK_CHECK=skipped
       BK_ID_FULL="$(backup_status_get snapshot_full)" BK_ID_CLOUD="$(backup_status_get snapshot_cloud)"
-      BK_MSG="restauración en curso: este backup se omitió"
+      BK_TS="$(backup_status_get timestamp)"
+      BK_LAST_SKIP="$(date -Is)"
+      BK_MSG="$(backup_status_get message)"
+      if [[ "$BK_MSG" != *"último intento omitido"* ]]; then
+        BK_MSG="${BK_MSG:+$BK_MSG; }último intento omitido: restauración en curso"
+      fi
       _backup_status_write || true
       exit 0
     fi
@@ -142,6 +155,10 @@ case "$1" in
     trap 'exit 143' TERM
     trap 'exit 130' INT HUP
     backup_run
+    ;;
+  journal-recover)
+    # Sin docker: solo devuelve a su lugar lo que una restauración dejó a medias.
+    restore_journal_recover_main
     ;;
   recover)
     trap backup_exit_cleanup EXIT

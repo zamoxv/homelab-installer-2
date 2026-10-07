@@ -121,6 +121,10 @@ _backup_restore_main() {
     return 1
   fi
 
+  if [[ "$(restore_status_get reverted)" == "1" ]]; then
+    msg "Aviso: la última restauración se revirtió (quedó a medias por un corte o un proceso terminado) y lo anterior volvió a su lugar.\n\n$(restore_status_get message)\n\nPuede volver a intentarla."
+  fi
+
   # Copia root-owned del código (por si se actualizó el HLI 2 con git, o es la
   # primera vez): root solo ejecuta esa copia, nunca el checkout.
   if ! backup_refresh_install; then

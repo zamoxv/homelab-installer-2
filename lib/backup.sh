@@ -70,6 +70,9 @@ BK_RESULT="ok" BK_LOCAL="ok" BK_CLOUD="not-configured" BK_CHECK="skipped"
 BK_ID_FULL="" BK_ID_CLOUD="" BK_MSG="" BK_ACTIVE=0 BK_WARMUP_ID=""
 BK_TMP_FILES=()
 BK_NO_RETENTION=0
+# Solo para el estado de un backup omitido (ver bin/hli2-backup): conserva la fecha
+# del último intento REAL y anota cuándo se omitió el último.
+BK_TS="" BK_LAST_SKIP=""
 
 # Si stdout ya no existe (una terminal SSH colgada deja rota la tubería de 'tee'),
 # la línea va directo al log: un registro nunca puede matar al proceso, y menos
@@ -416,7 +419,12 @@ backup_recover() {
   local -a names=()
   # Una restauración que murió a medias se deshace ANTES de iniciar nada (ver
   # lib/restore.sh): sin eso Docker crearía carpetas vacías donde falta la de datos.
-  restore_journal_recover || true
+  if ! restore_journal_recover; then
+    # No se pudo devolver algún dato a su lugar: iniciar los contenedores haría que
+    # Docker cree carpetas vacías. Quedan detenidos (y en la lista) hasta resolverlo.
+    hli_error "no se pudo deshacer una restauración interrumpida: los contenedores no se inician (ver restore-swap-journal.failed en $BACKUP_STATE_DIR)"
+    return 1
+  fi
   [[ -s "$BACKUP_RECOVERY_FILE" ]] || return 0
   while IFS= read -r c; do
     if [[ "$c" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then names+=("$c"); fi
@@ -652,7 +660,7 @@ _backup_status_write() {
   local tmp
   tmp="$(mktemp "$BACKUP_STATE_DIR/.status.XXXXXX")" || return 1
   {
-    printf 'timestamp=%s\n' "$(date -Is)"
+    printf 'timestamp=%s\n' "${BK_TS:-$(date -Is)}"
     printf 'result=%s\n' "$BK_RESULT"
     printf 'local=%s\n' "$BK_LOCAL"
     printf 'cloud=%s\n' "$BK_CLOUD"
@@ -660,6 +668,7 @@ _backup_status_write() {
     printf 'snapshot_full=%s\n' "$BK_ID_FULL"
     printf 'snapshot_cloud=%s\n' "$BK_ID_CLOUD"
     printf 'message=%s\n' "$BK_MSG"
+    if [[ -n "$BK_LAST_SKIP" ]]; then printf 'last_skip=%s\n' "$BK_LAST_SKIP"; fi
   } > "$tmp"
   chmod 0644 "$tmp"
   mv -f -- "$tmp" "$BACKUP_STATUS_FILE"
@@ -706,6 +715,16 @@ backup_status_summary() {
   printf '  Copia externa : %s\n' "$(_backup_res_es "$(backup_status_get cloud)")"
   msg="$(backup_status_get message)"
   [[ -z "$msg" ]] || printf '  Detalle       : %s\n' "$msg"
+  # Un backup omitido (había una restauración en curso) NO refresca la fecha de
+  # arriba: el aviso de "más de N horas" sigue valiendo.
+  when="$(backup_status_get last_skip)"
+  if [[ -n "$when" ]]; then
+    when="${when/T/ }"
+    printf '  Intento omitido: %s (restauración en curso)\n' "${when:0:16}"
+  fi
+  if [[ "$(restore_status_get reverted)" == "1" ]]; then
+    printf '  AVISO         : la última restauración se revirtió (quedó a medias): %s\n' "$(restore_status_get message)"
+  fi
   if age="$(date -d "$ts" +%s 2>/dev/null)" && (( $(date +%s) - age > BACKUP_STALE_HOURS * 3600 )); then
     printf '  AVISO         : el último backup tiene más de %s horas\n' "$BACKUP_STALE_HOURS"
   fi
@@ -812,6 +831,33 @@ backup_run() {
   [[ "$BK_RESULT" != "error" ]]
 }
 
+# ¿La salida de 'restic cat config' ($2, código $1) dice POSITIVAMENTE que el
+# repositorio no existe? Solo entonces se inicializa. Restic >= 0.17 devuelve el
+# código 10 para eso; en 0.16 se exige un marcador explícito de "no encontrado"
+# (clave S3 inexistente / NoSuchKey) y la ausencia de marcadores de acceso o red:
+# el aviso "Is there a repository at the following location?" lo imprime restic
+# también ante un 403 o un fallo de DNS, así que por sí solo no prueba nada.
+# Cualquier ambigüedad es un error (nunca se inicializa a ciegas).
+_backup_r2_repo_missing() {
+  local rc="$1" out="" line
+  # Sin las líneas con la URL del repositorio: el id de cuenta (hexadecimal al
+  # azar) podría contener "403" o "401" y confundir la detección.
+  while IFS= read -r line; do
+    case "$line" in *"s3:"*|*"https://"*|*"http://"*) continue ;; esac
+    out+="${line,,}"$'\n'
+  done <<<"$2"
+  case "$out" in
+    *403*|*forbidden*|*accessdenied*|*"access denied"*|*invalidaccesskeyid*|*signaturedoesnotmatch*|*unauthorized*|*401*|*"no such host"*|*timeout*|*"timed out"*|*"connection refused"*|*"dial tcp"*|*x509*|*"tls:"*|*nosuchbucket*|*"specified bucket"*|*"temporary failure"*|*"network is unreachable"*)
+      return 1
+      ;;
+  esac
+  [[ "$rc" -eq 10 ]] && return 0
+  case "$out" in
+    *"specified key does not exist"*|*nosuchkey*) return 0 ;;
+  esac
+  return 1
+}
+
 # Inicializa los repositorios que falten (idempotente). Como root. Con R2
 # configurado se comprueba PRIMERO ('restic cat config'); solo después se crea nada:
 #   - la contraseña no abre un repositorio existente -> error, no se inicializa NADA
@@ -838,13 +884,13 @@ backup_init() {
     cat_out="$(_backup_restic_r2 cat config 2>&1 </dev/null)" && rc=0 || rc=$?
     if [[ "$rc" -eq 0 ]]; then
       r2="exists"
-    elif [[ "$cat_out" == *"wrong password"* ]]; then
+    elif [[ "$rc" -eq 12 || "$cat_out" == *"wrong password"* ]]; then
       # El repositorio de R2 ya existe y esta contraseña no lo abre (típico en una
       # recuperación ante un desastre: no es la misma que se usó al crear los backups).
       echo "ERROR: el repositorio de R2 ya existe y la contraseña de restic no lo abre. Use la MISMA contraseña con la que se crearon los backups (Vaultwarden o papel). No se inicializó nada." >&2
       _BK_R2_REPO="" _BK_R2_KEY="" _BK_R2_SECRET="" _BK_R2_REGION=""
       return 1
-    elif [[ "$cat_out" == *"Is there a repository at the following location"* && "$cat_out" != *"specified bucket"* ]]; then
+    elif _backup_r2_repo_missing "$rc" "$cat_out"; then
       r2="missing"
     else
       echo "ERROR: no se pudo comprobar el repositorio de R2 (red, claves, bucket o endpoint). No se inicializó nada. Detalle: $(printf '%s' "$cat_out" | tail -n 2 | tr '\n' ' ')" >&2
@@ -855,6 +901,20 @@ backup_init() {
     r2="none"
   fi
 
+  if [[ -f "$BACKUP_ROOT/config" ]]; then
+    # Repositorio local existente: la contraseña tiene que abrirlo (si no, es otra:
+    # no se da por buena ni se sigue).
+    cat_out="$(_backup_restic_local cat config 2>&1 </dev/null)" && rc=0 || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      if [[ "$rc" -eq 12 || "$cat_out" == *"wrong password"* ]]; then
+        echo "ERROR: la contraseña de restic no abre el repositorio local existente ($BACKUP_ROOT). Use la contraseña con la que se creó (Vaultwarden o papel)." >&2
+      else
+        echo "ERROR: no se pudo comprobar el repositorio local existente. Detalle: $(printf '%s' "$cat_out" | tail -n 2 | tr '\n' ' ')" >&2
+      fi
+      _BK_R2_REPO="" _BK_R2_KEY="" _BK_R2_SECRET="" _BK_R2_REGION=""
+      return 1
+    fi
+  fi
   if [[ ! -f "$BACKUP_ROOT/config" ]]; then
     if [[ "$r2" == "exists" ]]; then
       _backup_log "Inicializando el repositorio local con los parámetros de R2"

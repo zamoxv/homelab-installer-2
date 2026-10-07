@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Stub de 'sync': solo registra la llamada (los tests nunca sincronizan discos de verdad;
+# sirve para afirmar que el diario se sincroniza ANTES del primer 'mv').
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call sync "$@"
+exit 0
