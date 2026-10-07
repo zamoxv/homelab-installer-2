@@ -577,16 +577,59 @@ Especificación acordada con el usuario (2026-10-06):
       --keep-monthly 6`, más `prune`. Chequeo de integridad periódico
       (`restic check`, con una muestra de datos).
 - [ ] **Restaurar** desde el menú (parte del entregable, no opcional):
-      elegir origen (local o R2), fecha (snapshot) y servicio (o "todo",
-      para migrar a un equipo nuevo); detiene el contenedor, restaura sus
-      rutas, corrige dueños y lo levanta. Restaurar `opencloud/data` solo es
-      posible desde el local.
+      Herramientas → "Restaurar un backup" (`modules/backup-restore.sh`):
+      origen (copia local, o R2 si está configurada), fecha (foto, la más nueva
+      primero), y qué (un servicio con datos o "todo", para migrar a un equipo
+      nuevo). Resumen claro de lo que se reemplaza y de la fecha, y
+      "¿Hacer un backup de seguridad del estado actual antes de restaurar?"
+      (por defecto sí; corre `hli2-backup run --no-retention`, porque la
+      retención podría borrar justo la foto elegida). Lo hace root con
+      `hli2-backup restore --source local|r2 --snapshot <id> --target
+      <servicio|all>` (más `snapshots --source` para la lista), desde la misma
+      copia root-owned, con el mismo bloqueo, lista de recuperación y reinicio
+      garantizado que el backup; los argumentos se validan de forma estricta
+      (id hexadecimal, destino del registro, origen enum) y las rutas salen
+      siempre del registro, nunca de los argumentos. Detalle (ver
+      `lib/restore.sh`):
+      - Se verifica la foto (existe en ese repositorio con el tag `full` en
+        local o `cloud` en R2) y se detienen **todos** los contenedores del
+        servicio. Cada ruta se restaura primero en `<ruta>.hli2-restore-tmp`
+        (mismo sistema de archivos), y solo si todas las rutas del servicio
+        salieron bien se intercambian: lo actual pasa a
+        `<ruta>.hli2-before-restore-<fecha>` y lo restaurado ocupa su lugar
+        (reemplazo, no mezcla; si falla un intercambio se deshace todo el
+        servicio). Una restauración fallida o interrumpida nunca deja una
+        carpeta a medias. Dueños y modos vienen de la foto (restic como root).
+      - Copia previa: al terminar bien se conserva **solo la última** por ruta
+        (para volver atrás) y se avisa dónde está; si el módulo acaba de hacer el
+        backup de seguridad, se borra también (`--discard-old`).
+      - `opencloud/data` solo desde la copia local: desde R2 no se pide ni se
+        toca y el resultado queda "con avisos" explicando por qué.
+      - "Todo": todos los servicios con datos, `smb.conf` (unidad `smbd` se
+        reinicia) y los `<servicio>.env` de `/etc/hli2`, uno por uno y atómicos.
+        **Nunca** `restic-password`; `restic.env` solo con pedido explícito
+        (el módulo lo pregunta, por defecto No); `dokploy.env` nunca.
+      - Contenedores que no existen (equipo nuevo): se restauran los datos y se
+        avisa qué módulos ejecutar (y Dokploy primero si Docker no está).
+      - Recuperación ante un desastre: reinstalar Ubuntu y el HLI, ejecutar
+        `backup-setup` con la **misma contraseña de restic** ("Recuperación
+        ante un desastre"; no inicializa un repositorio de R2 existente: lo
+        comprueba con `restic cat config` y se niega si la contraseña no lo
+        abre) y restaurar "todo" desde R2 (procedimiento completo en
+        docs/VALIDACION.md, prueba 80).
+      - Resultado en `/var/lib/hli2-root/restore-status` (0644, sin secretos) y
+        en `/var/log/hli2/backup.log`. Supuestos de restic 0.16.4 sin verificar
+        en hardware: `restore <id> --target <dir> --include <ruta-absoluta>`
+        (crea `<dir>` y restaura la ruta con todo su contenido bajo
+        `<dir>/<ruta>`), `snapshots --json` con `id`, `short_id`, `time` y
+        `tags`, y `snapshots --tag T <id-corto>`.
 - [ ] **Estado visible**: resultado del último backup (fecha, OK/error, qué
       copia falló) legible por el usuario y mostrado en el dashboard del HLI.
       Avisos por Telegram: v2.6.
 - [ ] Verificación en el M70q: backup manual, backup del timer, restaurar
       Vaultwarden desde local y desde R2 a una fecha anterior, y un
-      "restaurar todo" de prueba en la X230.
+      "restaurar todo" de prueba en la X230 (docs/VALIDACION.md, pruebas
+      48-80; la validación en hardware sigue pendiente).
 
 ### v2.6 — Agente IA siempre activo (opcional)
 

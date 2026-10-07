@@ -197,7 +197,62 @@ Nota: `/etc/hli2/restic.env` (claves de R2) **sí** se respalda, cifrado dentro 
 los repositorios: hace falta para recuperarse de un desastre. La contraseña de
 restic **no** se respalda (vive en Vaultwarden y en papel).
 
-Pendiente (parte 2 de v2.5): restaurar desde el menú.
+#### Restaurar (v2.5, parte 2)
+
+Herramientas → "Restaurar un backup" (`modules/backup-restore.sh`). Requisitos:
+al menos un backup hecho (pruebas 52 y 56). Preparación: en Vaultwarden, crear
+un elemento de prueba **antes** del backup y otro **después**, para ver a qué
+fecha vuelve.
+
+| # | Prueba | Resultado esperado |
+|---|---|---|
+| 67 | Con el elemento A creado, "Hacer backup ahora"; crear el elemento B; "Restaurar un backup" → Copia local → la foto más nueva → Vaultwarden. Aceptar el resumen y **aceptar** el backup de seguridad | El resumen dice qué se reemplaza y la fecha de la foto; corre un backup de seguridad (sin retención); Vaultwarden se detiene unos segundos y vuelve (`docker ps`); resultado "correcto". Vaultwarden muestra A y **no** B. `sudo ls -d /srv/appdata/vaultwarden/data*` solo muestra `data` (con backup de seguridad no queda copia previa) |
+| 68 | Repetir 67 pero **rechazando** el backup de seguridad | Resultado "correcto"; `sudo ls -d /srv/appdata/vaultwarden/data*` muestra también `data.hli2-before-restore-<fecha>` con lo anterior (el elemento B sigue ahí); el log lo avisa |
+| 69 | Con el menú de fechas abierto, comprobar el orden y el formato | La más nueva primero, fecha y hora legibles (`2026-10-05 04:00`), con el id corto; solo fotos del repositorio elegido |
+| 70 | Restaurar Vaultwarden a una fecha **anterior** (la 2.ª foto de la lista) | Vuelve al estado de esa fecha; ningún contenedor de otro servicio se detiene (`docker ps`, `sudo tail -f /var/log/hli2/backup.log`) |
+| 71 | Restaurar Vaultwarden desde **R2** (origen: copia externa), foto más nueva | Mismo resultado que 67 (el log dice "Foto <id> (<fecha>)"); el origen en el resumen es "copia externa (R2)" |
+| 72 | OpenCloud desde R2 | El resumen avisa que los archivos de OpenCloud **no están** en la copia externa; solo se restaura su configuración (`/srv/appdata/opencloud/config`); `data` no se toca y el resultado es "con avisos" con el motivo |
+| 73 | OpenCloud desde la copia local | Restaura config **y** data; resultado "correcto" |
+| 74 | `sudo hli2-backup restore --source local --snapshot 'x;id' --target all` y `--target ../x` (con `sudo /usr/local/lib/hli2/bin/hli2-backup`) | Se niega con código 2 y no toca nada (`docker ps`, carpetas) |
+| 75 | Cortar la restauración a medias: `sudo kill -TERM $(pgrep -f 'hli2-backup restore')` mientras `sudo tail -f /var/log/hli2/backup.log` muestre "Restaurando" | Los contenedores detenidos vuelven a iniciar solos; `cat /var/lib/hli2-root/restore-status` dice `result=interrupted`; los datos siguen como estaban y no queda `*.hli2-restore-tmp` |
+| 76 | Restaurar con un backup en curso (`sudo systemctl start hli2-backup.service` y, mientras corre, lanzar la restauración) | Espera el bloqueo (hasta 2 min) o lo rechaza con "Otro backup o restauración mantiene el bloqueo"; no se pisan |
+| 77 | Restaurar **AdGuard** | Se detiene y vuelve; el DNS de la casa responde de nuevo (`dig @<IP> ejemplo.com`); panel en :3053 con la configuración de la foto |
+| 78 | Restaurar **Samba** (smb.conf) | `systemctl is-active smbd` → `active`; el recurso compartido responde |
+| 79 | `cat /var/lib/hli2-root/restore-status` | Legible sin sudo; fecha, `result`, origen, foto, destino, `message`; ningún secreto |
+| 80 | **Simulacro en la X230 (recuperación ante un desastre)**: procedimiento de abajo, con "Todo" desde R2 | Los servicios que existen se restauran; el aviso final lista los módulos que faltan; tras ejecutarlos, cada servicio arranca con sus datos |
+
+**Procedimiento de recuperación ante un desastre (también es la prueba 80)**
+
+1. Instalar Ubuntu Server y el HLI 2 (`bootstrap.sh`); montar el disco de media
+   con el módulo `datadisk`/`storage`. **Mismo nombre de equipo** que el
+   original si es posible (la retención agrupa por equipo: con otro nombre, las
+   fotos viejas de R2 no se podan nunca; se limpian a mano con `restic forget`).
+2. Ejecutar `backup-setup`. En "Contraseña de los backups" elegir
+   **"Recuperación ante un desastre"** e ingresar (dos veces) **la misma
+   contraseña de restic** guardada en Vaultwarden o en papel. Configurar R2 con
+   el **mismo bucket** (endpoint, bucket y claves). `backup-setup` NO
+   inicializa nada que ya exista: comprueba el repositorio de R2 con
+   `restic cat config`, y si la contraseña no lo abre, se niega (no inicializa
+   encima). El repositorio local sí se crea nuevo (vacío).
+3. Herramientas → "Restaurar un backup" → **copia externa (R2)** → la foto más
+   nueva → **Todo**. Se restauran todos los servicios con datos, `smb.conf` y los
+   secretos de los servicios de `/etc/hli2`. **No** se tocan `restic-password`
+   (nunca viaja en los backups), `restic.env` (se acaba de configurar en el paso
+   2) ni `dokploy.env` (describe la instancia de Dokploy anterior; en el equipo
+   nuevo es otra). Los archivos de OpenCloud no están en R2 (solo en la copia
+   local): si el disco original no se recuperó, esa parte se pierde por diseño.
+4. Instalar Dokploy (módulo `dokploy`, y `dokploy-api` si lo pide) y luego los
+   módulos que indique el aviso final ("Falta: ... ejecute sus módulos: ...").
+   Cada módulo despliega el contenedor y encuentra sus datos y secretos ya en
+   su lugar (reutiliza el secreto existente: no pide uno nuevo).
+5. Comprobar el dashboard y hacer "Hacer backup ahora": la primera subida a R2
+   desde el equipo nuevo vuelve a enviar todo (el repositorio local nuevo tiene
+   otros parámetros de troceado, así que no se deduplica contra lo ya subido).
+
+Qué NO restaura "Todo": el estado del propio HLI (`/var/lib/hli2`, los módulos
+marcados como hechos) ni su configuración (`config/`): vuelven al reinstalar el
+HLI. Tampoco `tailscale` ni Cloudflare Tunnel (sin datos en backups: se
+reconfiguran con sus módulos).
 
 ### Energía (correr primero)
 
