@@ -78,7 +78,7 @@ test_backup_restarts_containers_when_interrupted() {
   export STUB_RESTIC_KILL_ON="backup"
   _bk_run run || true
   local left
-  left="$(rg --files "$STUB_DOCKER_STATE_DIR" 2>/dev/null || true)"
+  left="$(_bk_files_in "$STUB_DOCKER_STATE_DIR")"
   [[ -z "$left" ]] || { fail "quedaron contenedores detenidos: $left"; return 1; }
   [[ -n "$(_bk_calls '^docker\tstart\t')" ]] || { fail "no hubo ningún docker start"; return 1; }
 }
@@ -539,7 +539,7 @@ test_backup_second_signal_does_not_abort_restart() {
   _bk_prepare
   export STUB_RESTIC_KILL_ON="backup" STUB_DOCKER_KILL_ON_START=1
   _bk_run run || true
-  local left; left="$(rg --files "$STUB_DOCKER_STATE_DIR" 2>/dev/null | rg -v '/\.' || true)"
+  local left; left="$(_bk_files_in "$STUB_DOCKER_STATE_DIR" \'/\.\')"
   [[ -z "$left" ]] || { fail "una segunda señal dejó contenedores detenidos: $left"; return 1; }
   [[ -f "$STUB_DOCKER_STATE_DIR/.killed" ]] || { fail "no se envió la segunda señal (test vacío)"; return 1; }
   assert_eq "4" "$(_bk_calls '^docker\tstart\t' | wc -l | tr -d ' ')" "los 4 contenedores volvieron a iniciar" || return 1
@@ -549,7 +549,7 @@ test_backup_restart_retries_until_container_is_really_running() {
   _bk_prepare
   export STUB_DOCKER_START_IGNORED=1 HLI2_BACKUP_RESTART_WAIT=4
   _bk_run run || { fail "debió terminar bien tras reintentar"; return 1; }
-  assert_eq "" "$(rg --files "$STUB_DOCKER_STATE_DIR" 2>/dev/null | rg -v '/\.' || true)" "todo quedó corriendo" || return 1
+  assert_eq "" "$(_bk_files_in "$STUB_DOCKER_STATE_DIR" \'/\.\')" "todo quedó corriendo" || return 1
   local n; n="$(_bk_calls '^docker\tstart\tvaultwarden$' | wc -l | tr -d ' ')"
   (( n >= 2 )) || { fail "no reintentó docker start (n=$n)"; return 1; }
   assert_eq "ok" "$(_bk_status result)" || return 1
@@ -702,7 +702,7 @@ test_backup_setup_removes_password_tempfile_when_interrupted() {
   printf 'yes\nno\n' > "$DIALOG_YESNO_QUEUE"
   timeout 30 bash "$REPO_ROOT/modules/backup-setup.sh" || true
   assert_file_contains "$STUB_TEXTBOX_LOG" "CONTRASEÑA" "el textbox llegó a mostrarse (test no vacío)" || return 1
-  assert_eq "" "$(rg --files "$TMPDIR" 2>/dev/null || true)" "no queda el archivo con la contraseña" || return 1
+  assert_eq "" "$(_bk_files_in "$TMPDIR")" "no queda el archivo con la contraseña" || return 1
 }
 
 test_backup_setup_writes_password_atomically() {
@@ -752,7 +752,7 @@ test_backup_status_is_running_during_the_run_and_interrupted_when_killed() {
   _bk_run run || true
   assert_file_contains "$STUB_RESTIC_PROBE" "result=running" "estado 'running' mientras corre" || return 1
   assert_eq "interrupted" "$(_bk_status result)" "una corrida cortada no deja un 'ok' viejo" || return 1
-  assert_eq "" "$(rg --files "$TMPDIR" 2>/dev/null || true)" "el temporal de salida de restic se borró en la señal" || return 1
+  assert_eq "" "$(_bk_files_in "$TMPDIR")" "el temporal de salida de restic se borró en la señal" || return 1
 }
 
 test_backup_previous_ok_status_does_not_survive_a_killed_run() {
@@ -829,7 +829,7 @@ test_backup_run_keeps_unrecoverable_leftovers_in_the_list() {
   assert_eq "legacy" "$(cat "$BACKUP_STATE_DIR/recovery-containers")" "lo no recuperable no se pisa ni se borra" || return 1
   assert_contains "$(_bk_status message)" "sin iniciar" || return 1
   # Lo detenido por esta corrida sí volvió.
-  assert_eq "" "$(rg --files "$STUB_DOCKER_STATE_DIR" 2>/dev/null | rg -v '/\.|legacy' || true)" || return 1
+  assert_eq "" "$(_bk_files_in "$STUB_DOCKER_STATE_DIR" \'/\.|legacy\')" || return 1
 }
 
 test_backup_recover_drops_containers_that_no_longer_exist() {
@@ -876,7 +876,7 @@ test_backup_setup_aborts_confirmation_loop_without_a_terminal() {
   if timeout 30 bash "$REPO_ROOT/modules/backup-setup.sh"; then fail "debió abortar tras N intentos"; return 1; fi
   assert_eq "10" "$(grep -c "CONTRASEÑA DE CIFRADO" "$STUB_TEXTBOX_LOG")" "tope de intentos" || return 1
   assert_file_not_contains "$STATE_FILE" "backup-password-confirmed" "sin confirmar no se marca" || return 1
-  assert_eq "" "$(rg --files "$TMPDIR" 2>/dev/null || true)" || return 1
+  assert_eq "" "$(_bk_files_in "$TMPDIR")" || return 1
 }
 
 test_backup_setup_cleans_password_stage_when_move_fails() {

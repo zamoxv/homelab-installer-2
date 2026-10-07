@@ -62,3 +62,19 @@ _bk_setup_env() {
   rm -rf "$BACKUP_ROOT"
   echo "new" > "$DIALOG_MENU_QUEUE"      # instalación nueva (no recuperación ante un desastre)
 }
+
+
+# Archivos bajo $1 (uno por línea), sin los que calzan con la expresión $2 (opcional). Un
+# error de 'rg' (directorio inexistente, expresión inválida) NO se confunde con "no hay
+# archivos": devuelve 'RG-ERROR(...)' y el assert contra "" falla.
+_bk_files_in() {
+  local dir="$1" excl="${2:-}" out rc=0
+  out="$(rg --files -- "$dir" 2>&1)" || rc=$?
+  if [[ "$rc" -gt 1 ]]; then printf 'RG-ERROR(%s): %s' "$rc" "$out"; return 0; fi
+  if [[ -n "$excl" ]]; then
+    rc=0
+    out="$(printf '%s\n' "$out" | rg -v -- "$excl" 2>&1)" || rc=$?
+    if [[ "$rc" -gt 1 ]]; then printf 'RG-ERROR(%s): %s' "$rc" "$out"; return 0; fi
+  fi
+  printf '%s' "$out"
+}

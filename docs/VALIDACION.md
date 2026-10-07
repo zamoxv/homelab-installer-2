@@ -233,8 +233,36 @@ fecha vuelve.
 | 92 | Tras 83, `cat /var/lib/hli2-root/restore-status` y el dashboard | `result=interrupted`, `reverted=1` y el mensaje con las rutas devueltas; el dashboard y el módulo avisan "la última restauración se revirtió". Si algún `mv` de la recuperación falla, el diario queda como `restore-swap-journal.failed` (0600), el estado en `error` y no se inicia ningún contenedor ni se acepta otra restauración hasta resolverlo a mano |
 | 93 | `systemctl cat hli2-restore-journal.service`; reiniciar con un diario de prueba en `/var/lib/hli2-root` | `Before=docker.service`, `ExecStart=.../hli2-backup journal-recover`; la carpeta vuelve a su lugar antes de que arranque ningún contenedor (`journalctl -b -u hli2-restore-journal`) |
 | 94 | `sudo ls -ld /etc/hli2-old-secrets` tras restaurar "todo" | `drwx------ root`, junto a `/etc/hli2` (mismo sistema de archivos) y **fuera** de él: los secretos viejos no entran en los backups (`sudo restic ... ls <foto> \| grep old-secrets` → nada) |
+| 96 | Primera configuración con un bucket de R2 **nuevo y vacío**, si restic responde algo que `backup-setup` no reconoce | Pregunta "¿El bucket es nuevo y está vacío?" (por defecto **No**); solo con "Sí" inicializa (`init --r2-assume-new`). En una recuperación ante un desastre la pregunta **no** aparece: es un error. Un 403, claves inválidas o falta de red nunca la ofrecen |
+| 97 | Sin `/etc/hli2` accesible o con otro `hli2-backup` tomando el bloqueo durante el arranque | `systemctl status hli2-restore-journal` queda `failed` (no "éxito" con el dato sin devolver) |
 | 95 | Con las claves de R2 equivocadas o sin red, `sudo /usr/local/lib/hli2/bin/hli2-backup init` en un equipo sin repositorio local | "no se pudo comprobar el repositorio de R2 ... No se inicializó nada": ni el local ni el de R2 |
 | 91 | Restaurar `smb.conf` con `testparm` instalado | Valida la copia de la carpeta de paso antes de reemplazar la actual; una configuración inválida se rechaza sin tocar la actual |
+
+**Diario `.failed` (una restauración que no se pudo revertir)**
+
+Si tras un corte de luz la recuperación no puede devolver una carpeta a su lugar (o el
+diario tiene líneas que no reconoce), el diario queda como
+`/var/lib/hli2-root/restore-swap-journal.failed` (0600) y el dashboard muestra
+"RESTAURACIÓN SIN REVERTIR". Mientras exista: los contenedores de los servicios
+afectados **no se inician** (los demás sí, en cada llamada de `recover`/`run`/arranque),
+los backups siguen tomando fotos pero **no podan** ningún repositorio, y no se acepta
+otra restauración. Para resolverlo a mano:
+
+```bash
+sudo cat /var/lib/hli2-root/restore-swap-journal.failed      # columnas: destino  copia  había(1|0)
+# Por cada línea con había=1 (lo anterior está apartado en <copia>):
+sudo rm -rf '<destino>'                    # solo si existe (datos nuevos a medias)
+sudo mv -T '<copia>' '<destino>'           # devuelve lo anterior a su lugar
+# Por cada línea con había=0 (no existía nada antes):
+sudo rm -rf '<destino>'
+# Cuando todo esté en su lugar:
+sudo rm /var/lib/hli2-root/restore-swap-journal.failed
+sudo /usr/local/lib/hli2/bin/hli2-backup recover      # ahora sí inicia los contenedores
+```
+
+Las copias de los `.env` viven en `/etc/hli2-old-secrets/` (en la versión anterior estaban en
+`/var/lib/hli2-root/restore-old-secrets/`; el validador acepta ambas, pero esas se devuelven
+con `mv`, no con un renombrado atómico).
 
 **Procedimiento de recuperación ante un desastre (también es la prueba 80)**
 

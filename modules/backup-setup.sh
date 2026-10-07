@@ -310,12 +310,18 @@ AWS_DEFAULT_REGION=auto"; then
 # Sin NoNewPrivileges: el backup usa 'sudo' (hli_docker, lib/secrets.sh) aun
 # corriendo como root, y ese flag lo rompería.
 _backup_install_units() {
-  case "$BACKUP_INSTALL_DIR" in
-    *[[:space:]%\"\']*)
-      msg "La ruta de instalación del backup ($BACKUP_INSTALL_DIR) tiene espacios o caracteres que systemd no admite en ExecStart."
-      return 1
-      ;;
-  esac
+  # TODAS las rutas que van a una unidad se validan ANTES de escribir ninguna: espacios,
+  # '%' y comillas rompen ExecStart/RequiresMountsFor, y no puede quedar una unidad
+  # escrita y otra no.
+  local v
+  for v in "$BACKUP_INSTALL_DIR" "$BACKUP_ROOT" "$APPDATA_ROOT" "$BACKUP_STATE_DIR" "$SECRETS_DIR"; do
+    case "$v" in
+      *[[:space:]%\"\']*)
+        msg "La ruta '$v' tiene espacios, '%' o comillas que systemd no admite en las unidades del backup. No se instaló ninguna unidad."
+        return 1
+        ;;
+    esac
+  done
   local exe="$BACKUP_INSTALL_DIR/bin/hli2-backup"
 
   printf '%s\n' \
@@ -370,12 +376,6 @@ _backup_install_units() {
   # Docker inicie ningún contenedor: si no, Docker crearía una carpeta de datos vacía
   # y el servicio arrancaría sin datos. No usa docker: solo mueve carpetas.
   local mounts="$APPDATA_ROOT $BACKUP_STATE_DIR $SECRETS_DIR"
-  case "$mounts" in
-    *[%\"\']*)
-      msg "Alguna ruta de datos tiene caracteres que systemd no admite en RequiresMountsFor."
-      return 1
-      ;;
-  esac
   printf '%s\n' \
     "[Unit]" \
     "Description=HLI 2: deshacer una restauración interrumpida antes de iniciar Docker" \
@@ -421,8 +421,19 @@ _backup_setup_main() {
     msg "La recuperación ante un desastre necesita la copia externa (R2) con los backups existentes, o un repositorio local existente, para comprobar la contraseña.\n\nConfigure R2 (mismo bucket) volviendo a correr este módulo; no se creó ningún repositorio nuevo."
     return 1
   fi
-  local out
-  if ! out="$(sudo -n "$BACKUP_INSTALL_DIR/bin/hli2-backup" init 2>&1)"; then
+  local out rc=0
+  out="$(sudo -n "$BACKUP_INSTALL_DIR/bin/hli2-backup" init 2>&1)" || rc=$?
+  if [[ "$rc" -eq 20 ]] && ! is_done "$BACKUP_DR_PENDING_KEY" && [[ "$_BACKUP_DR" -ne 1 ]]; then
+    # Respuesta ambigua de restic al comprobar R2 (ni "no existe" explícito ni un error de
+    # acceso o red). En una instalación NUEVA el bucket puede estar vacío y restic redactar
+    # distinto: se pregunta (por defecto No). En una recuperación ante un desastre nunca se
+    # ofrece: ahí un repositorio nuevo sería destruir la copia que se busca recuperar.
+    if confirm "No se pudo determinar si el bucket de R2 ya tiene un repositorio de backups.\n\n¿El bucket es nuevo y está vacío? Si confirma, se inicializará un repositorio nuevo en R2." no; then
+      rc=0
+      out="$(sudo -n "$BACKUP_INSTALL_DIR/bin/hli2-backup" init --r2-assume-new 2>&1)" || rc=$?
+    fi
+  fi
+  if [[ "$rc" -ne 0 ]]; then
     hli_error "inicialización de repositorios: $(printf '%s' "$out" | tail -n 3)"
     msg "No se pudieron inicializar los repositorios de backup:\n\n$(printf '%s' "$out" | tail -n 5)\n\nSi el disco de media no está montado aparte del sistema, móntelo y vuelva a correr este módulo."
     return 1

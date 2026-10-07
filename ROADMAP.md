@@ -623,7 +623,13 @@ Especificación acordada con el usuario (2026-10-06):
         (`hli2-restore-journal.service` → `hli2-backup journal-recover`, sin
         docker), deja constancia (`reverted=1`; el dashboard y el módulo avisan) y,
         si un `mv` falla, conserva el diario como `.failed`, deja el estado en
-        `error` y bloquea nuevas restauraciones y el inicio de contenedores.
+        `error`. Mientras ese `.failed` exista, los contenedores de los servicios
+        afectados no se inician (los demás sí), los backups no podan, no se acepta
+        otra restauración y el dashboard lo avisa (pasos a mano en
+        docs/VALIDACION.md); una línea del diario rechazada por la validación
+        también lo deja como `.failed`. Con R2 ambiguo y una instalación nueva,
+        `backup-setup` pregunta si el bucket es nuevo y está vacío (por defecto No;
+        `init --r2-assume-new`); nunca en una recuperación.
       - Un backup (timer) que espera el bloqueo durante una restauración
         termina bien: no refresca la fecha del último backup real ni pisa su
         resultado, solo anota `last_skip` ("restauración en curso") en el estado y

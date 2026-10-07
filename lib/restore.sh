@@ -81,6 +81,9 @@ RESTORE_OLD_REGISTRY="$BACKUP_STATE_DIR/restore-old-copies"
 # Junto a /etc/hli2 (mismo sistema de archivos: el 'mv' es un renombrado, nunca una
 # copia a medias) y fuera de él (no entra en los backups, que respaldan /etc/hli2).
 RESTORE_OLD_SECRETS_DIR="${SECRETS_DIR}-old-secrets"
+# Capa antigua (mismo estado de root, otro sistema de archivos): los validadores la
+# aceptan para poder borrar/identificar esas copias; revertirlas a mano si hace falta.
+RESTORE_OLD_SECRETS_DIR_LEGACY="$BACKUP_STATE_DIR/restore-old-secrets"
 RESTORE_OLD_TS_RE='[0-9]{8}-[0-9]{6}'
 RESTORE_JOURNAL_FAILED="$BACKUP_STATE_DIR/restore-swap-journal.failed"
 RESTORE_SPACE_MARGIN_PCT=10
@@ -737,10 +740,15 @@ _restore_journal_write() {
   for (( i = 0; i < ${#RS_PLAN_DST[@]}; i++ )); do
     printf '%s\t%s\t%s\n' "${RS_PLAN_DST[$i]}" "${RS_PLAN_OLD[$i]}" "${RS_PLAN_HAD[$i]}"
   done > "$tmp" || { rm -f "$tmp"; return 1; }
-  # Duradero antes del primer 'mv': archivo, renombrado y entrada de directorio.
-  _restore_sync -- "$tmp"
+  # Duradero antes del primer 'mv': archivo, renombrado y entrada de directorio. Si el
+  # 'sync' falla no hay garantía de que el diario sobreviva a un corte: error, y no se
+  # hace ningún 'mv'.
+  if ! sync -- "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
   mv -f -- "$tmp" "$RESTORE_JOURNAL" || return 1
-  _restore_sync -f -- "$BACKUP_STATE_DIR"
+  sync -f -- "$BACKUP_STATE_DIR" 2>/dev/null || { rm -f -- "$RESTORE_JOURNAL"; return 1; }
 }
 
 _restore_journal_clear() {
@@ -772,7 +780,8 @@ _restore_dst_allowed() {
 _restore_old_name_ok() {
   local dst="$1" old="$2" ts
   if [[ "$dst" == "$SECRETS_DIR/"* ]]; then
-    [[ "$old" == "$RESTORE_OLD_SECRETS_DIR/$(basename -- "$dst")$RESTORE_OLD_SUFFIX-"* ]] || return 1
+    [[ "$old" == "$RESTORE_OLD_SECRETS_DIR/$(basename -- "$dst")$RESTORE_OLD_SUFFIX-"* \
+       || "$old" == "$RESTORE_OLD_SECRETS_DIR_LEGACY/$(basename -- "$dst")$RESTORE_OLD_SUFFIX-"* ]] || return 1
     ts="${old##*"$RESTORE_OLD_SUFFIX"-}"
   else
     [[ "$old" == "$dst$RESTORE_OLD_SUFFIX-"* ]] || return 1
@@ -788,6 +797,8 @@ _restore_old_to_dst() {
   base="${BASH_REMATCH[1]}"
   if [[ "$base" == "$RESTORE_OLD_SECRETS_DIR/"* ]]; then
     printf '%s/%s' "$SECRETS_DIR" "${base#"$RESTORE_OLD_SECRETS_DIR"/}"
+  elif [[ "$base" == "$RESTORE_OLD_SECRETS_DIR_LEGACY/"* ]]; then
+    printf '%s/%s' "$SECRETS_DIR" "${base#"$RESTORE_OLD_SECRETS_DIR_LEGACY"/}"
   else
     printf '%s' "$base"
   fi
@@ -809,16 +820,20 @@ _restore_old_to_dst() {
 restore_journal_recover() {
   RS_JOURNAL_FAILED=0
   [[ -s "$RESTORE_JOURNAL" ]] || return 0
-  local dst old had i failed="" reverted=""
+  local dst old had i failed="" reverted="" invalid=0
   local -a D=() O=() H=()
   while IFS=$'\t' read -r dst old had; do
     if _restore_path_ok "$dst" && _restore_path_ok "$old" && [[ "$had" =~ ^[01]$ ]] \
        && _restore_dst_allowed "$dst" && _restore_old_name_ok "$dst" "$old"; then
       D+=("$dst") O+=("$old") H+=("$had")
     else
-      _backup_log "Recuperación: línea inválida en el diario de restauración, se ignora"
+      _backup_log "Recuperación: línea inválida en el diario de restauración (no se toca nada por ella)"
+      invalid=$(( invalid + 1 ))
     fi
   done < "$RESTORE_JOURNAL"
+  # Una línea rechazada puede ser una carpeta que quedó sin devolver: el diario NO se
+  # borra (se conserva como .failed para resolverlo a mano).
+  [[ "$invalid" -eq 0 ]] || failed="$invalid línea(s) inválida(s) del diario"
   _backup_log "Recuperación: se deshace una restauración que quedó a medias"
   for (( i = ${#D[@]} - 1; i >= 0; i-- )); do
     if [[ "${H[$i]}" == "1" ]]; then
@@ -863,6 +878,29 @@ restore_journal_recover() {
   RS_JOURNAL_REVERTED="$reverted"
   _restore_status_write_raw interrupted "$(restore_status_get source)" "$(restore_status_get snapshot)" "$(restore_status_get snapshot_time)" \
     "$(restore_status_get target)" "" "la restauración quedó a medias (corte de luz o proceso terminado) y se revirtió: ${reverted:-nada que devolver}" 1 || true
+  return 0
+}
+
+# Contenedores de los servicios cuyas rutas figuran en el diario .failed (una restauración
+# que no se pudo revertir): NO se inician mientras el archivo exista, para que no arranquen
+# sobre datos a medias. Los demás servicios no se ven afectados (AdGuard, el DNS de la casa,
+# no puede quedar rehén de un servicio ajeno). Un contenedor por línea.
+restore_journal_blocked_containers() {
+  [[ -f "$RESTORE_JOURNAL_FAILED" ]] || return 0
+  local dst old had id p
+  local -a dsts=()
+  while IFS=$'\t' read -r dst old had; do
+    [[ -z "$dst" ]] || dsts+=("$dst")
+  done < "$RESTORE_JOURNAL_FAILED"
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    [[ "$(service_get "$id" KIND)" == "container" ]] || continue
+    while IFS= read -r p; do
+      for dst in "${dsts[@]}"; do
+        if [[ "$p" == "$dst" ]]; then service_get "$id" CONTAINER; break 2; fi
+      done
+    done < <(service_get "$id" DATA)
+  done < <(service_list)
   return 0
 }
 

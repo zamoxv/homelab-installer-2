@@ -17,7 +17,7 @@
 #                    exista ahí (lo que no está "no está en la foto").
 #                    STUB_RESTIC_FIXTURE_R2 lo reemplaza para los repos s3.
 #   STUB_RESTIC_CAT_WRONG_PW=1                'cat config' falla con "wrong password".
-#   STUB_RESTIC_CAT_ERROR=<403|badkey|sig|timeout|refused|bucket|dns|1>
+#   STUB_RESTIC_CAT_ERROR=<403|badkey|sig|timeout|refused|bucket|dns|weird|missingurl|1>
 #                    'cat config' de R2 falla por acceso/red (NO es "no hay repositorio").
 #   STUB_RESTIC_CAT_EXIT10=1                  'cat config' de R2 sale con 10 (restic >= 0.17: no existe).
 #   STUB_RESTIC_KILL_ON="backup"              envía TERM al proceso bin/hli2-backup
@@ -98,6 +98,8 @@ case "$sub" in
         sig) printf 'Fatal: unable to open config file: Stat: SignatureDoesNotMatch\nIs there a repository at the following location?\n' >&2; exit 1 ;;
         timeout) printf 'Fatal: unable to open config file: Stat: Get "https://r2": context deadline exceeded (i/o timeout)\nIs there a repository at the following location?\n' >&2; exit 1 ;;
         refused) printf 'Fatal: unable to open config file: dial tcp 127.0.0.1:443: connect: connection refused\nIs there a repository at the following location?\n' >&2; exit 1 ;;
+        weird) printf 'Fatal: unexpected response from the server\nIs there a repository at the following location?\n%s\n' "${RESTIC_REPOSITORY:-}" >&2; exit 1 ;;
+        missingurl) printf 'Fatal: unable to open config file: Stat: s3:%s: The specified key does not exist.\n' "${RESTIC_REPOSITORY:-}" >&2; exit 1 ;;
         bucket) printf 'Fatal: unable to open config file: Stat: The specified bucket does not exist.\nIs there a repository at the following location?\n' >&2; exit 1 ;;
         *) printf 'Fatal: unable to open config file: dial tcp: lookup r2: no such host\nIs there a repository at the following location?\n' >&2; exit 1 ;;
       esac

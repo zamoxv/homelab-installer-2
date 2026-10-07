@@ -70,6 +70,10 @@ BK_RESULT="ok" BK_LOCAL="ok" BK_CLOUD="not-configured" BK_CHECK="skipped"
 BK_ID_FULL="" BK_ID_CLOUD="" BK_MSG="" BK_ACTIVE=0 BK_WARMUP_ID=""
 BK_TMP_FILES=()
 BK_NO_RETENTION=0
+# 'init --r2-assume-new': el usuario confirmó que el bucket de R2 es nuevo y está vacío.
+BK_R2_ASSUME_NEW=0
+# Código de salida de 'init' cuando la comprobación de R2 es ambigua (backup-setup pregunta).
+BACKUP_INIT_RC_AMBIGUOUS=20
 # Solo para el estado de un backup omitido (ver bin/hli2-backup): conserva la fecha
 # del último intento REAL y anota cuándo se omitió el último.
 BK_TS="" BK_LAST_SKIP=""
@@ -415,21 +419,27 @@ backup_restart_stopped() {
 # luz). Al inicio de cada 'run', en 'hli2-backup recover' (ExecStopPost y
 # arranque del equipo). Devuelve 1 si algo no pudo levantarse.
 backup_recover() {
-  local c bad=0
+  local c bad=0 blocked
   local -a names=()
   # Una restauración que murió a medias se deshace ANTES de iniciar nada (ver
   # lib/restore.sh): sin eso Docker crearía carpetas vacías donde falta la de datos.
   if ! restore_journal_recover; then
-    # No se pudo devolver algún dato a su lugar: iniciar los contenedores haría que
-    # Docker cree carpetas vacías. Quedan detenidos (y en la lista) hasta resolverlo.
-    hli_error "no se pudo deshacer una restauración interrumpida: los contenedores no se inician (ver restore-swap-journal.failed en $BACKUP_STATE_DIR)"
-    return 1
+    hli_error "no se pudo deshacer una restauración interrumpida (ver restore-swap-journal.failed en $BACKUP_STATE_DIR)"
+    bad=1
   fi
-  [[ -s "$BACKUP_RECOVERY_FILE" ]] || return 0
+  # Mientras exista el diario .failed, los contenedores de los servicios afectados NO se
+  # inician (ni ahora ni en las siguientes llamadas); los demás sí.
+  blocked=" $(restore_journal_blocked_containers | tr '\n' ' ') "
+  [[ -s "$BACKUP_RECOVERY_FILE" ]] || return "$bad"
   while IFS= read -r c; do
     if [[ "$c" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then names+=("$c"); fi
   done < "$BACKUP_RECOVERY_FILE"
   for c in "${names[@]}"; do
+    if [[ "$blocked" == *" $c "* ]]; then
+      _backup_log "Recuperación: NO se inicia '$c': su restauración quedó sin revertir (resuélvala y borre restore-swap-journal.failed)"
+      bad=1
+      continue
+    fi
     _backup_log "Recuperación: iniciando '$c' (quedó detenido por un backup anterior)"
     # Lo que levanta sale de la lista; lo que no, se conserva para el próximo intento.
     if _backup_restart_container "$c" </dev/null; then
@@ -438,7 +448,7 @@ backup_recover() {
       bad=1
     fi
   done
-  [[ "$bad" -eq 0 ]]
+  return "$bad"
 }
 
 # Boot/ExecStopPost: una corrida que murió dejó 'running' en el estado; se
@@ -703,6 +713,12 @@ _backup_res_es() {
 # Texto del estado del último backup, para el dashboard y backup-now.
 backup_status_summary() {
   local ts res msg when age
+  if [[ -e "$RESTORE_JOURNAL_FAILED" ]]; then
+    printf '  !! RESTAURACIÓN SIN REVERTIR: una restauración quedó a medias y no se pudo deshacer.\n'
+    printf '     Los servicios afectados siguen DETENIDOS y no se podan los backups. Devuelva a mano\n'
+    printf '     cada carpeta desde su copia .hli2-before-restore-* y borre %s\n' "$RESTORE_JOURNAL_FAILED"
+    printf '     (pasos exactos: docs/VALIDACION.md, "Diario .failed"). Detalle: %s\n' "$(restore_status_get message)"
+  fi
   if [[ ! -r "$BACKUP_STATUS_FILE" ]]; then
     printf '  Último backup : sin backups todavía\n'
     return 0
@@ -775,6 +791,14 @@ backup_run() {
     _backup_msg_add "quedaron contenedores sin iniciar de una corrida anterior"
   fi
 
+  if [[ -e "$RESTORE_JOURNAL_FAILED" ]]; then
+    # Hay una restauración sin revertir: las fotos se siguen tomando, pero NO se poda
+    # ningún repositorio (podría borrar justo las fotos buenas anteriores).
+    BK_NO_RETENTION=1
+    _backup_worse warning
+    _backup_msg_add "retención omitida: hay una restauración sin revertir (restore-swap-journal.failed); resuélvala y borre ese archivo"
+  fi
+
   if ! _backup_preflight; then
     BK_RESULT=error BK_LOCAL=error BK_CLOUD=skipped
     _backup_log "ERROR: $BK_MSG"
@@ -831,31 +855,36 @@ backup_run() {
   [[ "$BK_RESULT" != "error" ]]
 }
 
-# ¿La salida de 'restic cat config' ($2, código $1) dice POSITIVAMENTE que el
-# repositorio no existe? Solo entonces se inicializa. Restic >= 0.17 devuelve el
-# código 10 para eso; en 0.16 se exige un marcador explícito de "no encontrado"
-# (clave S3 inexistente / NoSuchKey) y la ausencia de marcadores de acceso o red:
-# el aviso "Is there a repository at the following location?" lo imprime restic
-# también ante un 403 o un fallo de DNS, así que por sí solo no prueba nada.
-# Cualquier ambigüedad es un error (nunca se inicializa a ciegas).
-_backup_r2_repo_missing() {
-  local rc="$1" out="" line
-  # Sin las líneas con la URL del repositorio: el id de cuenta (hexadecimal al
-  # azar) podría contener "403" o "401" y confundir la detección.
-  while IFS= read -r line; do
-    case "$line" in *"s3:"*|*"https://"*|*"http://"*) continue ;; esac
-    out+="${line,,}"$'\n'
-  done <<<"$2"
+# Clasifica la salida de 'restic cat config' ($2, código $1) cuando NO pudo abrir el
+# repositorio de R2 ni dijo "contraseña equivocada". Imprime:
+#   missing    positivo y explícito: el repositorio no existe (código 10 de restic >= 0.17,
+#              o "specified key does not exist"/NoSuchKey de la clave S3 de 0.16);
+#   blocked    hay un marcador de acceso, red o bucket (403, claves inválidas, DNS, timeout...);
+#   ambiguous  ninguna de las dos.
+# El aviso "Is there a repository at the following location?" lo imprime restic también
+# ante un 403 o un fallo de DNS, así que por sí solo no prueba nada. Las URL se quitan del
+# texto (no la línea entera): el id de cuenta, hexadecimal al azar, podría contener "403"
+# o "401" y confundir la detección sin perder el "Fatal ... does not exist" de esa línea.
+_backup_r2_cat_state() {
+  local rc="$1" out
+  out="$(printf '%s\n' "$2" | sed -E 's#(s3:)?https?://[^[:space:]]*# #g')"
+  out="${out,,}"
   case "$out" in
-    *403*|*forbidden*|*accessdenied*|*"access denied"*|*invalidaccesskeyid*|*signaturedoesnotmatch*|*unauthorized*|*401*|*"no such host"*|*timeout*|*"timed out"*|*"connection refused"*|*"dial tcp"*|*x509*|*"tls:"*|*nosuchbucket*|*"specified bucket"*|*"temporary failure"*|*"network is unreachable"*)
-      return 1
+    *403*|*forbidden*|*accessdenied*|*"access denied"*|*invalidaccesskeyid*|*signaturedoesnotmatch*|*unauthorized*|*401*|*"no such host"*|*timeout*|*"timed out"*|*"deadline exceeded"*|*"connection refused"*|*"dial tcp"*|*x509*|*"tls:"*|*nosuchbucket*|*"specified bucket"*|*"temporary failure"*|*"network is unreachable"*)
+      echo blocked
+      return 0
       ;;
   esac
-  [[ "$rc" -eq 10 ]] && return 0
+  if [[ "$rc" -eq 10 ]]; then echo missing; return 0; fi
   case "$out" in
-    *"specified key does not exist"*|*nosuchkey*) return 0 ;;
+    *"specified key does not exist"*|*nosuchkey*) echo missing; return 0 ;;
   esac
-  return 1
+  echo ambiguous
+}
+
+# 0 si la salida dice POSITIVAMENTE que el repositorio no existe.
+_backup_r2_repo_missing() {
+  [[ "$(_backup_r2_cat_state "$1" "$2")" == "missing" ]]
 }
 
 # Inicializa los repositorios que falten (idempotente). Como root. Con R2
@@ -890,12 +919,28 @@ backup_init() {
       echo "ERROR: el repositorio de R2 ya existe y la contraseña de restic no lo abre. Use la MISMA contraseña con la que se crearon los backups (Vaultwarden o papel). No se inicializó nada." >&2
       _BK_R2_REPO="" _BK_R2_KEY="" _BK_R2_SECRET="" _BK_R2_REGION=""
       return 1
-    elif _backup_r2_repo_missing "$rc" "$cat_out"; then
-      r2="missing"
     else
-      echo "ERROR: no se pudo comprobar el repositorio de R2 (red, claves, bucket o endpoint). No se inicializó nada. Detalle: $(printf '%s' "$cat_out" | tail -n 2 | tr '\n' ' ')" >&2
-      _BK_R2_REPO="" _BK_R2_KEY="" _BK_R2_SECRET="" _BK_R2_REGION=""
-      return 1
+      case "$(_backup_r2_cat_state "$rc" "$cat_out")" in
+        missing) r2="missing" ;;
+        ambiguous)
+          if [[ "$BK_R2_ASSUME_NEW" == "1" ]]; then
+            # El usuario confirmó (en backup-setup, nunca en una recuperación ante un
+            # desastre) que el bucket es nuevo y está vacío: restic no dio una señal
+            # explícita, pero tampoco ningún marcador de acceso o red.
+            _backup_log "R2: respuesta ambigua; se inicializa porque se indicó que el bucket es nuevo y está vacío"
+            r2="missing"
+          else
+            echo "ERROR: no se pudo determinar si el repositorio de R2 existe (respuesta ambigua de restic). No se inicializó nada. Detalle: $(printf '%s' "$cat_out" | tail -n 2 | tr '\n' ' ')" >&2
+            _BK_R2_REPO="" _BK_R2_KEY="" _BK_R2_SECRET="" _BK_R2_REGION=""
+            return "$BACKUP_INIT_RC_AMBIGUOUS"
+          fi
+          ;;
+        *)
+          echo "ERROR: no se pudo comprobar el repositorio de R2 (red, claves, bucket o endpoint). No se inicializó nada. Detalle: $(printf '%s' "$cat_out" | tail -n 2 | tr '\n' ' ')" >&2
+          _BK_R2_REPO="" _BK_R2_KEY="" _BK_R2_SECRET="" _BK_R2_REGION=""
+          return 1
+          ;;
+      esac
     fi
   else
     r2="none"
