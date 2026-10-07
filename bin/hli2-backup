@@ -4,9 +4,17 @@
 # como root y SIEMPRE desde la copia root-owned en /usr/local/lib/hli2 (la deja
 # backup_refresh_install): root nunca ejecuta código de un checkout del usuario.
 #
-#   hli2-backup run      Backup completo (fotos locales + copia a R2 + retención).
+#   hli2-backup run [--no-retention]
+#                        Backup completo (fotos locales + copia a R2 + retención).
 #   hli2-backup init     Inicializa los repositorios que falten (idempotente).
 #   hli2-backup recover  Levanta lo que un backup interrumpido dejó detenido.
+#   hli2-backup snapshots --source local|r2
+#                        Lista las fotos restaurables (id y fecha, la más nueva
+#                        primero) por stdout; no usa el log ni el bloqueo.
+#   hli2-backup restore --source local|r2 --snapshot <id> --target <servicio|all>
+#                        [--discard-old] [--with-restic-env]
+#                        Restaura (ver lib/restore.sh). Los argumentos se
+#                        validan de forma estricta: vienen del usuario.
 #
 # Registra en $LOG_DIR/backup.log (0640 root; sin secretos) y, si hay
 # terminal, también la muestra.
@@ -43,7 +51,23 @@ if [[ "$(id -u)" -ne 0 && -z "${HLI2_BACKUP_ALLOW_NONROOT:-}" ]]; then
   exit 1
 fi
 
+_usage() {
+  echo "Uso: hli2-backup {run [--no-retention]|init|recover|snapshots --source local|r2|restore --source local|r2 --snapshot <id> --target <servicio|all>}" >&2
+  exit 2
+}
+case "${1:-}" in
+  run|recover|init|restore|snapshots) ;;
+  *) _usage ;;
+esac
+
 umask 027
+# 'snapshots' imprime su resultado por stdout para que el módulo lo capture: sin
+# redirección al log (no escribe nada en disco, ni toma el bloqueo).
+if [[ "$1" == "snapshots" ]]; then
+  restore_snapshots_main "${@:2}"
+  exit $?
+fi
+
 mkdir -p "$LOG_DIR"
 if [[ -t 1 ]]; then
   exec > >(tee -a "$LOG_DIR/backup.log") 2>&1
@@ -51,9 +75,22 @@ else
   exec >>"$LOG_DIR/backup.log" 2>&1
 fi
 
-case "${1:-}" in
-  run|recover|init) ;;
-  *) echo "Uso: hli2-backup {run|init|recover}" >&2; exit 2 ;;
+# Argumentos de cada subcomando, validados ANTES de tocar nada.
+case "$1" in
+  run)
+    for _a in "${@:2}"; do
+      case "$_a" in
+        --no-retention) BK_NO_RETENTION=1 ;;
+        *) echo "ERROR: argumento no reconocido para run: $(printf '%q' "$_a")" >&2; exit 2 ;;
+      esac
+    done
+    ;;
+  restore)
+    restore_parse_args "${@:2}" || exit 2
+    ;;
+  *)
+    [[ $# -eq 1 ]] || _usage
+    ;;
 esac
 
 if ! _backup_state_dir_ensure; then
@@ -68,7 +105,13 @@ exec 9>"$BACKUP_STATE_DIR/lock"
 # espera un rato en vez de fallar sin dejar rastro.
 if [[ "$1" == "recover" ]]; then _wait="${HLI2_BACKUP_LOCK_WAIT:-30}"; else _wait="${HLI2_BACKUP_LOCK_WAIT:-120}"; fi
 if ! flock -w "$_wait" 9; then
-  echo "Otro backup mantiene el bloqueo desde hace más de ${_wait} s."
+  echo "Otro backup o restauración mantiene el bloqueo desde hace más de ${_wait} s."
+  if [[ "$1" == "restore" ]]; then
+    RS_RESULT=error RS_MODULES="" RS_STIME=""
+    RS_MSG="no se pudo iniciar: otro backup o restauración mantiene el bloqueo"
+    _restore_status_write || true
+    exit 1
+  fi
   if [[ "$1" == "run" ]]; then
     BK_RESULT=error BK_LOCAL=skipped BK_CLOUD=skipped BK_CHECK=skipped BK_ID_FULL="" BK_ID_CLOUD=""
     BK_MSG="no se pudo iniciar: otro backup mantiene el bloqueo"
@@ -89,7 +132,15 @@ case "$1" in
   recover)
     trap backup_exit_cleanup EXIT
     backup_status_mark_stale || true
+    restore_status_mark_stale || true
     backup_recover
+    ;;
+  restore)
+    # Igual que 'run': lo detenido se levanta SIEMPRE (salida normal, error o señal).
+    trap restore_exit_cleanup EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT HUP
+    restore_run
     ;;
   init)
     backup_init

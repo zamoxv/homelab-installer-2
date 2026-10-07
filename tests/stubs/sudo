@@ -96,6 +96,16 @@ case "$sub" in
     fi
     exit 0
     ;;
+  */bin/hli2-backup)
+    # Entrypoint del backup (hli2-backup): por defecto no-op (solo se registra).
+    # STUB_SUDO_RUN_ENTRYPOINT="snapshots restore run": subcomandos que se
+    # ejecutan de verdad (como el usuario del test, con HLI2_BACKUP_ALLOW_NONROOT).
+    if [[ " ${STUB_SUDO_RUN_ENTRYPOINT:-} " == *" ${args[1]:-} "* ]]; then
+      bash "$sub" "${args[@]:1}"
+      exit $?
+    fi
+    exit 0
+    ;;
   blkid)
     echo "UUID-TEST"
     exit 0
@@ -177,9 +187,17 @@ case "$sub" in
     # scratch (los -exec resuelven por PATH: 'chown' es el stub que solo
     # registra, 'chmod' el real).
     if _stub_all_paths_safe "${args[@]:1}"; then
+      _stub_unlock_root_area
       "${args[@]}"
-      exit $?
+      rc=$?
+      _stub_relock_root_area
+      exit "$rc"
     fi
+    exit 0
+    ;;
+  systemctl)
+    # STUB_SYSTEMCTL_FAIL="try-restart cat": esos subcomandos fallan (rc 5).
+    [[ " ${STUB_SYSTEMCTL_FAIL:-} " == *" ${args[1]:-} "* ]] && exit 5
     exit 0
     ;;
   rm)

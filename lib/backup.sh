@@ -69,6 +69,7 @@ _BK_R2_REGION=""
 BK_RESULT="ok" BK_LOCAL="ok" BK_CLOUD="not-configured" BK_CHECK="skipped"
 BK_ID_FULL="" BK_ID_CLOUD="" BK_MSG="" BK_ACTIVE=0 BK_WARMUP_ID=""
 BK_TMP_FILES=()
+BK_NO_RETENTION=0
 
 _backup_log() {
   printf '[%s] %s\n' "$(date '+%F %T')" "$*"
@@ -481,6 +482,12 @@ backup_r2_load() {
   [[ -n "$_BK_R2_REPO" && -n "$_BK_R2_KEY" && -n "$_BK_R2_SECRET" ]]
 }
 
+# ¿Hay una copia externa configurada (restic.env con repositorio)? Sin cargar
+# ni exponer nada. La usan backup-setup y backup-restore.
+backup_r2_configured() {
+  secret_file_exists restic && secret_get restic RESTIC_REPOSITORY >/dev/null 2>&1
+}
+
 # Corre "$@" mostrando la salida (terminal/log) y guardándola en $1. Devuelve
 # el código de salida del comando (no el de tee).
 _backup_tee() {
@@ -572,6 +579,12 @@ _backup_warmup_forget() {
 
 _backup_forget() {
   local which="$1" rc=0
+  # 'run --no-retention' (backup de seguridad previo a una restauración): la
+  # retención podría borrar justo la foto que el usuario eligió restaurar.
+  if [[ "${BK_NO_RETENTION:-0}" == "1" ]]; then
+    _backup_log "Retención ($which) omitida (--no-retention)"
+    return 0
+  fi
   _backup_log "Retención ($which)"
   if [[ "$which" == "local" ]]; then
     _backup_restic_local forget --group-by host,tags "${BACKUP_KEEP[@]}" --prune || rc=$?
@@ -795,7 +808,18 @@ backup_init() {
     _backup_restic_local init || { echo "ERROR: no se pudo inicializar el repositorio local." >&2; return 1; }
   fi
   if backup_r2_load; then
-    if ! _backup_restic_r2 cat config >/dev/null 2>&1; then
+    local cat_out
+    cat_out="$(_backup_restic_r2 cat config 2>&1 </dev/null)" && rc=0 || rc=$?
+    if [[ "$rc" -ne 0 && "$cat_out" == *"wrong password"* ]]; then
+      # El repositorio de R2 ya existe y esta contraseña no lo abre (típico en
+      # una recuperación ante un desastre: no es la misma que se usó al crear
+      # los backups). NUNCA se intenta inicializar encima.
+      echo "ERROR: el repositorio de R2 ya existe y la contraseña de restic no lo abre. Use la MISMA contraseña con la que se crearon los backups (Vaultwarden o papel)." >&2
+      _BK_R2_REPO="" _BK_R2_KEY="" _BK_R2_SECRET="" _BK_R2_REGION=""
+      return 1
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+      rc=0
       _backup_log "Inicializando el repositorio en R2"
       # Mismos parámetros de chunking que el repo local: 'restic copy'
       # deduplica entre repos solo así.

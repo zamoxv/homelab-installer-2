@@ -192,9 +192,33 @@ msg() {
   dialog --title "HLI 2" --msgbox "$1" "$(_dlg_height "$1")" 76 || true
 }
 
+# Segundo argumento opcional "no": el botón por defecto pasa a ser "No" (para
+# acciones destructivas o dudosas: Enter sin pensar no debe confirmarlas).
 confirm() {
+  local -a flags=()
+  [[ "${2:-}" != "no" ]] || flags=(--defaultno)
   hli_busy_end
-  dialog --title "Confirmar" --yesno "$1" "$(_dlg_height "$1")" 76
+  dialog "${flags[@]}" --title "Confirmar" --yesno "$1" "$(_dlg_height "$1")" 76
+}
+
+# Menú de una sola elección: menu_box <título> <texto> <tag> <ítem> [<tag> <ítem>...]
+# Imprime el tag elegido; falla si se cancela. La altura se calcula con
+# _dlg_height (texto + una fila por opción, tope 12 visibles: el resto se
+# desplaza), nunca con altura 0, que deja el texto sin espacio.
+menu_box() {
+  local title="$1" prompt="$2" n mh h
+  shift 2
+  n=$(( $# / 2 ))
+  mh=$n
+  (( mh > 12 )) && mh=12
+  (( mh < 1 )) && mh=1
+  h="$(_dlg_height "$prompt" 76 $(( mh + 6 )))"
+  # Con una terminal chica el menú se recorta: sus filas no pueden exceder lo
+  # que queda tras el texto, los bordes y los botones.
+  (( mh > h - 7 )) && mh=$(( h - 7 ))
+  (( mh < 1 )) && mh=1
+  hli_busy_end
+  dialog --title "$title" --menu "$prompt" "$h" 76 "$mh" "$@" 3>&1 1>&2 2>&3
 }
 
 input_box() {
@@ -401,5 +425,6 @@ source "$SCRIPT_DIR/lib/compose.sh"
 source "$SCRIPT_DIR/lib/importer.sh"
 source "$SCRIPT_DIR/lib/canary.sh"
 source "$SCRIPT_DIR/lib/backup.sh"
+source "$SCRIPT_DIR/lib/restore.sh"
 
 hli_require_sudo

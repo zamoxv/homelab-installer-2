@@ -39,3 +39,32 @@ test_input_box_short_prompt_has_room_for_field() {
   h="$(_dlg_logged_height --inputbox)"
   (( h >= 8 )) || { fail "altura insuficiente para un prompt de 1 línea: $h (mínimo 8)"; return 1; }
 }
+
+test_menu_box_returns_the_chosen_tag_with_room_for_text_and_items() {
+  local out h
+  echo "r2" > "$DIALOG_MENU_QUEUE"
+  out="$( ( source "$REPO_ROOT/lib/core.sh"; v="$(menu_box T 'Línea 1\n\nLínea 3:' local "Copia local" r2 "Copia externa" x "Otra")"; echo "got:$v" ) 2>&1 )"
+  assert_contains "$out" "got:r2" "el tag elegido se captura" || return 1
+  h="$(_dlg_logged_height --menu)"
+  [[ "$h" =~ ^[0-9]+$ ]] || { fail "altura no numérica: [$h]"; return 1; }
+  # 3 líneas de texto + 3 opciones + bordes y botones.
+  (( h >= 12 )) || { fail "altura insuficiente para el menú: $h (mínimo 12)"; return 1; }
+  # El alto de la lista (4.º argumento tras --menu) coincide con las 3 opciones.
+  assert_eq "3" "$(grep -F $'\t--menu\t' "$STUB_CALL_LOG" | tail -n1 | awk -F'\t' '{for(i=1;i<=NF;i++) if($i=="--menu"){print $(i+4); exit}}')" || return 1
+}
+
+test_menu_box_cancel_fails() {
+  : > "$DIALOG_MENU_QUEUE"
+  if ( source "$REPO_ROOT/lib/core.sh"; menu_box T "Texto:" a "A" ) >/dev/null 2>&1; then
+    fail "cancelar el menú debe fallar"; return 1
+  fi
+}
+
+test_confirm_defaultno_only_when_asked() {
+  echo yes > "$DIALOG_YESNO_QUEUE"
+  ( source "$REPO_ROOT/lib/core.sh"; confirm "Seguro?" ) || { fail "confirm debió aceptar"; return 1; }
+  [[ -z "$(grep -F -- '--defaultno' "$STUB_CALL_LOG" || true)" ]] || { fail "confirm normal no lleva --defaultno"; return 1; }
+  echo yes > "$DIALOG_YESNO_QUEUE"
+  ( source "$REPO_ROOT/lib/core.sh"; confirm "Seguro?" no ) || { fail "confirm debió aceptar"; return 1; }
+  [[ -n "$(grep -F -- '--defaultno' "$STUB_CALL_LOG" || true)" ]] || { fail "confirm ... no debe llevar --defaultno"; return 1; }
+}

@@ -9,6 +9,14 @@
 #   STUB_RESTIC_FAIL="copy backup:cloud ..."  subcomandos que fallan; para
 #                    'backup' se puede filtrar por tag ('backup:cloud').
 #   STUB_RESTIC_FAIL_RC                       código de salida (default 1).
+#   STUB_RESTIC_SNAPSHOTS_FILE=<json>         lista de fotos de 'snapshots --json'
+#                    (filtra por --tag y por un id/prefijo posicional); sin
+#                    esto, el comportamiento histórico (STUB_RESTIC_HAS_FULL).
+#   STUB_RESTIC_FIXTURE=<dir>                 contenido de las fotos: 'restore'
+#                    copia <dir><ruta> a <target><ruta> por cada --include que
+#                    exista ahí (lo que no está "no está en la foto").
+#                    STUB_RESTIC_FIXTURE_R2 lo reemplaza para los repos s3.
+#   STUB_RESTIC_CAT_WRONG_PW=1                'cat config' falla con "wrong password".
 #   STUB_RESTIC_KILL_ON="backup"              envía TERM al proceso bin/hli2-backup
 #                    (el ancestro más alto) al correr ese subcomando: simula
 #                    una interrupción en plena ventana de parada.
@@ -73,14 +81,50 @@ case "$sub" in
     echo "created restic repository (stub)"
     ;;
   cat)
+    if [[ -n "${STUB_RESTIC_CAT_WRONG_PW:-}" ]]; then
+      echo "Fatal: wrong password or no key found" >&2
+      exit 1
+    fi
     if [[ "$is_r2" -eq 1 ]]; then
       [[ -f "${STUB_SAFE_ROOT:-/nonexistent}/r2-initialized" || -n "${STUB_RESTIC_R2_INITIALIZED:-}" ]] || exit 1
     fi
     ;;
   snapshots)
+    if [[ -n "${STUB_RESTIC_SNAPSHOTS_FILE:-}" ]]; then
+      sid=""
+      for a in "$@"; do
+        [[ "$a" =~ ^[0-9a-f]{8,64}$ ]] && sid="$a"
+      done
+      jq --arg tag "$tag" --arg sid "$sid" \
+        '[ .[] | select($tag == "" or (.tags | index($tag))) | select($sid == "" or (.id | startswith($sid)) or (.short_id | startswith($sid))) ]' \
+        "$STUB_RESTIC_SNAPSHOTS_FILE"
+      exit 0
+    fi
     # STUB_RESTIC_HAS_FULL=1: ya existe una foto 'full' (sin esto, la primera
     # corrida hace la pasada previa en vivo).
     if [[ -n "${STUB_RESTIC_HAS_FULL:-}" ]]; then echo '[{"short_id":"ab12cd00"}]'; else echo '[]'; fi
+    ;;
+  restore)
+    target="" includes=() prev=""
+    for a in "$@"; do
+      [[ "$prev" == "--target" ]] && target="$a"
+      [[ "$prev" == "--include" ]] && includes+=("$a")
+      prev="$a"
+    done
+    fx="${STUB_RESTIC_FIXTURE:-}"
+    [[ "$is_r2" -eq 1 && -n "${STUB_RESTIC_FIXTURE_R2:-}" ]] && fx="$STUB_RESTIC_FIXTURE_R2"
+    if [[ -z "$target" ]] || ! _stub_path_is_safe "$target"; then
+      echo "Fatal: stub restic: --target fuera del scratch" >&2
+      exit 1
+    fi
+    mkdir -p "$target"
+    for p in "${includes[@]}"; do
+      if [[ -n "$fx" && -e "$fx$p" ]]; then
+        mkdir -p "$target$(dirname "$p")"
+        cp -a "$fx$p" "$target$p"
+      fi
+    done
+    echo "restoring snapshot (stub)"
     ;;
   backup)
     case "$tag" in

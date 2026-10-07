@@ -125,6 +125,40 @@ _backup_write_password() {
   fi
 }
 
+# Recuperación ante un desastre: se ingresa la contraseña con la que se crearon
+# los backups (Vaultwarden o papel) en vez de generar una. No se inicializa
+# nada que ya exista: 'hli2-backup init' comprueba el repositorio de R2 con
+# 'restic cat config' y se niega si esa contraseña no lo abre.
+_BACKUP_DR=0
+_backup_use_existing_password() {
+  local pw="" pw2=""
+  msg "Recuperación ante un desastre.\n\nIngrese la MISMA contraseña de restic con la que se crearon los backups (la guardada en Vaultwarden o en papel). Después configure la copia externa (R2) con el MISMO bucket: ahí están sus backups."
+  pw=$(password_box "Contraseña de restic" "Contraseña de cifrado de los backups existentes. No se muestra en pantalla ni se registra en logs.") \
+    || { msg "Se cancela la configuración: no se ingresó la contraseña."; return 1; }
+  pw2=$(password_box "Contraseña de restic" "Repita la contraseña:") \
+    || { pw=""; msg "Se cancela la configuración: no se repitió la contraseña."; return 1; }
+  pw="$(_backup_trim "$pw")"; pw2="$(_backup_trim "$pw2")"
+  if [[ "$pw" != "$pw2" ]]; then
+    pw=""; pw2=""
+    msg "Las dos contraseñas no coinciden. Vuelva a correr este módulo."
+    return 1
+  fi
+  if [[ "${#pw}" -lt 16 || "$pw" == *[[:space:]]* ]]; then
+    pw=""; pw2=""
+    msg "La contraseña no tiene la forma esperada (al menos 16 caracteres, sin espacios). Vuelva a correr este módulo."
+    return 1
+  fi
+  if ! _backup_write_password "$pw"; then
+    pw=""; pw2=""
+    msg "No se pudo guardar la contraseña de restic."
+    return 1
+  fi
+  pw=""; pw2=""
+  log "Contraseña de restic existente guardada root-only (no se loguea el valor)."
+  mark_done "$BACKUP_PW_CONFIRMED_KEY"
+  _BACKUP_DR=1
+}
+
 _backup_ensure_password() {
   local pw=""
   if priv_file_exists "$BACKUP_PASSWORD_FILE"; then
@@ -151,6 +185,17 @@ _backup_ensure_password() {
     log "Archivo de contraseña de restic vacío o inválido y sin repositorio: se genera de nuevo."
   fi
 
+  # Sin archivo de contraseña (equipo sin backups configurados): instalación
+  # nueva o recuperación ante un desastre con los backups de un equipo anterior.
+  if ! priv_file_exists "$BACKUP_PASSWORD_FILE"; then
+    local mode
+    mode="$(menu_box "Contraseña de los backups" "¿Es una instalación nueva o está recuperando los backups de otro equipo?"       new "Instalación nueva: generar una contraseña"       existing "Recuperación ante un desastre: usar la contraseña de backups existentes")" || return 1
+    if [[ "$mode" == "existing" ]]; then
+      _backup_use_existing_password
+      return
+    fi
+  fi
+
   pw="$(_backup_generate_password)"
   [[ -n "$pw" ]] || { msg "No se pudo generar la contraseña de restic."; return 1; }
   if ! _backup_write_password "$pw"; then
@@ -166,7 +211,7 @@ _backup_ensure_password() {
 # --- Cloudflare R2 ------------------------------------------------------------------
 
 _backup_r2_configured() {
-  secret_file_exists restic && secret_get restic RESTIC_REPOSITORY >/dev/null 2>&1
+  backup_r2_configured
 }
 
 # 0 = quedó configurado (o se conserva lo guardado); 1 = el usuario no quiso
@@ -316,7 +361,11 @@ _backup_setup_main() {
 
   local r2_note="Solo hay copia local (R2 sin configurar): vuelva a correr este módulo para agregarla."
   if _backup_r2_configured; then r2_note="La copia externa en R2 está configurada."; fi
-  msg "Backups listos.\n\n- Repositorio local: $BACKUP_ROOT\n- $r2_note\n- Se ejecutan todos los días a las 04:00 (hli2-backup.timer).\n- El código del backup se instaló en $BACKUP_INSTALL_DIR (copia de root). Tras actualizar el HLI 2 con git, vuelva a correr este módulo o 'Hacer backup ahora' para refrescarla.\n- Para probar ahora: Herramientas -> 'Hacer backup ahora'.\n\nRecuerde: sin la contraseña de restic los backups no se pueden restaurar."
+  local dr_note=""
+  if [[ "$_BACKUP_DR" -eq 1 ]]; then
+    dr_note="\n- Recuperación: Herramientas -> 'Restaurar un backup' -> copia externa -> 'Todo'. Después ejecute los módulos de los servicios que se indiquen."
+  fi
+  msg "Backups listos.\n\n- Repositorio local: $BACKUP_ROOT\n- $r2_note\n- Se ejecutan todos los días a las 04:00 (hli2-backup.timer).\n- El código del backup se instaló en $BACKUP_INSTALL_DIR (copia de root). Tras actualizar el HLI 2 con git, vuelva a correr este módulo o 'Hacer backup ahora' para refrescarla.\n- Para probar ahora: Herramientas -> 'Hacer backup ahora'.${dr_note}\n\nRecuerde: sin la contraseña de restic los backups no se pueden restaurar."
 
   mark_done backup-setup
   return 0
