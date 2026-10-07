@@ -104,7 +104,7 @@ hli_module_log() {
 # rompe la detección del tamaño de la terminal), así que el rastro se deja
 # explícitamente acá. No pasar secretos en el mensaje.
 hli_error() {
-  printf 'ERROR: %s\n' "$1" >&2
+  printf 'ERROR: %s\n' "$1" >&2 || true   # stderr puede ser una tubería rota (terminal colgada)
   hli_module_log "ERROR: $1"
   return 0
 }

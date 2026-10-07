@@ -54,6 +54,8 @@ case "$widget" in
     ;;
   --yesno)
     ans="$(_dialog_pop "${DIALOG_YESNO_QUEUE:-/dev/null}")" || ans="no"
+    # "esc" simula ESC (código 255), distinto de "No" (1).
+    [[ "$ans" == "esc" ]] && exit 255
     [[ "$ans" == "yes" ]] && exit 0 || exit 1
     ;;
   --inputbox)

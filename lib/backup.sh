@@ -71,8 +71,14 @@ BK_ID_FULL="" BK_ID_CLOUD="" BK_MSG="" BK_ACTIVE=0 BK_WARMUP_ID=""
 BK_TMP_FILES=()
 BK_NO_RETENTION=0
 
+# Si stdout ya no existe (una terminal SSH colgada deja rota la tubería de 'tee'),
+# la línea va directo al log: un registro nunca puede matar al proceso, y menos
+# al cleanup que vuelve a iniciar los contenedores. (Con SIGPIPE ignorado, que es
+# como corren el backup y la restauración, 'printf' solo devuelve error.)
 _backup_log() {
-  printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+  local line
+  line="$(printf '[%s] %s' "$(date '+%F %T')" "$*")"
+  printf '%s\n' "$line" 2>/dev/null || printf '%s\n' "$line" >> "$LOG_DIR/backup.log" 2>/dev/null || true
 }
 
 # Agrega un aviso/error corto al mensaje del estado (sin saltos de línea).
@@ -408,6 +414,9 @@ backup_restart_stopped() {
 backup_recover() {
   local c bad=0
   local -a names=()
+  # Una restauración que murió a medias se deshace ANTES de iniciar nada (ver
+  # lib/restore.sh): sin eso Docker crearía carpetas vacías donde falta la de datos.
+  restore_journal_recover || true
   [[ -s "$BACKUP_RECOVERY_FILE" ]] || return 0
   while IFS= read -r c; do
     if [[ "$c" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then names+=("$c"); fi
@@ -437,9 +446,10 @@ backup_status_mark_stale() {
 # Trap EXIT de bin/hli2-backup: lo detenido SIEMPRE se levanta, una corrida
 # cortada deja 'interrupted' en el estado, y las credenciales cargadas no
 # sobreviven al proceso. Lo PRIMERO es ignorar nuevas señales: una segunda
-# Ctrl+C/TERM no puede abortar el bucle de reinicio.
+# Ctrl+C/TERM no puede abortar el bucle de reinicio, ni un SIGPIPE por la tubería
+# rota de una terminal colgada.
 backup_exit_cleanup() {
-  trap '' INT TERM HUP
+  trap '' INT TERM HUP PIPE
   local rc=0 f
   backup_restart_stopped || rc=1
   if [[ "$BK_ACTIVE" == "1" ]]; then
@@ -466,6 +476,15 @@ _backup_restic_local() {
 
 _backup_restic_r2() {
   RESTIC_REPOSITORY="$_BK_R2_REPO" RESTIC_PASSWORD_FILE="$BACKUP_PASSWORD_FILE" \
+    RESTIC_CACHE_DIR="$BACKUP_CACHE_DIR" \
+    AWS_ACCESS_KEY_ID="$_BK_R2_KEY" AWS_SECRET_ACCESS_KEY="$_BK_R2_SECRET" \
+    AWS_DEFAULT_REGION="${_BK_R2_REGION:-auto}" restic "$@"
+}
+
+# Repositorio local como destino con R2 como origen (recuperación ante un desastre:
+# 'init --from-repo' con las claves de R2 en el entorno de ESE proceso).
+_backup_restic_local_from_r2() {
+  RESTIC_REPOSITORY="$BACKUP_ROOT" RESTIC_PASSWORD_FILE="$BACKUP_PASSWORD_FILE" \
     RESTIC_CACHE_DIR="$BACKUP_CACHE_DIR" \
     AWS_ACCESS_KEY_ID="$_BK_R2_KEY" AWS_SECRET_ACCESS_KEY="$_BK_R2_SECRET" \
     AWS_DEFAULT_REGION="${_BK_R2_REGION:-auto}" restic "$@"
@@ -793,9 +812,20 @@ backup_run() {
   [[ "$BK_RESULT" != "error" ]]
 }
 
-# Inicializa los repositorios que falten (idempotente). Como root.
+# Inicializa los repositorios que falten (idempotente). Como root. Con R2
+# configurado se comprueba PRIMERO ('restic cat config'); solo después se crea nada:
+#   - la contraseña no abre un repositorio existente -> error, no se inicializa NADA
+#     (recuperación ante un desastre con la contraseña equivocada: se reintenta
+#     con la correcta);
+#   - el repositorio existe -> el local nuevo se crea con los parámetros de troceado
+#     de R2 ('init --from-repo <R2> --copy-chunker-params'), así lo que se copie
+#     después se deduplica contra lo ya subido;
+#   - no existe (señal positiva: "Is there a repository at the following location?"
+#     de la clave S3 inexistente) -> se crea el local y, desde él, el de R2;
+#   - cualquier otro error (red, claves, bucket, endpoint) -> error, no se inicializa
+#     nada: nunca se inicializa ante una señal ambigua.
 backup_init() {
-  local rc=0
+  local rc=0 r2="missing" cat_out
   BK_MSG=""
   command -v restic >/dev/null 2>&1 || { echo "ERROR: restic no está instalado." >&2; return 1; }
   _backup_state_dir_ensure || { echo "ERROR: $BK_MSG" >&2; return 1; }
@@ -803,31 +833,47 @@ backup_init() {
   if ! _backup_guard_fs; then echo "ERROR: $BK_MSG" >&2; return 1; fi
   install -d -m 0700 "$BACKUP_ROOT"
   _backup_secure_repo_dir
-  if [[ ! -f "$BACKUP_ROOT/config" ]]; then
-    _backup_log "Inicializando el repositorio local"
-    _backup_restic_local init || { echo "ERROR: no se pudo inicializar el repositorio local." >&2; return 1; }
-  fi
+
   if backup_r2_load; then
-    local cat_out
     cat_out="$(_backup_restic_r2 cat config 2>&1 </dev/null)" && rc=0 || rc=$?
-    if [[ "$rc" -ne 0 && "$cat_out" == *"wrong password"* ]]; then
-      # El repositorio de R2 ya existe y esta contraseña no lo abre (típico en
-      # una recuperación ante un desastre: no es la misma que se usó al crear
-      # los backups). NUNCA se intenta inicializar encima.
-      echo "ERROR: el repositorio de R2 ya existe y la contraseña de restic no lo abre. Use la MISMA contraseña con la que se crearon los backups (Vaultwarden o papel)." >&2
+    if [[ "$rc" -eq 0 ]]; then
+      r2="exists"
+    elif [[ "$cat_out" == *"wrong password"* ]]; then
+      # El repositorio de R2 ya existe y esta contraseña no lo abre (típico en una
+      # recuperación ante un desastre: no es la misma que se usó al crear los backups).
+      echo "ERROR: el repositorio de R2 ya existe y la contraseña de restic no lo abre. Use la MISMA contraseña con la que se crearon los backups (Vaultwarden o papel). No se inicializó nada." >&2
+      _BK_R2_REPO="" _BK_R2_KEY="" _BK_R2_SECRET="" _BK_R2_REGION=""
+      return 1
+    elif [[ "$cat_out" == *"Is there a repository at the following location"* && "$cat_out" != *"specified bucket"* ]]; then
+      r2="missing"
+    else
+      echo "ERROR: no se pudo comprobar el repositorio de R2 (red, claves, bucket o endpoint). No se inicializó nada. Detalle: $(printf '%s' "$cat_out" | tail -n 2 | tr '\n' ' ')" >&2
       _BK_R2_REPO="" _BK_R2_KEY="" _BK_R2_SECRET="" _BK_R2_REGION=""
       return 1
     fi
+  else
+    r2="none"
+  fi
+
+  if [[ ! -f "$BACKUP_ROOT/config" ]]; then
+    if [[ "$r2" == "exists" ]]; then
+      _backup_log "Inicializando el repositorio local con los parámetros de R2"
+      _backup_restic_local_from_r2 init --from-repo "$_BK_R2_REPO" --from-password-file "$BACKUP_PASSWORD_FILE" --copy-chunker-params \
+        || { echo "ERROR: no se pudo inicializar el repositorio local." >&2; return 1; }
+    else
+      _backup_log "Inicializando el repositorio local"
+      _backup_restic_local init || { echo "ERROR: no se pudo inicializar el repositorio local." >&2; return 1; }
+    fi
+  fi
+  if [[ "$r2" == "missing" ]]; then
+    rc=0
+    _backup_log "Inicializando el repositorio en R2"
+    # Mismos parámetros de chunking que el repo local: 'restic copy'
+    # deduplica entre repos solo así.
+    _backup_restic_r2 init --from-repo "$BACKUP_ROOT" --from-password-file "$BACKUP_PASSWORD_FILE" --copy-chunker-params || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-      rc=0
-      _backup_log "Inicializando el repositorio en R2"
-      # Mismos parámetros de chunking que el repo local: 'restic copy'
-      # deduplica entre repos solo así.
-      _backup_restic_r2 init --from-repo "$BACKUP_ROOT" --from-password-file "$BACKUP_PASSWORD_FILE" --copy-chunker-params || rc=$?
-      if [[ "$rc" -ne 0 ]]; then
-        echo "ERROR: no se pudo inicializar el repositorio en R2 (revise endpoint, bucket y claves)." >&2
-        return 1
-      fi
+      echo "ERROR: no se pudo inicializar el repositorio en R2 (revise endpoint, bucket y claves)." >&2
+      return 1
     fi
   fi
   _BK_R2_REPO="" _BK_R2_KEY="" _BK_R2_SECRET="" _BK_R2_REGION=""

@@ -75,6 +75,10 @@ else
   exec >>"$LOG_DIR/backup.log" 2>&1
 fi
 
+# Una terminal SSH colgada rompe la tubería de 'tee': un SIGPIPE no puede matar el
+# proceso (menos aún antes del cleanup que vuelve a iniciar los contenedores).
+trap '' PIPE
+
 # Argumentos de cada subcomando, validados ANTES de tocar nada.
 case "$1" in
   run)
@@ -113,6 +117,16 @@ if ! flock -w "$_wait" 9; then
     exit 1
   fi
   if [[ "$1" == "run" ]]; then
+    if [[ "$(restore_status_get result)" == "running" ]]; then
+      # El bloqueo lo tiene una restauración (puede ser larga): no es un error del
+      # backup. Se registra como 'skipped' (el dashboard lo muestra como omitido) y
+      # el servicio termina bien; el próximo backup corre cuando termine.
+      BK_RESULT=skipped BK_LOCAL=skipped BK_CLOUD=skipped BK_CHECK=skipped
+      BK_ID_FULL="$(backup_status_get snapshot_full)" BK_ID_CLOUD="$(backup_status_get snapshot_cloud)"
+      BK_MSG="restauración en curso: este backup se omitió"
+      _backup_status_write || true
+      exit 0
+    fi
     BK_RESULT=error BK_LOCAL=skipped BK_CLOUD=skipped BK_CHECK=skipped BK_ID_FULL="" BK_ID_CLOUD=""
     BK_MSG="no se pudo iniciar: otro backup mantiene el bloqueo"
     _backup_status_write || true

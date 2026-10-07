@@ -130,6 +130,27 @@ _backup_write_password() {
 # nada que ya exista: 'hli2-backup init' comprueba el repositorio de R2 con
 # 'restic cat config' y se niega si esa contraseña no lo abre.
 _BACKUP_DR=0
+# Marca (en el estado del HLI) de una recuperación ante un desastre sin verificar:
+# se pone al guardar la contraseña ingresada y se saca cuando 'init' comprueba que
+# abre el repositorio (o el usuario elige generar una nueva).
+BACKUP_DR_PENDING_KEY="backup-dr-pending"
+
+_backup_unmark() {
+  local tmp
+  [[ -f "$STATE_FILE" ]] || return 0
+  tmp="$(mktemp)"
+  grep -vxF -- "$1" "$STATE_FILE" > "$tmp" || true
+  cat "$tmp" > "$STATE_FILE"
+  rm -f "$tmp"
+}
+
+# Menú de modo de contraseña: new (generar) o existing (la de backups existentes).
+_backup_password_mode_menu() {
+  menu_box "Contraseña de los backups" "$1" \
+    new "Instalación nueva: generar una contraseña" \
+    existing "Recuperación ante un desastre: usar la contraseña de backups existentes"
+}
+
 _backup_use_existing_password() {
   local pw="" pw2=""
   msg "Recuperación ante un desastre.\n\nIngrese la MISMA contraseña de restic con la que se crearon los backups (la guardada en Vaultwarden o en papel). Después configure la copia externa (R2) con el MISMO bucket: ahí están sus backups."
@@ -156,12 +177,25 @@ _backup_use_existing_password() {
   pw=""; pw2=""
   log "Contraseña de restic existente guardada root-only (no se loguea el valor)."
   mark_done "$BACKUP_PW_CONFIRMED_KEY"
+  mark_done "$BACKUP_DR_PENDING_KEY"
   _BACKUP_DR=1
 }
 
 _backup_ensure_password() {
-  local pw=""
-  if priv_file_exists "$BACKUP_PASSWORD_FILE"; then
+  local pw="" mode force_new=0
+  # Una recuperación ante un desastre que no terminó (la contraseña ingresada no
+  # abrió el repositorio de R2, o se cortó antes de verificarla): "ya existente y
+  # confirmada" no aplica, porque nunca se comprobó. Se vuelve a ofrecer ingresarla.
+  if is_done "$BACKUP_DR_PENDING_KEY"; then
+    mode="$(_backup_password_mode_menu "La recuperación ante un desastre anterior no terminó: la contraseña ingresada no se pudo verificar contra los backups existentes.\n\n¿Qué desea hacer?")" || return 1
+    if [[ "$mode" == "existing" ]]; then
+      _backup_use_existing_password
+      return
+    fi
+    _backup_unmark "$BACKUP_DR_PENDING_KEY"
+    force_new=1
+  fi
+  if [[ "$force_new" -eq 0 ]] && priv_file_exists "$BACKUP_PASSWORD_FILE"; then
     pw="$(priv_file_read "$BACKUP_PASSWORD_FILE" 2>/dev/null || true)"
     pw="${pw%%$'\n'*}"
     if [[ "${#pw}" -ge 16 && "$pw" != *[[:space:]]* ]]; then
@@ -187,9 +221,8 @@ _backup_ensure_password() {
 
   # Sin archivo de contraseña (equipo sin backups configurados): instalación
   # nueva o recuperación ante un desastre con los backups de un equipo anterior.
-  if ! priv_file_exists "$BACKUP_PASSWORD_FILE"; then
-    local mode
-    mode="$(menu_box "Contraseña de los backups" "¿Es una instalación nueva o está recuperando los backups de otro equipo?"       new "Instalación nueva: generar una contraseña"       existing "Recuperación ante un desastre: usar la contraseña de backups existentes")" || return 1
+  if [[ "$force_new" -eq 0 ]] && ! priv_file_exists "$BACKUP_PASSWORD_FILE"; then
+    mode="$(_backup_password_mode_menu "¿Es una instalación nueva o está recuperando los backups de otro equipo?")" || return 1
     if [[ "$mode" == "existing" ]]; then
       _backup_use_existing_password
       return
@@ -356,6 +389,10 @@ _backup_setup_main() {
     msg "No se pudieron inicializar los repositorios de backup:\n\n$(printf '%s' "$out" | tail -n 5)\n\nSi el disco de media no está montado aparte del sistema, móntelo y vuelva a correr este módulo."
     return 1
   fi
+
+  # 'init' comprobó (o creó) los repositorios con esta contraseña: la recuperación
+  # ante un desastre, si la había, quedó verificada.
+  _backup_unmark "$BACKUP_DR_PENDING_KEY"
 
   _backup_install_units || return 1
 

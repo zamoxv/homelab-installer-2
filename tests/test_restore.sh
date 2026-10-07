@@ -87,10 +87,18 @@ _rs_secret_exists() {
   return "$rc"
 }
 
+# Copias previas de un .env: viven FUERA de /etc/hli2 (no deben entrar en los backups).
 _rs_secret_has_old() {
+  local f
+  for f in "$BACKUP_STATE_DIR/restore-old-secrets/$1".hli2-before-restore-*; do
+    [[ -e "$f" ]] && return 0
+  done
+  return 1
+}
+_rs_secret_old_inside() {
   local rc=1 f
   chmod u+rwx "$SECRETS_DIR"
-  for f in "$SECRETS_DIR/$1".hli2-before-restore-*; do [[ -e "$f" ]] && rc=0; done
+  for f in "$SECRETS_DIR"/*.hli2-before-restore-*; do [[ -e "$f" ]] && rc=0; done
   chmod 000 "$SECRETS_DIR"
   return "$rc"
 }
@@ -258,7 +266,7 @@ test_restore_service_replaces_data_exactly_and_restarts_container() {
   rest="$(_bk_line_no '^restic\t(.*\t)?restore\t')"
   start="$(_bk_line_no '^docker\tstart\tvaultwarden$')"
   [[ -n "$stop" && -n "$rest" && -n "$start" ]] || { fail "faltan llamadas (stop=$stop restore=$rest start=$start)"; return 1; }
-  (( stop < rest && rest < start )) || { fail "orden incorrecto: stop=$stop restore=$rest start=$start"; return 1; }
+  (( rest < stop && stop < start )) || { fail "orden incorrecto (restaurar a la carpeta de paso, detener, iniciar): restore=$rest stop=$stop start=$start"; return 1; }
   assert_contains "$(_bk_calls '^recovery-at-stop\t')" "yes" "la lista de recuperación existía al detener" || return 1
   [[ ! -s "$BACKUP_STATE_DIR/recovery-containers" ]] || { fail "la lista de recuperación no se limpió"; return 1; }
   [[ -z "$(_bk_calls '^docker\t(stop|start)\t.*(jellyfin|adguard|homeassistant|opencloud|qbittorrent)')" ]] || { fail "solo debe tocar el contenedor del servicio"; return 1; }
@@ -273,15 +281,51 @@ test_restore_service_replaces_data_exactly_and_restarts_container() {
   assert_contains "$(cat "$LOG_DIR/backup.log")" "Fin de la restauración: ok" "queda en el log del backup" || return 1
 }
 
-test_restore_keeps_only_the_last_before_restore_copy() {
+# Registra una copia previa de $1 (ruta de datos) con fecha $2 como creada por una restauración
+# exitosa anterior (como lo hace lib/restore.sh).
+_rs_seed_old_copy() {
+  local dst="$1" ts="$2"
+  mkdir -p "$dst.hli2-before-restore-$ts"
+  echo "copia-$ts" > "$dst.hli2-before-restore-$ts/file.txt"
+  printf '%s\t%s\n' "$dst" "$dst.hli2-before-restore-$ts" >> "$BACKUP_STATE_DIR/restore-old-copies"
+}
+
+test_restore_keeps_the_oldest_and_the_newest_before_restore_copy() {
   _rs_prepare
   local d="$APPDATA_ROOT/vaultwarden/data" n
-  mkdir -p "$d.hli2-before-restore-20200101-000000"
-  echo "muy vieja" > "$d.hli2-before-restore-20200101-000000/file.txt"
+  _rs_seed_old_copy "$d" 20200101-000000      # el estado original, anterior a toda restauración
+  _rs_seed_old_copy "$d" 20200201-000000      # intermedia
+  # Una copia que no registró ninguna corrida exitosa: nunca se borra sola.
+  mkdir -p "$d.hli2-before-restore-20190101-000000"
   _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target vaultwarden || return 1
+  [[ -e "$d.hli2-before-restore-20200101-000000" ]] || { fail "la copia más vieja (estado original) debe conservarse"; return 1; }
+  [[ ! -e "$d.hli2-before-restore-20200201-000000" ]] || { fail "la intermedia debió borrarse"; return 1; }
+  [[ -e "$d.hli2-before-restore-20190101-000000" ]] || { fail "una copia desconocida no se borra"; return 1; }
   n="$(_rs_olds "$d" | grep -c .)"
-  assert_eq "1" "$n" "se conserva solo la última copia previa" || return 1
-  [[ ! -e "$d.hli2-before-restore-20200101-000000" ]] || { fail "la copia anterior debió borrarse"; return 1; }
+  assert_eq "3" "$n" "la vieja, la desconocida y la nueva" || return 1
+  assert_contains "$(_rs_status message)" "copias previas conservadas" "avisa dónde quedaron" || return 1
+  assert_contains "$(_rs_status message)" "20200101-000000" || return 1
+}
+
+test_restore_does_not_prune_when_the_previous_restore_was_interrupted() {
+  _rs_prepare
+  local d="$APPDATA_ROOT/vaultwarden/data"
+  _rs_seed_old_copy "$d" 20200101-000000
+  _rs_seed_old_copy "$d" 20200201-000000
+  _rs_seed_old_copy "$d" 20200301-000000
+  printf 'timestamp=%s\nresult=interrupted\nsource=local\nsnapshot=x\nsnapshot_time=\ntarget=all\nmodules=\nmessage=\n' "$(date -Is)" > "$BACKUP_STATE_DIR/restore-status"
+  _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target vaultwarden --discard-old || return 1
+  assert_eq "4" "$(_rs_olds "$d" | grep -c .)" "no se borró ninguna copia previa" || return 1
+  assert_contains "$(_rs_status message)" "quedó interrumpida" "lo dice" || return 1
+}
+
+test_restore_failed_run_registers_nothing_for_pruning() {
+  _rs_prepare
+  local c="$APPDATA_ROOT/adguard/conf" w="$APPDATA_ROOT/adguard/work"
+  export STUB_SUDO_MV_FAIL_TARGET="$w"
+  # 'all' hace que adguard (la 1.ª en orden) falle: nada completado, nada registrado.
+  _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target adguard || true
+  [[ ! -s "$BACKUP_STATE_DIR/restore-old-copies" ]] || { fail "una corrida fallida no registra copias: $(cat "$BACKUP_STATE_DIR/restore-old-copies")"; return 1; }
 }
 
 test_restore_discard_old_removes_the_previous_copy() {
@@ -311,7 +355,7 @@ test_restore_without_docker_restores_data_and_asks_for_dokploy() {
     source "$REPO_ROOT/lib/core.sh"
     hli_docker_presence() { echo absent; }
     RS_TARGET=all RS_MODULES=""
-    _restore_stop_containers
+    _restore_containers_plan
     echo "rc=$? modules=$RS_MODULES"
   ) )"
   assert_contains "$out" "rc=0" || return 1
@@ -321,7 +365,7 @@ test_restore_without_docker_restores_data_and_asks_for_dokploy() {
     source "$REPO_ROOT/lib/core.sh"
     hli_docker_presence() { echo unknown; }
     RS_TARGET=all RS_MODULES=""
-    _restore_stop_containers && echo "rc=0" || echo "rc=1"
+    _restore_containers_plan && echo "rc=0" || echo "rc=1"
   ) )"
   assert_contains "$out" "rc=1" "con un estado de Docker incierto no se restaura (falla cerrado)" || return 1
   [[ -z "$(_bk_calls '^docker\tstop\t')" ]] || { fail "no debió detener nada"; return 1; }
@@ -340,15 +384,16 @@ test_restore_container_that_wont_stop_aborts_and_restarts_the_rest() {
   _rs_prepare
   export STUB_DOCKER_FAIL_STOP="jellyfin"
   if _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target all; then fail "debió abortar"; return 1; fi
-  assert_eq "current-vaultwarden/data" "$(_rs_content "$APPDATA_ROOT/vaultwarden/data/file.txt")" "nada restaurado" || return 1
-  [[ -z "$(_bk_calls '^restic\t(.*\t)?restore\t')" ]] || { fail "no debió restaurar con un contenedor sin detener"; return 1; }
+  assert_eq "current-vaultwarden/data" "$(_rs_content "$APPDATA_ROOT/vaultwarden/data/file.txt")" "nada reemplazado" || return 1
+  # Las carpetas de paso se armaron con los contenedores en marcha y se borraron al abortar.
+  [[ -n "$(_bk_calls '^restic\t(.*\t)?restore\t')" ]] || { fail "la fase 1 (carpetas de paso) debió correr antes de detener nada"; return 1; }
+  [[ ! -e "$APPDATA_ROOT/vaultwarden/data.hli2-restore-tmp" && ! -e "$APPDATA_ROOT/jellyfin/config.hli2-restore-tmp" ]] || { fail "quedaron carpetas de paso"; return 1; }
+  assert_eq "" "$(_rs_olds "$APPDATA_ROOT/vaultwarden/data")" "no se apartó nada" || return 1
   local c
-  # Se detuvieron (en orden) adguard, homeassistant y jellyfin (falla): esos vuelven.
+  # Se detuvieron (en orden) adguard, homeassistant y jellyfin (falla); el cleanup intenta
+  # levantar TODOS los de la lista (iniciar uno que nunca se detuvo no hace daño).
   for c in adguard homeassistant jellyfin; do
     [[ -n "$(_bk_calls "^docker\tstart\t$c\$")" ]] || { fail "no reinició $c"; return 1; }
-  done
-  for c in opencloud qbittorrent vaultwarden; do
-    [[ -z "$(_bk_calls "^docker\tstart\t$c\$")" ]] || { fail "$c nunca se detuvo: no hay que iniciarlo"; return 1; }
   done
   assert_eq "error" "$(_rs_status result)" || return 1
 }
@@ -364,7 +409,8 @@ test_restore_restic_failure_leaves_original_intact_and_restarts() {
   [[ -f "$d/extra.txt" ]] || { fail "el dato original debe seguir completo"; return 1; }
   [[ ! -e "$d.hli2-restore-tmp" ]] || { fail "quedó la carpeta de paso"; return 1; }
   assert_eq "" "$(_rs_olds "$d")" "no se apartó nada" || return 1
-  [[ -n "$(_bk_calls '^docker\tstart\tvaultwarden$')" ]] || { fail "el contenedor debe volver a iniciar"; return 1; }
+  # Las carpetas de paso se arman con los contenedores en marcha: si falla, nunca se detuvieron.
+  [[ -z "$(_bk_calls '^docker\t(stop|start)\t')" ]] || { fail "no debió detener ni iniciar nada"; return 1; }
   assert_eq "error" "$(_rs_status result)" || return 1
   assert_contains "$(_rs_status message)" "vaultwarden" || return 1
 }
@@ -407,11 +453,14 @@ test_restore_interrupted_restarts_containers_and_keeps_original() {
 
 test_restore_second_signal_does_not_abort_restart() {
   _rs_prepare
-  export STUB_RESTIC_KILL_ON="restore" STUB_DOCKER_KILL_ON_START=1
+  # TERM en plena parada de contenedores y un segundo TERM al primer 'docker start'.
+  export STUB_DOCKER_KILL_ON_STOP=1 STUB_DOCKER_KILL_ON_START=1
   _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target all || true
-  [[ -f "$STUB_DOCKER_STATE_DIR/.killed" ]] || { fail "no se envió la segunda señal (test vacío)"; return 1; }
+  [[ -f "$STUB_DOCKER_STATE_DIR/.killed-stop" && -f "$STUB_DOCKER_STATE_DIR/.killed" ]] || { fail "no se enviaron las dos señales (test vacío)"; return 1; }
   assert_eq "" "$(rg --files "$STUB_DOCKER_STATE_DIR" 2>/dev/null | rg -v '/\.' || true)" "ningún contenedor quedó detenido" || return 1
   assert_eq "6" "$(_bk_calls '^docker\tstart\t' | wc -l | tr -d ' ')" "los 6 contenedores con datos volvieron a iniciar" || return 1
+  assert_eq "current-vaultwarden/data" "$(_rs_content "$APPDATA_ROOT/vaultwarden/data/file.txt")" "no se reemplazó nada" || return 1
+  assert_eq "interrupted" "$(_rs_status result)" || return 1
 }
 
 test_restore_leftover_recovery_list_is_recovered_before_restoring() {
@@ -510,7 +559,7 @@ test_restore_service_missing_from_snapshot_is_an_error_and_leaves_data() {
   if _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target qbittorrent; then fail "debió fallar: la foto no tiene datos"; return 1; fi
   assert_eq "current-qbittorrent/config" "$(_rs_content "$APPDATA_ROOT/qbittorrent/config/file.txt")" "no se borra lo actual" || return 1
   assert_contains "$(_rs_status message)" "no contiene datos" || return 1
-  [[ -n "$(_bk_calls '^docker\tstart\tqbittorrent$')" ]] || { fail "el contenedor debe volver a iniciar"; return 1; }
+  [[ -z "$(_bk_calls '^docker\tstop\t')" ]] || { fail "sin nada que restaurar no se detiene el contenedor"; return 1; }
 }
 
 # --- "Todo" ------------------------------------------------------------------------------------------------
@@ -541,7 +590,9 @@ test_restore_all_restores_services_and_secrets_but_not_restic_credentials() {
   _rs_secret_exists notes.txt && { fail "solo se restauran '<servicio>.env'"; return 1; }
   _rs_secret_exists .restic-password.123 && { fail "los temporales de la contraseña no se restauran"; return 1; }
   _rs_secret_exists sub && { fail "las subcarpetas no se restauran"; return 1; }
-  _rs_secret_has_old vaultwarden.env || { fail "debió quedar copia previa de vaultwarden.env"; return 1; }
+  _rs_secret_has_old vaultwarden.env || { fail "debió quedar copia previa de vaultwarden.env fuera de /etc/hli2"; return 1; }
+  if _rs_secret_old_inside; then fail "las copias previas de secretos no deben quedar dentro de /etc/hli2 (entrarían en los backups)"; return 1; fi
+  assert_eq "700" "$(stat -c %a "$BACKUP_STATE_DIR/restore-old-secrets")" "carpeta de copias de secretos 0700" || return 1
   [[ ! -e "$SECRETS_DIR.hli2-restore-tmp" ]] || { fail "quedó la carpeta de paso de /etc/hli2"; return 1; }
 
   # Contenedores existentes: detenidos y levantados; el que no existe, ni tocado y avisado.
@@ -797,4 +848,409 @@ test_backup_init_refuses_an_existing_r2_repo_with_a_different_password() {
   [[ -z "$(_bk_calls '^restic\t(.*\t)?init')" ]] || { fail "NUNCA debe inicializar sobre un repositorio existente"; return 1; }
   assert_contains "$(cat "$LOG_DIR/backup.log")" "no lo abre" "dice por qué" || return 1
   assert_not_contains "$(cat "$STUB_CALL_LOG" "$LOG_DIR/backup.log")" "$_BK_SECRET_VAL" || return 1
+}
+
+# ==================================================================================================
+# Revisión: robustez ante señales y terminal colgada, diario de intercambio, orden de fases,
+# frescura del estado, enlaces simbólicos y recuperación ante desastre verificable
+# ==================================================================================================
+
+# --- W1: una tubería rota (SSH colgado) no puede matar el cleanup ----------------------------------
+
+test_backup_cleanup_survives_a_closed_stdout_pipe() {
+  _bk_prepare
+  : > "$STUB_DOCKER_STATE_DIR/vaultwarden.stopped"
+  printf 'vaultwarden\n' > "$BACKUP_STATE_DIR/recovery-containers"
+  # El lector sale al instante: cuando el subshell escribe, la tubería ya está rota
+  # (con SIGPIPE por defecto, el primer 'printf' del cleanup lo mataba).
+  ( sleep 0.3
+    source "$REPO_ROOT/lib/core.sh"
+    BACKUP_STOPPED_CONTAINERS="vaultwarden " BK_ACTIVE=1
+    backup_exit_cleanup
+    : > "$HLI2_TEST_SCRATCH/cleanup-finished"
+  ) 2>/dev/null | true
+  [[ -f "$HLI2_TEST_SCRATCH/cleanup-finished" ]] || { fail "el cleanup murió antes de terminar (SIGPIPE)"; return 1; }
+  [[ -n "$(_bk_calls '^docker\tstart\tvaultwarden$')" ]] || { fail "no volvió a iniciar el contenedor"; return 1; }
+  assert_contains "$(cat "$LOG_DIR/backup.log")" "Iniciando 'vaultwarden'" "con stdout roto, el registro va al log" || return 1
+  assert_eq "interrupted" "$(_bk_status result)" || return 1
+}
+
+test_restore_cleanup_survives_a_closed_stdout_pipe() {
+  _rs_prepare
+  : > "$STUB_DOCKER_STATE_DIR/vaultwarden.stopped"
+  ( sleep 0.3
+    source "$RS_CODE/lib/core.sh"
+    BACKUP_STOPPED_CONTAINERS="vaultwarden " RS_ACTIVE=1 RS_SOURCE=local RS_SNAPSHOT="$_RS_FULL_NEW" RS_TARGET=vaultwarden
+    restore_exit_cleanup
+    : > "$HLI2_TEST_SCRATCH/cleanup-finished"
+  ) 2>/dev/null | true
+  [[ -f "$HLI2_TEST_SCRATCH/cleanup-finished" ]] || { fail "el cleanup murió antes de terminar (SIGPIPE)"; return 1; }
+  [[ -n "$(_bk_calls '^docker\tstart\tvaultwarden$')" ]] || { fail "no volvió a iniciar el contenedor"; return 1; }
+  assert_eq "interrupted" "$(_rs_status result)" || return 1
+}
+
+# --- W2: intercambio atómico por servicio, deshacer a medias y diario ---------------------------
+
+test_restore_signal_between_two_swaps_cannot_leave_a_half_restored_service() {
+  _rs_prepare
+  local c="$APPDATA_ROOT/adguard/conf" w="$APPDATA_ROOT/adguard/work"
+  export STUB_SUDO_MV_KILL_TARGET="$c"      # TERM justo después de colocar la 1.ª ruta
+  _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target adguard || { fail "las señales se ignoran durante el intercambio: debió terminar"; return 1; }
+  [[ -f "$HLI2_TEST_SCRATCH/.mv-killed" ]] || { fail "no se envió la señal (test vacío)"; return 1; }
+  assert_eq "snapshot-adguard/conf" "$(_rs_content "$c/file.txt")" || return 1
+  assert_eq "snapshot-adguard/work" "$(_rs_content "$w/file.txt")" "las dos rutas, no solo la primera" || return 1
+  [[ ! -e "$BACKUP_STATE_DIR/restore-swap-journal" ]] || { fail "el diario debe borrarse al terminar"; return 1; }
+  assert_eq "ok" "$(_rs_status result)" || return 1
+}
+
+test_restore_exit_cleanup_undoes_a_partial_swap() {
+  _rs_prepare
+  local p="$APPDATA_ROOT/adguard/conf" stage
+  stage="$p.hli2-restore-tmp$p"
+  mkdir -p "$stage"; echo "nuevo" > "$stage/file.txt"
+  ( source "$RS_CODE/lib/core.sh"
+    RS_TS=T RS_ACTIVE=1 RS_SOURCE=local RS_SNAPSHOT=x RS_TARGET=adguard
+    RS_SW_DST=() RS_SW_OLD=() RS_SW_HAD=()
+    _restore_swap_one "$stage" "$p" "$p.hli2-before-restore-T" 1
+    # Un 'set -e' aborta aquí, entre dos intercambios: el trap EXIT lo deshace.
+    restore_exit_cleanup
+  ) >/dev/null 2>&1
+  assert_eq "current-adguard/conf" "$(_rs_content "$p/file.txt")" "se devolvió lo original" || return 1
+  [[ ! -e "$p.hli2-before-restore-T" ]] || { fail "no debe quedar la copia apartada"; return 1; }
+  assert_eq "interrupted" "$(_rs_status result)" || return 1
+  assert_contains "$(_rs_status message)" "se deshizo" "el estado no miente sobre lo que pasó" || return 1
+}
+
+test_restore_interrupted_status_names_the_services_already_restored() {
+  _rs_prepare
+  ( source "$RS_CODE/lib/core.sh"
+    RS_ACTIVE=1 RS_RESULT=ok RS_DONE="adguard jellyfin" RS_SOURCE=local RS_SNAPSHOT=x RS_TARGET=all
+    restore_exit_cleanup ) >/dev/null 2>&1
+  assert_contains "$(_rs_status message)" "ya restaurados: adguard jellyfin" || return 1
+}
+
+test_restore_journal_recovery_puts_old_data_back_before_starting_containers() {
+  _rs_prepare
+  local d="$APPDATA_ROOT/vaultwarden/data" old="$APPDATA_ROOT/vaultwarden/data.hli2-before-restore-20261006-040000"
+  # Corte de luz entre los dos 'mv': falta 'data', lo anterior quedó apartado y el contenedor, detenido.
+  mv "$d" "$old"
+  : > "$STUB_DOCKER_STATE_DIR/vaultwarden.stopped"
+  printf 'vaultwarden\n' > "$BACKUP_STATE_DIR/recovery-containers"
+  printf '%s\t%s\t1\n' "$d" "$old" > "$BACKUP_STATE_DIR/restore-swap-journal"
+  _rs_run recover || { fail "recover falló"; return 1; }
+  assert_eq "current-vaultwarden/data" "$(_rs_content "$d/file.txt")" "lo anterior volvió a su lugar" || return 1
+  [[ ! -e "$old" ]] || { fail "la copia apartada debió volver a su nombre"; return 1; }
+  [[ ! -e "$BACKUP_STATE_DIR/restore-swap-journal" ]] || { fail "el diario debe borrarse"; return 1; }
+  local mvl start
+  mvl="$(_bk_line_no '^sudo\t-n\tmv\t.*hli2-before-restore')"
+  start="$(_bk_line_no '^docker\tstart\tvaultwarden$')"
+  [[ -n "$mvl" && -n "$start" ]] || { fail "faltan llamadas (mv=$mvl start=$start)"; return 1; }
+  (( mvl < start )) || { fail "el dato debe volver ANTES de iniciar el contenedor (mv=$mvl start=$start)"; return 1; }
+}
+
+test_restore_journal_recovery_also_runs_at_the_start_of_run_and_restore() {
+  _rs_prepare
+  local d="$APPDATA_ROOT/vaultwarden/data" old="$APPDATA_ROOT/vaultwarden/data.hli2-before-restore-20261006-040000"
+  mv "$d" "$old"
+  printf '%s\t%s\t1\n' "$d" "$old" > "$BACKUP_STATE_DIR/restore-swap-journal"
+  _bk_run run || return 1
+  assert_eq "current-vaultwarden/data" "$(_rs_content "$d/file.txt")" "run también deshace lo que quedó a medias" || return 1
+}
+
+test_restore_journal_recovery_removes_data_placed_when_nothing_existed_before() {
+  _rs_prepare
+  local d="$APPDATA_ROOT/vaultwarden/data"
+  printf '%s\t%s\t0\n' "$d" "$d.hli2-before-restore-20261006-040000" > "$BACKUP_STATE_DIR/restore-swap-journal"
+  _rs_run recover || return 1
+  [[ ! -e "$d" ]] || { fail "sin estado anterior (had=0) se vuelve a no tener la carpeta"; return 1; }
+}
+
+test_restore_journal_recovery_ignores_invalid_lines() {
+  _rs_prepare
+  printf '/etc/passwd\t/etc/shadow\t1\n../x\t../y\t1\n%s\t%s\t7\n' "$APPDATA_ROOT/vaultwarden/data" "$APPDATA_ROOT/vaultwarden/data.hli2-before-restore-1" > "$BACKUP_STATE_DIR/restore-swap-journal"
+  _rs_run recover || return 1
+  assert_contains "$(cat "$LOG_DIR/backup.log")" "línea inválida" || return 1
+  [[ -z "$(_bk_calls '^sudo\t-n\t(mv|rm)\t')" ]] || { fail "no debió tocar nada con líneas inválidas: $(_bk_calls '^sudo\t-n\t(mv|rm)\t')"; return 1; }
+  assert_eq "current-vaultwarden/data" "$(_rs_content "$APPDATA_ROOT/vaultwarden/data/file.txt")" || return 1
+}
+
+# --- W6: primero las carpetas de paso, después se detiene; espacio libre -----------------------------
+
+test_restore_stages_everything_before_stopping_any_container() {
+  _rs_prepare
+  _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target all || true
+  local last_restore first_stop
+  last_restore="$(_bk_last_line_no '^restic\t(.*\t)?restore\t')"
+  first_stop="$(_bk_line_no '^docker\tstop\t')"
+  [[ -n "$last_restore" && -n "$first_stop" ]] || { fail "faltan llamadas (restore=$last_restore stop=$first_stop)"; return 1; }
+  (( last_restore < first_stop )) || { fail "todos los 'restic restore' deben ir antes del primer 'docker stop' (los servicios siguen arriba mientras se restaura)"; return 1; }
+}
+
+test_restore_refuses_when_there_is_not_enough_free_space() {
+  _rs_prepare
+  export STUB_DF_AVAIL=1000
+  if _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target vaultwarden; then fail "debió negarse por falta de espacio"; return 1; fi
+  assert_contains "$(_rs_status message)" "espacio insuficiente" || return 1
+  [[ -z "$(_bk_calls '^restic\t(.*\t)?restore\t')" ]] || { fail "no debió restaurar nada"; return 1; }
+  [[ -z "$(_bk_calls '^docker\t(stop|start)\t')" ]] || { fail "no debió tocar contenedores"; return 1; }
+  assert_eq "current-vaultwarden/data" "$(_rs_content "$APPDATA_ROOT/vaultwarden/data/file.txt")" || return 1
+}
+
+test_restore_estimates_with_restic_stats_when_the_path_does_not_exist_yet() {
+  _rs_prepare
+  rm -rf "$APPDATA_ROOT/vaultwarden"        # equipo nuevo: no hay nada que medir con 'du'
+  export STUB_RESTIC_STATS_SIZE=1000000000000 STUB_DF_AVAIL=1000000 STUB_DOCKER_NOT_FOUND=vaultwarden
+  if _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target vaultwarden; then fail "debió negarse: la foto no entra"; return 1; fi
+  [[ -n "$(_bk_calls '^restic\t(.*\t)?stats\t.*restore-size')" ]] || { fail "debió estimar con 'restic stats --mode restore-size'"; return 1; }
+  assert_contains "$(_rs_status message)" "espacio insuficiente" || return 1
+  [[ -z "$(_bk_calls '^restic\t(.*\t)?restore\t')" ]] || { fail "no debió restaurar"; return 1; }
+}
+
+# --- Enlaces simbólicos y carpeta de paso -----------------------------------------------------------
+
+test_restore_removes_a_stale_stage_dir_from_an_interrupted_run() {
+  _rs_prepare
+  local d="$APPDATA_ROOT/vaultwarden/data"
+  mkdir -p "$d.hli2-restore-tmp/basura"; echo x > "$d.hli2-restore-tmp/basura/f"
+  _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target vaultwarden || { fail "debió terminar bien"; return 1; }
+  [[ ! -e "$d/basura" ]] || { fail "la basura de la carpeta de paso vieja no debe colarse en los datos"; return 1; }
+  [[ ! -e "$d.hli2-restore-tmp" ]] || { fail "quedó la carpeta de paso"; return 1; }
+  assert_eq "snapshot-vaultwarden/data" "$(_rs_content "$d/file.txt")" || return 1
+}
+
+test_restore_refuses_a_stage_dir_that_is_a_symlink() {
+  _rs_prepare
+  local d="$APPDATA_ROOT/vaultwarden/data" other="$HLI2_TEST_SCRATCH/otro"
+  mkdir -p "$other"
+  ln -s "$other" "$d.hli2-restore-tmp"
+  if _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target vaultwarden; then fail "debió negarse"; return 1; fi
+  [[ -L "$d.hli2-restore-tmp" ]] || { fail "el enlace no se toca"; return 1; }
+  assert_eq "" "$(rg --files "$other" 2>/dev/null || true)" "no se escribió a través del enlace" || return 1
+  [[ -z "$(_bk_calls '^restic\t(.*\t)?restore\t')" ]] || { fail "no debió restaurar"; return 1; }
+  assert_contains "$(_rs_status message)" "enlace simbólico" || return 1
+  assert_eq "current-vaultwarden/data" "$(_rs_content "$d/file.txt")" || return 1
+}
+
+test_restore_refuses_a_data_path_that_is_a_symlink() {
+  _rs_prepare
+  local d="$APPDATA_ROOT/vaultwarden/data" real="$HLI2_TEST_SCRATCH/otro-disco-data"
+  mv "$d" "$real"; ln -s "$real" "$d"
+  if _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target vaultwarden; then fail "debió negarse"; return 1; fi
+  assert_contains "$(_rs_status message)" "enlace simbólico" "con un mensaje claro" || return 1
+  [[ -L "$d" ]] || { fail "el enlace no se toca"; return 1; }
+  assert_eq "current-vaultwarden/data" "$(_rs_content "$real/file.txt")" || return 1
+  [[ -z "$(_bk_calls '^restic\t(.*\t)?restore\t')" ]] || { fail "no debió restaurar"; return 1; }
+}
+
+test_restore_refuses_a_parent_dir_that_is_a_symlink() {
+  _rs_prepare
+  local real="$HLI2_TEST_SCRATCH/jellyfin-real"
+  mv "$APPDATA_ROOT/jellyfin" "$real"; ln -s "$real" "$APPDATA_ROOT/jellyfin"
+  if _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target jellyfin; then fail "debió negarse"; return 1; fi
+  assert_contains "$(_rs_status message)" "enlace simbólico" || return 1
+  assert_eq "current-jellyfin/config" "$(_rs_content "$real/config/file.txt")" || return 1
+  [[ -z "$(_bk_calls '^restic\t(.*\t)?restore\t')" ]] || { fail "no debió restaurar"; return 1; }
+}
+
+test_restore_creates_the_stage_dir_with_plain_mkdir_not_mkdir_p() {
+  _rs_prepare
+  local d="$APPDATA_ROOT/vaultwarden/data"
+  _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target vaultwarden || return 1
+  [[ -n "$(_bk_calls "^sudo\\t(-n\\t)?mkdir\\t--\\t$d.hli2-restore-tmp\$")" ]] || { fail "la carpeta de paso debe crearse con 'mkdir' sin -p"; return 1; }
+}
+
+# --- S1: configuración de Samba inválida ----------------------------------------------------------
+
+test_restore_validates_smb_conf_with_testparm_before_swapping() {
+  _rs_prepare
+  _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target smbd || return 1
+  assert_contains "$(_bk_calls '^testparm\t')" "$RS_SAMBA.hli2-restore-tmp$RS_SAMBA" "valida la copia de la carpeta de paso" || return 1
+  assert_eq "snapshot-smb" "$(_rs_content "$RS_SAMBA")" || return 1
+}
+
+test_restore_refuses_an_invalid_smb_conf_and_keeps_the_current_one() {
+  _rs_prepare
+  export STUB_TESTPARM_FAIL=1
+  if _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target smbd; then fail "debió negarse"; return 1; fi
+  assert_eq "current-smb" "$(_rs_content "$RS_SAMBA")" "Samba sigue con su configuración" || return 1
+  assert_contains "$(_rs_status message)" "no es válida" || return 1
+  [[ ! -e "$RS_SAMBA.hli2-restore-tmp" ]] || { fail "quedó la carpeta de paso"; return 1; }
+  [[ -z "$(_bk_calls 'systemctl\ttry-restart')" ]] || { fail "no debió reiniciar smbd"; return 1; }
+}
+
+# --- R2: nada que restaurar si todo es "solo local" (S6) --------------------------------------------
+
+test_restore_from_r2_when_all_the_data_of_a_service_is_local_only() {
+  _rs_prepare
+  _bk_r2
+  printf '%s\n' 'SERVICE_NAME="OpenCloud"' 'SERVICE_KIND="container"' 'SERVICE_CONTAINER="opencloud"' \
+    "SERVICE_DATA=(\"$APPDATA_ROOT/opencloud/data\")" 'SERVICE_BACKUP_KIND="files"' \
+    "SERVICE_BACKUP_LOCAL_ONLY=(\"$APPDATA_ROOT/opencloud/data\")" > "$RS_CODE/services/opencloud.conf"
+  if _rs_run restore --source r2 --snapshot "$_RS_CLOUD" --target opencloud; then fail "debió fallar con un mensaje claro"; return 1; fi
+  assert_contains "$(_rs_status message)" "todos los datos de 'opencloud' son solo locales" || return 1
+  [[ -z "$(_bk_calls '^docker\tstop\t')" ]] || { fail "no debió detener nada"; return 1; }
+  # El módulo lo avisa antes de preguntar nada más.
+  export STUB_SUDO_RUN_ENTRYPOINT="snapshots"
+  printf 'r2\n%s\nopencloud\n' "$_RS_CLOUD" > "$DIALOG_MENU_QUEUE"
+  printf 'yes\nyes\n' > "$DIALOG_YESNO_QUEUE"
+  bash "$RS_CODE/modules/backup-restore.sh" </dev/null || true
+  assert_contains "$(_bk_calls '^dialog\t')" "solo existen en la copia local" || return 1
+  [[ -z "$(_bk_calls "^sudo\t-n\t$BACKUP_INSTALL_DIR/bin/hli2-backup\trestore")" ]] || { fail "el módulo no debe pedir la restauración"; return 1; }
+}
+
+# --- W4/W5: respuestas del módulo y frescura del estado ---------------------------------------------
+
+test_restore_module_esc_on_the_safety_question_cancels_everything() {
+  _rs_module_env
+  printf '%s\nvaultwarden\n' "$_RS_FULL_NEW" > "$DIALOG_MENU_QUEUE"
+  printf 'yes\nesc\n' > "$DIALOG_YESNO_QUEUE"          # resumen sí / ESC en la pregunta del backup de seguridad
+  bash "$RS_CODE/modules/backup-restore.sh" </dev/null || true
+  [[ -z "$(_bk_calls "^sudo\t-n\t$BACKUP_INSTALL_DIR/bin/hli2-backup\t(run|restore)")" ]] || { fail "ESC no es 'no hacer backup y seguir': no debió ejecutar nada"; return 1; }
+  assert_contains "$(_bk_calls '^dialog\t')" "Restauración cancelada" || return 1
+  assert_eq "current-vaultwarden/data" "$(_rs_content "$APPDATA_ROOT/vaultwarden/data/file.txt")" || return 1
+}
+
+test_restore_module_does_not_discard_old_when_the_safety_status_is_stale() {
+  _rs_module_env
+  export STUB_SUDO_RUN_ENTRYPOINT="snapshots restore"      # 'run' es un no-op: el estado queda viejo
+  printf 'timestamp=%s\nresult=ok\nlocal=ok\ncloud=ok\ncheck=ok\nsnapshot_full=ab12cd01\nsnapshot_cloud=ab12cd02\nmessage=\n' "$(date -d '2 days ago' -Is)" > "$BACKUP_STATE_DIR/backup-status"
+  printf '%s\nvaultwarden\n' "$_RS_FULL_NEW" > "$DIALOG_MENU_QUEUE"
+  printf 'yes\nyes\n' > "$DIALOG_YESNO_QUEUE"
+  bash "$RS_CODE/modules/backup-restore.sh" </dev/null || true
+  assert_not_contains "$(_rs_sudo_calls)" "--discard-old" "un estado viejo no prueba que el backup de seguridad se hizo" || return 1
+  assert_contains "$(_bk_calls '^dialog\t')" "No se pudo confirmar el resultado del backup de seguridad" || return 1
+  [[ -n "$(_bk_calls "^sudo\t-n\t$BACKUP_INSTALL_DIR/bin/hli2-backup\trestore")" ]] || { fail "igual restaura"; return 1; }
+}
+
+test_restore_module_does_not_discard_old_when_the_safety_backup_has_a_warning() {
+  _rs_module_env
+  export STUB_RESTIC_FAIL_RC=3 STUB_RESTIC_FAIL="backup:cloud"   # foto cloud con archivos ilegibles
+  printf '%s\nvaultwarden\n' "$_RS_FULL_NEW" > "$DIALOG_MENU_QUEUE"
+  printf 'yes\nyes\n' > "$DIALOG_YESNO_QUEUE"
+  bash "$RS_CODE/modules/backup-restore.sh" </dev/null || true
+  assert_not_contains "$(_rs_sudo_calls)" "--discard-old" "solo result=ok autoriza descartar" || return 1
+}
+
+test_restore_module_never_shows_a_stale_restore_status() {
+  _rs_module_env
+  export STUB_SUDO_RUN_ENTRYPOINT="snapshots"             # 'restore' no se ejecuta (p. ej. sudo -n vencido)
+  printf 'timestamp=%s\nresult=ok\nsource=local\nsnapshot=%s\nsnapshot_time=\ntarget=vaultwarden\nmodules=\nmessage=\n' "$(date -d '3 days ago' -Is)" "$_RS_FULL_NEW" > "$BACKUP_STATE_DIR/restore-status"
+  printf '%s\nvaultwarden\n' "$_RS_FULL_NEW" > "$DIALOG_MENU_QUEUE"
+  printf 'yes\nno\n' > "$DIALOG_YESNO_QUEUE"
+  if bash "$RS_CODE/modules/backup-restore.sh" </dev/null; then fail "debió terminar con error"; return 1; fi
+  assert_contains "$(_bk_calls '^dialog\t')" "No se pudo leer el resultado de la restauración" || return 1
+  assert_not_contains "$(_bk_calls '^dialog\t')" "Restauración terminada" "no se muestra el resultado de otra restauración" || return 1
+}
+
+test_restore_module_lets_you_pick_older_snapshots_beyond_the_first_page() {
+  _rs_module_env
+  export HLI2_RESTORE_PAGE=1
+  printf 'more\n%s\nvaultwarden\n' "$_RS_FULL_OLD" > "$DIALOG_MENU_QUEUE"
+  printf 'yes\nno\n' > "$DIALOG_YESNO_QUEUE"
+  bash "$RS_CODE/modules/backup-restore.sh" </dev/null || { fail "el módulo falló"; return 1; }
+  local menus
+  menus="$(_bk_calls '^dialog\t.*--menu')"
+  assert_contains "$menus" "Ver fotos más antiguas" "ofrece la página siguiente" || return 1
+  [[ -n "$(_bk_calls "^sudo\t-n\t$BACKUP_INSTALL_DIR/bin/hli2-backup\trestore\t--source\tlocal\t--snapshot\t$_RS_FULL_OLD\t--target\tvaultwarden\$")" ]] || { fail "debió restaurar la foto más vieja: $(_rs_sudo_calls)"; return 1; }
+  assert_eq "snapshot-vaultwarden/data" "$(_rs_content "$APPDATA_ROOT/vaultwarden/data/file.txt")" || return 1
+}
+
+# --- W8: el timer esperando una restauración no es un error ------------------------------------------
+
+test_backup_run_waiting_on_a_restore_is_recorded_as_skipped_not_error() {
+  _bk_prepare
+  printf 'timestamp=%s\nresult=running\nsource=local\nsnapshot=ab12cd01\nsnapshot_time=\ntarget=all\nmodules=\nmessage=\n' "$(date -Is)" > "$BACKUP_STATE_DIR/restore-status"
+  printf 'timestamp=%s\nresult=ok\nlocal=ok\ncloud=ok\ncheck=ok\nsnapshot_full=ab12cd01\nsnapshot_cloud=ab12cd02\nmessage=\n' "$(date -d '1 hour ago' -Is)" > "$BACKUP_STATE_DIR/backup-status"
+  flock "$BACKUP_STATE_DIR/lock" sleep 5 &
+  local holder=$!
+  sleep 0.3
+  local rc=0
+  HLI2_BACKUP_LOCK_WAIT=1 _bk_run run || rc=$?
+  kill "$holder" 2>/dev/null || true
+  assert_eq "0" "$rc" "no es un fallo del backup (el servicio systemd no queda 'failed')" || return 1
+  assert_eq "skipped" "$(_bk_status result)" || return 1
+  assert_contains "$(_bk_status message)" "restauración en curso" || return 1
+  [[ -z "$(_bk_calls '^(docker|restic)\t')" ]] || { fail "no debió tocar nada"; return 1; }
+  # Se conservan las fotos del último backup real y el dashboard lo muestra como omitido.
+  assert_eq "ab12cd01" "$(_bk_status snapshot_full)" || return 1
+  local summary
+  summary="$( ( source "$REPO_ROOT/lib/core.sh"; backup_status_summary ) )"
+  assert_contains "$summary" "omitido" || return 1
+  assert_contains "$summary" "restauración en curso" || return 1
+}
+
+# --- W3: recuperación ante un desastre con la contraseña equivocada ----------------------------------
+
+test_backup_init_wrong_password_initializes_nothing_and_a_retry_works() {
+  _bk_prepare
+  _bk_r2
+  rm -f "$BACKUP_ROOT/config"
+  export STUB_RESTIC_CAT_WRONG_PW=1
+  if _bk_run init; then fail "debió negarse con la contraseña equivocada"; return 1; fi
+  [[ -z "$(_bk_calls '^restic\t(.*\t)?init')" ]] || { fail "no debió inicializar NADA (ni siquiera el repositorio local)"; return 1; }
+  [[ ! -e "$BACKUP_ROOT/config" ]] || { fail "el repositorio local no debe quedar inicializado"; return 1; }
+  # Con la contraseña correcta (el repositorio de R2 existe): el local nace con los parámetros de R2.
+  unset STUB_RESTIC_CAT_WRONG_PW
+  export STUB_RESTIC_R2_INITIALIZED=1
+  : > "$STUB_CALL_LOG"
+  _bk_run init || { fail "con la contraseña correcta debió funcionar"; return 1; }
+  [[ -f "$BACKUP_ROOT/config" ]] || { fail "debió inicializar el repositorio local"; return 1; }
+  local init
+  init="$(_bk_calls '^restic\t(.*\t)?init\t')"
+  assert_eq "1" "$(printf '%s\n' "$init" | grep -c .)" "solo el local: el de R2 ya existe" || return 1
+  _bk_has_arg "$init" "--from-repo" && _bk_has_arg "$init" "s3:https://${_BK_ACCOUNT}.r2.cloudflarestorage.com/bkt" || { fail "el local debe copiar el repositorio de R2: $init"; return 1; }
+  _bk_has_arg "$init" "--copy-chunker-params" || { fail "faltan los parámetros de troceado de R2: $init"; return 1; }
+  assert_not_contains "$(cat "$STUB_CALL_LOG")" "$_BK_SECRET_VAL" "las claves de R2 viajan por el entorno, nunca por argv" || return 1
+}
+
+test_backup_init_does_not_initialize_on_an_ambiguous_r2_error() {
+  _bk_prepare
+  _bk_r2
+  rm -f "$BACKUP_ROOT/config"
+  export STUB_RESTIC_CAT_ERROR=1
+  if _bk_run init; then fail "debió negarse: no se pudo comprobar R2"; return 1; fi
+  [[ -z "$(_bk_calls '^restic\t(.*\t)?init')" ]] || { fail "solo se inicializa ante una señal positiva de 'no hay repositorio'"; return 1; }
+  [[ ! -e "$BACKUP_ROOT/config" ]] || { fail "no debe quedar nada inicializado"; return 1; }
+  assert_contains "$(cat "$LOG_DIR/backup.log")" "No se inicializó nada" || return 1
+}
+
+test_backup_init_new_install_creates_local_first_then_r2_from_local() {
+  _bk_prepare
+  _bk_r2
+  rm -f "$BACKUP_ROOT/config"
+  _bk_run init || return 1
+  local first second
+  first="$(_bk_calls '^restic\t(.*\t)?init' | sed -n 1p)"
+  second="$(_bk_calls '^restic\t(.*\t)?init' | sed -n 2p)"
+  [[ -n "$first" && -n "$second" ]] || { fail "debió inicializar los dos"; return 1; }
+  ! _bk_has_arg "$first" "--from-repo" || { fail "el local nuevo no copia nada"; return 1; }
+  _bk_has_arg "$second" "--from-repo" && _bk_has_arg "$second" "$BACKUP_ROOT" && _bk_has_arg "$second" "--copy-chunker-params" || { fail "R2 se crea desde el local: $second"; return 1; }
+}
+
+test_backup_setup_disaster_recovery_allows_reentering_the_password_after_a_failure() {
+  _rs_prepare
+  _bk_setup_env
+  local bad="la-contrasena-equivocada-123456" good="la-contrasena-correcta-7890123"
+  export STUB_SUDO_RUN_ENTRYPOINT="init" STUB_RESTIC_CAT_WRONG_PW=1
+  echo "existing" > "$DIALOG_MENU_QUEUE"
+  printf '%s\n%s\n%s\n' "$bad" "$bad" "$_BK_SECRET_VAL" > "$DIALOG_PASSWORDBOX_QUEUE"
+  printf 'yes\n' > "$DIALOG_YESNO_QUEUE"
+  printf '%s\n%s\n%s\n' "https://${_BK_ACCOUNT}.r2.cloudflarestorage.com" "hli2-bkt" "$_BK_SECRET_KEY" > "$DIALOG_INPUTBOX_QUEUE"
+  if timeout 30 bash "$RS_CODE/modules/backup-setup.sh"; then fail "con la contraseña equivocada debió fallar"; return 1; fi
+  [[ ! -e "$BACKUP_ROOT/config" ]] || { fail "no debió inicializar el repositorio local"; return 1; }
+  assert_file_contains "$STATE_FILE" "backup-dr-pending" "la recuperación queda pendiente de verificar" || return 1
+
+  # Segunda corrida con la contraseña correcta: NO dice "ya existente y confirmada: se conserva".
+  unset STUB_RESTIC_CAT_WRONG_PW
+  export STUB_RESTIC_R2_INITIALIZED=1
+  : > "$STUB_CALL_LOG"
+  echo "existing" > "$DIALOG_MENU_QUEUE"
+  printf '%s\n%s\n' "$good" "$good" > "$DIALOG_PASSWORDBOX_QUEUE"
+  : > "$DIALOG_YESNO_QUEUE"
+  timeout 30 bash "$RS_CODE/modules/backup-setup.sh" || { fail "el reintento con la contraseña correcta debió funcionar"; return 1; }
+  assert_eq "$good" "$(sudo -n cat "$SECRETS_DIR/restic-password")" "la contraseña se reemplazó por la correcta" || return 1
+  [[ -f "$BACKUP_ROOT/config" ]] || { fail "ahora sí se inicializó el repositorio local"; return 1; }
+  assert_file_not_contains "$STATE_FILE" "backup-dr-pending" "verificada: se saca la marca" || return 1
+  assert_not_contains "$(cat "$STUB_CALL_LOG")" "$good" || return 1
+  assert_not_contains "$(cat "$STUB_CALL_LOG")" "$bad" || return 1
 }

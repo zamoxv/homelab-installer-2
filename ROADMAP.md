@@ -592,17 +592,31 @@ Especificación acordada con el usuario (2026-10-06):
       siempre del registro, nunca de los argumentos. Detalle (ver
       `lib/restore.sh`):
       - Se verifica la foto (existe en ese repositorio con el tag `full` en
-        local o `cloud` en R2) y se detienen **todos** los contenedores del
-        servicio. Cada ruta se restaura primero en `<ruta>.hli2-restore-tmp`
-        (mismo sistema de archivos), y solo si todas las rutas del servicio
-        salieron bien se intercambian: lo actual pasa a
-        `<ruta>.hli2-before-restore-<fecha>` y lo restaurado ocupa su lugar
-        (reemplazo, no mezcla; si falla un intercambio se deshace todo el
-        servicio). Una restauración fallida o interrumpida nunca deja una
-        carpeta a medias. Dueños y modos vienen de la foto (restic como root).
-      - Copia previa: al terminar bien se conserva **solo la última** por ruta
-        (para volver atrás) y se avisa dónde está; si el módulo acaba de hacer el
-        backup de seguridad, se borra también (`--discard-old`).
+        local o `cloud` en R2), el espacio libre (estimado con `du` o con
+        `restic stats`) y que ni la ruta ni su padre ni la carpeta de paso sean
+        enlaces simbólicos. Cada ruta se restaura primero en
+        `<ruta>.hli2-restore-tmp` (mismo sistema de archivos, creada con `mkdir`
+        sin `-p` y comprobada) **con los contenedores aún en marcha**; recién con
+        todo listo se detienen **todos** los contenedores del servicio y se
+        intercambia: lo actual pasa a `<ruta>.hli2-before-restore-<fecha>` y lo
+        restaurado ocupa su lugar (reemplazo, no mezcla). Cada servicio se
+        intercambia con las señales ignoradas de principio a fin, con un diario
+        en el estado de root: si el proceso aborta, se deshace; si el equipo se
+        cae a medias, `hli2-backup recover` (o el siguiente `run`/`restore`) lo
+        deshace antes de iniciar ningún contenedor. Una restauración fallida o
+        interrumpida nunca deja una carpeta a medias. Dueños y modos vienen de la
+        foto (restic como root). `smb.conf` se valida con `testparm` antes.
+      - Copias previas: se conservan la más vieja (el estado anterior a las
+        restauraciones) y la más nueva de cada ruta, solo las de corridas
+        exitosas (registro en el estado de root); no se borra nada tras una
+        corrida fallida o si la anterior quedó interrumpida. Si el módulo acaba
+        de hacer el backup de seguridad **y su estado lo confirma** (resultado
+        correcto, con foto, de esa corrida) pasa `--discard-old` y se borran
+        todas. Las copias de los `.env` de `/etc/hli2` van fuera de `/etc/hli2`
+        (estado de root, 0700): los secretos viejos no entran en los backups.
+      - Un backup (timer) que espera el bloqueo durante una restauración
+        queda `skipped` ("restauración en curso", omitido en el dashboard), no
+        `error`.
       - `opencloud/data` solo desde la copia local: desde R2 no se pide ni se
         toca y el resultado queda "con avisos" explicando por qué.
       - "Todo": todos los servicios con datos, `smb.conf` (unidad `smbd` se
@@ -613,10 +627,13 @@ Especificación acordada con el usuario (2026-10-06):
         avisa qué módulos ejecutar (y Dokploy primero si Docker no está).
       - Recuperación ante un desastre: reinstalar Ubuntu y el HLI, ejecutar
         `backup-setup` con la **misma contraseña de restic** ("Recuperación
-        ante un desastre"; no inicializa un repositorio de R2 existente: lo
-        comprueba con `restic cat config` y se niega si la contraseña no lo
-        abre) y restaurar "todo" desde R2 (procedimiento completo en
-        docs/VALIDACION.md, prueba 80).
+        ante un desastre"). `hli2-backup init` comprueba R2 primero (`restic cat
+        config`) y no inicializa nada si la contraseña no lo abre o no se puede
+        comprobar (solo inicializa ante un "no hay repositorio" positivo);
+        con R2 existente, el repositorio local nuevo copia sus parámetros de
+        troceado. Se puede reingresar la contraseña tras un fallo. Luego,
+        restaurar "todo" desde R2 (procedimiento completo en docs/VALIDACION.md,
+        prueba 80).
       - Resultado en `/var/lib/hli2-root/restore-status` (0644, sin secretos) y
         en `/var/log/hli2/backup.log`. Supuestos de restic 0.16.4 sin verificar
         en hardware: `restore <id> --target <dir> --include <ruta-absoluta>`

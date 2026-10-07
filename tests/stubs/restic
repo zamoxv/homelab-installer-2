@@ -17,6 +17,7 @@
 #                    exista ahí (lo que no está "no está en la foto").
 #                    STUB_RESTIC_FIXTURE_R2 lo reemplaza para los repos s3.
 #   STUB_RESTIC_CAT_WRONG_PW=1                'cat config' falla con "wrong password".
+#   STUB_RESTIC_CAT_ERROR=1                   'cat config' de R2 falla por red (sin señal de "no hay repo").
 #   STUB_RESTIC_KILL_ON="backup"              envía TERM al proceso bin/hli2-backup
 #                    (el ancestro más alto) al correr ese subcomando: simula
 #                    una interrupción en plena ventana de parada.
@@ -33,7 +34,7 @@ log_call restic "$@"
 sub=""
 for a in "$@"; do
   case "$a" in
-    init|backup|copy|forget|check|cat|snapshots|restore) sub="$a"; break ;;
+    init|backup|copy|forget|check|cat|snapshots|restore|stats) sub="$a"; break ;;
   esac
 done
 
@@ -86,8 +87,20 @@ case "$sub" in
       exit 1
     fi
     if [[ "$is_r2" -eq 1 ]]; then
-      [[ -f "${STUB_SAFE_ROOT:-/nonexistent}/r2-initialized" || -n "${STUB_RESTIC_R2_INITIALIZED:-}" ]] || exit 1
+      if [[ -n "${STUB_RESTIC_CAT_ERROR:-}" ]]; then
+        echo "Fatal: unable to open config file: dial tcp: lookup r2: no such host" >&2
+        exit 1
+      fi
+      if [[ ! -f "${STUB_SAFE_ROOT:-/nonexistent}/r2-initialized" && -z "${STUB_RESTIC_R2_INITIALIZED:-}" ]]; then
+        # Mensaje real de restic 0.16 ante una clave S3 inexistente (no hay repositorio).
+        printf 'Fatal: unable to open config file: Stat: The specified key does not exist.\nIs there a repository at the following location?\n%s\n' "${RESTIC_REPOSITORY:-}" >&2
+        exit 1
+      fi
     fi
+    ;;
+  stats)
+    # STUB_RESTIC_STATS_SIZE: tamaño total de la foto (bytes).
+    echo "{\"total_size\":${STUB_RESTIC_STATS_SIZE:-1024},\"total_file_count\":1,\"snapshots_count\":1}"
     ;;
   snapshots)
     if [[ -n "${STUB_RESTIC_SNAPSHOTS_FILE:-}" ]]; then

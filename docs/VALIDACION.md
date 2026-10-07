@@ -220,6 +220,17 @@ fecha vuelve.
 | 78 | Restaurar **Samba** (smb.conf) | `systemctl is-active smbd` → `active`; el recurso compartido responde |
 | 79 | `cat /var/lib/hli2-root/restore-status` | Legible sin sudo; fecha, `result`, origen, foto, destino, `message`; ningún secreto |
 | 80 | **Simulacro en la X230 (recuperación ante un desastre)**: procedimiento de abajo, con "Todo" desde R2 | Los servicios que existen se restauran; el aviso final lista los módulos que faltan; tras ejecutarlos, cada servicio arranca con sus datos |
+| 81 | Con la restauración de OpenCloud o de "todo" en curso (log: "Restaurando ... en la carpeta de paso"), `docker ps` | Los contenedores siguen **arriba** mientras se restaura a las carpetas de paso; recién después aparece "Deteniendo '...'" y solo duran el intercambio |
+| 82 | `sudo kill -TERM $(pgrep -f 'hli2-backup restore')` durante el **intercambio** (tras "Deteniendo", en un servicio con varias rutas como AdGuard) | La señal se ignora hasta terminar ese servicio (nunca queda mitad restaurado); el resultado es correcto o, si se interrumpió antes, `interrupted` con los servicios ya restaurados nombrados |
+| 83 | Simular un corte de luz entre los dos `mv` (en una prueba controlada: dejar un `restore-swap-journal` en `/var/lib/hli2-root` con la ruta faltante y su copia `.hli2-before-restore-*`) y `sudo systemctl start hli2-backup-recover.service` | Lo anterior vuelve a su lugar **antes** de iniciar el contenedor (que no arranca vacío); el diario desaparece |
+| 84 | Cerrar la terminal SSH (o `kill -HUP` del cliente) en pleno backup o restauración | Los contenedores detenidos vuelven a iniciar igual (el log lo muestra en `/var/log/hli2/backup.log`) |
+| 85 | Con poco espacio libre en el disco de datos (o un `STUB` equivalente: llenar el disco) intentar restaurar | Se niega antes de restaurar nada ("espacio insuficiente en ...") y no se detiene ningún contenedor |
+| 86 | `sudo systemctl start hli2-backup.service` mientras hay una restauración en curso | El backup termina bien sin hacer nada; `cat /var/lib/hli2-root/backup-status` dice `result=skipped` y "restauración en curso"; el dashboard muestra "omitido", no error |
+| 87 | Restaurar 3 veces el mismo servicio (con o sin backup de seguridad) y mirar `sudo ls -d /srv/appdata/vaultwarden/data*` | Quedan la copia previa **más vieja** (estado original) y la más nueva; la del medio se borra. Con backup de seguridad verificado (`--discard-old`) no queda ninguna. Si la restauración anterior terminó `interrupted`, no se borra ninguna |
+| 88 | Responder ESC en la pregunta del backup de seguridad | "Restauración cancelada": no se hace backup ni se restaura |
+| 89 | Dejar un enlace simbólico en lugar de `/srv/appdata/vaultwarden/data` y restaurar Vaultwarden | Se niega con "es un enlace simbólico"; no escribe nada |
+| 90 | `backup-setup` en un equipo nuevo con la contraseña **equivocada** (recuperación ante un desastre) | "el repositorio de R2 ya existe y la contraseña de restic no lo abre. No se inicializó nada"; el repositorio local queda sin inicializar. Al volver a correr el módulo y elegir "Recuperación ante un desastre" se puede ingresar la contraseña correcta |
+| 91 | Restaurar `smb.conf` con `testparm` instalado | Valida la copia de la carpeta de paso antes de reemplazar la actual; una configuración inválida se rechaza sin tocar la actual |
 
 **Procedimiento de recuperación ante un desastre (también es la prueba 80)**
 
@@ -230,10 +241,12 @@ fecha vuelve.
 2. Ejecutar `backup-setup`. En "Contraseña de los backups" elegir
    **"Recuperación ante un desastre"** e ingresar (dos veces) **la misma
    contraseña de restic** guardada en Vaultwarden o en papel. Configurar R2 con
-   el **mismo bucket** (endpoint, bucket y claves). `backup-setup` NO
-   inicializa nada que ya exista: comprueba el repositorio de R2 con
-   `restic cat config`, y si la contraseña no lo abre, se niega (no inicializa
-   encima). El repositorio local sí se crea nuevo (vacío).
+   el **mismo bucket** (endpoint, bucket y claves). `backup-setup` comprueba
+   PRIMERO el repositorio de R2 con `restic cat config`: si la contraseña no lo
+   abre, o no se puede comprobar (red, claves, bucket), se niega y **no
+   inicializa nada** (ni el local); solo inicializa ante una señal positiva de
+   "no hay repositorio". Al volver a correr el módulo se puede reingresar la
+   contraseña. El repositorio local se crea nuevo, con los parámetros de R2.
 3. Herramientas → "Restaurar un backup" → **copia externa (R2)** → la foto más
    nueva → **Todo**. Se restauran todos los servicios con datos, `smb.conf` y los
    secretos de los servicios de `/etc/hli2`. **No** se tocan `restic-password`
@@ -245,9 +258,12 @@ fecha vuelve.
    módulos que indique el aviso final ("Falta: ... ejecute sus módulos: ...").
    Cada módulo despliega el contenedor y encuentra sus datos y secretos ya en
    su lugar (reutiliza el secreto existente: no pide uno nuevo).
-5. Comprobar el dashboard y hacer "Hacer backup ahora": la primera subida a R2
-   desde el equipo nuevo vuelve a enviar todo (el repositorio local nuevo tiene
-   otros parámetros de troceado, así que no se deduplica contra lo ya subido).
+5. Comprobar el dashboard y hacer "Hacer backup ahora". Como R2 ya tenía el
+   repositorio, el repositorio local nuevo se crea con sus mismos parámetros de
+   troceado (`restic init --from-repo <R2> --copy-chunker-params`), así que la
+   primera subida se deduplica contra lo ya subido (supuesto de restic 0.16 sin
+   verificar: que las claves de R2 del entorno sirvan también como origen del
+   `--from-repo`; si falla, el mensaje de `backup-setup` lo dice).
 
 Qué NO restaura "Todo": el estado del propio HLI (`/var/lib/hli2`, los módulos
 marcados como hechos) ni su configuración (`config/`): vuelven al reinstalar el

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Stub de 'testparm': registra la llamada; falla si STUB_TESTPARM_FAIL está definido.
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call testparm "$@"
+[[ -z "${STUB_TESTPARM_FAIL:-}" ]] || { echo "Unknown parameter encountered (simulado)" >&2; exit 1; }
+exit 0

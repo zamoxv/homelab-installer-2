@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Stub de 'df': con STUB_DF_AVAIL=<bytes>, 'df -B1 --output=avail' informa ese espacio
+# libre (simula un disco casi lleno); todo lo demás se delega al 'df' real.
+set -uo pipefail
+if [[ -n "${STUB_DF_AVAIL:-}" && " $* " == *" --output=avail "* ]]; then
+  printf 'Avail\n%s\n' "$STUB_DF_AVAIL"
+  exit 0
+fi
+exec "$(command -p -v df 2>/dev/null || echo /usr/bin/df)" "$@"

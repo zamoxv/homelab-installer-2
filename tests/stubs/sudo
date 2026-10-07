@@ -164,6 +164,13 @@ case "$sub" in
         rc=$?
       fi
       _stub_relock_root_area
+      # STUB_SUDO_MV_KILL_TARGET=<ruta>: tras un 'mv ... <ruta>' exitoso manda TERM
+      # al entrypoint (señal justo entre dos intercambios).
+      if [[ "$sub" == "mv" && "$rc" -eq 0 && -n "${STUB_SUDO_MV_KILL_TARGET:-}" && "${args[-1]}" == "$STUB_SUDO_MV_KILL_TARGET" && ! -f "$STUB_SAFE_ROOT/.mv-killed" ]]; then
+        : > "$STUB_SAFE_ROOT/.mv-killed"
+        stub_kill_entrypoint || true
+        sleep 0.3
+      fi
       exit "$rc"
     else
       # Ruta fuera del scratch de test: jamás se toca. SOLO 'tee' necesita
