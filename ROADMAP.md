@@ -530,39 +530,39 @@ normal.
 
 Especificación acordada con el usuario (2026-10-06):
 
-- [ ] **Qué se respalda** (desde el registro de servicios, `SERVICE_DATA`):
+- [x] **Qué se respalda** (desde el registro de servicios, `SERVICE_DATA`):
       todo `/srv/appdata` **excepto cachés** (`jellyfin/cache`), `/etc/samba/smb.conf`,
       `/etc/hli2` (secretos, root 0600) y la configuración del HLI. La media
       (`/srv/media*`) NO se respalda. Dokploy no se respalda: se reinstala y
       los composes se regeneran con los módulos del HLI.
-- [ ] **Consistencia**: `SERVICE_BACKUP_KIND` gobierna. `sqlite` (o base
+- [x] **Consistencia**: `SERVICE_BACKUP_KIND` gobierna. `sqlite` (o base
       embebida) = detener el contenedor durante la foto local y levantarlo
       siempre (trap). Corregir el registro: Home Assistant (SQLite) y AdGuard
       (bbolt) pasan a ese tipo. Los contenedores parados lo menos posible: la
       subida a R2 ocurre con los servicios ya levantados.
-- [ ] **Dos fotos en la misma ventana de parada**, ambas en el repositorio
+- [x] **Dos fotos en la misma ventana de parada**, ambas en el repositorio
       local (deduplicadas, casi gratis): una completa (tag `full`) y otra sin
       `opencloud/data` (tag `cloud`). Con los servicios ya levantados,
       `restic copy --tag cloud` lleva esa foto al repositorio de R2: la copia
       externa es idéntica a la local, sin una segunda parada.
-- [ ] **Repositorio local** en el SSD de media (`$BACKUP_ROOT`, por defecto
+- [x] **Repositorio local** en el SSD de media (`$BACKUP_ROOT`, por defecto
       `$MEDIA_ROOT/.hli2-backups`; el módulo `storage` ya no le cambia dueño
       ni modo y Samba no lo comparte), carpeta root 0700 (`/srv/media` sí se
       comparte por Samba). **Falla cerrado** si esa ruta no está en un punto de montaje
       distinto del disco del sistema (lección del 2026-10-06: un disco montado
       tarde deja escribir en la carpeta oculta del NVMe).
-- [ ] **Repositorio externo**: Cloudflare R2 (bucket propio, token S3 con
+- [x] **Repositorio externo**: Cloudflare R2 (bucket propio, token S3 con
       permiso solo sobre ese bucket). Endpoint, bucket y claves en
       `/etc/hli2/restic.env` root 0600 (`RESTIC_REPOSITORY`,
       `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION=auto`),
       nunca en argv ni en logs: llegan a restic solo por su entorno. El
       archivo SÍ se respalda (cifrado): se necesita para recuperarse de un
       desastre; la contraseña de restic NO se respalda.
-- [ ] **Contraseña de restic**: generada al configurar, guardada root 0600,
+- [x] **Contraseña de restic**: generada al configurar, guardada root 0600,
       mostrada UNA vez con confirmación explícita de que el usuario la guardó
       en Vaultwarden **y en papel** (sin ella la copia externa es irrecuperable;
       si el servidor muere, Vaultwarden muere con él).
-- [ ] **Automático**: timer de systemd diario a las 04:00 (`Persistent=true`)
+- [x] **Automático**: timer de systemd diario a las 04:00 (`Persistent=true`)
       que corre `bin/hli2-backup run` como root **desde una copia root-owned del
       código** en `/usr/local/lib/hli2` (la deja `backup-setup` y la refresca
       `backup-now`; root nunca ejecuta el checkout del usuario; el estado de
@@ -573,10 +573,10 @@ Especificación acordada con el usuario (2026-10-06):
       0.16.4 (noble): `restic copy --from-repo --from-password-file --tag`,
       retención con `--group-by host,tags`; región `auto` de R2 sin verificar
       en hardware. **Manual**: "Hacer backup ahora" en el menú.
-- [ ] **Retención** en ambos repositorios: `--keep-daily 7 --keep-weekly 4
+- [x] **Retención** en ambos repositorios: `--keep-daily 7 --keep-weekly 4
       --keep-monthly 6`, más `prune`. Chequeo de integridad periódico
       (`restic check`, con una muestra de datos).
-- [ ] **Restaurar** desde el menú (parte del entregable, no opcional):
+- [x] **Restaurar** desde el menú (parte del entregable, no opcional):
       Herramientas → "Restaurar un backup" (`modules/backup-restore.sh`):
       origen (copia local, o R2 si está configurada), fecha (foto, la más nueva
       primero), y qué (un servicio con datos o "todo", para migrar a un equipo
@@ -660,9 +660,14 @@ Especificación acordada con el usuario (2026-10-06):
         (crea `<dir>` y restaura la ruta con todo su contenido bajo
         `<dir>/<ruta>`), `snapshots --json` con `id`, `short_id`, `time` y
         `tags`, y `snapshots --tag T <id-corto>`.
-- [ ] **Estado visible**: resultado del último backup (fecha, OK/error, qué
+- [x] **Estado visible**: resultado del último backup (fecha, OK/error, qué
       copia falló) legible por el usuario y mostrado en el dashboard del HLI.
       Avisos por Telegram: v2.6.
+- [x] **Validado en el M70q (2026-10-09)**: `backup-setup` con un bucket R2
+      nuevo y vacío (restic 0.16.4 lo reconoce como "repositorio inexistente":
+      no hizo falta confirmar), backup local + R2 correctos (dashboard),
+      restaurar Vaultwarden desde local y desde R2 a la foto anterior (la
+      entrada borrada volvió en ambos casos).
 - [ ] Verificación en el M70q: backup manual, backup del timer, restaurar
       Vaultwarden desde local y desde R2 a una fecha anterior, y un
       "restaurar todo" de prueba en la X230 (docs/VALIDACION.md, pruebas
