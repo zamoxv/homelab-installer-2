@@ -82,7 +82,9 @@ _backup_show_password_until_confirmed() {
   local tries=0
   while true; do
     hli_busy_end
-    dialog --title "Contraseña de backups" --textbox "$_BACKUP_PW_TMP" 18 76 || true
+    # --no-mouse: sin esto dialog captura el mouse y el usuario no puede
+    # seleccionar la contraseña para copiarla (un clic cambia de ventana).
+    dialog --no-mouse --title "Contraseña de backups" --textbox "$_BACKUP_PW_TMP" 18 76 || true
     if confirm "¿Guardó la contraseña en Vaultwarden Y en papel?\n\nSi elige 'No', se mostrará de nuevo."; then
       break
     fi
