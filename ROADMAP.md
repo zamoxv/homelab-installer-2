@@ -667,7 +667,8 @@ Especificación acordada con el usuario (2026-10-06):
       nuevo y vacío (restic 0.16.4 lo reconoce como "repositorio inexistente":
       no hizo falta confirmar), backup local + R2 correctos (dashboard),
       restaurar Vaultwarden desde local y desde R2 a la foto anterior (la
-      entrada borrada volvió en ambos casos).
+      entrada borrada volvió en ambos casos). El backup nocturno del timer
+      corrió solo (2026-10-10). Pendiente: simulacro "todo" en la X230.
 - [ ] Verificación en el M70q: backup manual, backup del timer, restaurar
       Vaultwarden desde local y desde R2 a una fecha anterior, y un
       "restaurar todo" de prueba en la X230 (docs/VALIDACION.md, pruebas
