@@ -196,12 +196,14 @@ install_full() {
 }
 
 install_custom() {
-  local args=() m desc state failed=() skipped=()
+  local args=() m desc failed=() skipped=()
 
+  # Nada preseleccionado a propósito: en un servidor ya instalado, aceptar
+  # con todo marcado volvería a correr módulos que no se querían tocar. El
+  # usuario marca solo lo que quiere ("instalar todo" usa HLI-DEFAULT).
   while read -r m; do
     desc="$(module_meta "$m" DESC)"
-    [[ "$(module_meta "$m" DEFAULT)" == "yes" ]] && state="ON" || state="OFF"
-    args+=("$m" "$desc" "$state")
+    args+=("$m" "$desc" "OFF")
   done < <(_installable_modules)
 
   if [[ ${#args[@]} -eq 0 ]]; then
