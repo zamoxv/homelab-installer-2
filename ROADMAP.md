@@ -690,7 +690,18 @@ Especificación acordada con el usuario (2026-10-06):
 
 - [ ] **Hermes Agent** (Nous Research) como contenedor, con **OpenRouter** como proveedor de
       modelos. Aislado: sin socket de Docker, sin montar `/srv`, sin red del host.
-- [ ] **Telegram** como canal (modo polling: sin puertos entrantes), restringido al ID del usuario.
+- [ ] **Canal principal: [hermes-android](https://github.com/rusty4444/hermes-android)**
+      (decidido 2026-10-15; el usuario usa Android, Hermex es solo iOS). Cliente
+      nativo MIT que habla con el Gateway API Server de Hermes (puerto 8642,
+      `API_SERVER_KEY`) y, opcionalmente, con su dashboard (9119) para memoria,
+      cron y skills. **Solo por Tailscale/LAN**: el API server y el dashboard
+      nunca pasan por el túnel de Cloudflare ni se abren en el router (el propio
+      README lo exige). Se instala desde el APK de GitHub Releases. Verificar:
+      chat con streaming y voz fuera de casa con Tailscale encendido; con
+      Tailscale apagado no responde.
+- [ ] **Canal alternativo: Telegram** (modo polling: sin puertos entrantes),
+      restringido al ID del usuario. Útil si Tailscale no está disponible; las
+      conversaciones pasan por los servidores de Telegram.
 - [ ] Optimización de tokens: modelos auxiliares baratos en Hermes + `openrouter/auto` con nivel
       de costo `low`/`medium`. Límite de crédito en OpenRouter desde el primer día.
 - [ ] LiteLLM como proxy de ruteo y presupuesto por agente, solo si hay varios agentes.
