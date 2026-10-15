@@ -302,6 +302,34 @@ marcados como hechos) ni su configuración (`config/`): vuelven al reinstalar el
 HLI. Tampoco `tailscale` ni Cloudflare Tunnel (sin datos en backups: se
 reconfiguran con sus módulos).
 
+#### Servicios propios (registro local)
+
+Requisito: un contenedor de prueba cualquiera (por ejemplo, un `nginx` con
+nombre `miapp-db-1`) y una carpeta de datos con algún archivo en
+`/srv/appdata/miapp/db`.
+
+1. Crear el archivo de ejemplo del README (`miapp.conf`) e instalarlo con
+   `sudo install -d -m 0755 /etc/hli2.d /etc/hli2.d/services` y
+   `sudo install -m 0644 -o root -g root miapp.conf /etc/hli2.d/services/`.
+   El dashboard debe mostrar "Mi App (local)" con su estado.
+2. Ejecutar "Hacer backup ahora" con `SERVICE_BACKUP_KIND="sqlite"`: el contenedor
+   se detiene unos segundos y vuelve a iniciar. Con `restic ls latest --tag full`
+   (como root) deben verse `/srv/appdata/miapp/db` y `/etc/hli2.d/services/miapp.conf`.
+3. Rechazos (cada uno debe dejar una línea `servicio local 'miapp' ignorado` en
+   `/var/log/hli2/backup.log` tras un backup y desaparecer del dashboard):
+   `sudo chmod 0664` sobre el archivo; hacerlo propiedad del usuario con
+   `sudo chown $USER`; reemplazarlo por un enlace simbólico; poner
+   `SERVICE_DATA=("/etc/ssh")` o una ruta con `..`. Volver a dejarlo con 0644 y
+   dueño root lo restablece.
+4. Colisión: copiar el archivo como `/etc/hli2.d/services/jellyfin.conf`. El
+   dashboard sigue mostrando solo el Jellyfin incluido y el backup avisa en el log.
+5. Restaurar "Mi App (local)" desde la copia local: aparece en la lista de qué
+   restaurar y los datos vuelven a la foto.
+6. Simulacro en un equipo nuevo (junto con el procedimiento de "Todo" de arriba):
+   tras restaurar "Todo", `/etc/hli2.d/services/miapp.conf` existe, "Mi App (local)"
+   figura en el dashboard y sus datos están en `/srv/appdata/miapp/db`; el aviso
+   final indica que debe volver a desplegar su contenedor.
+
 ### Energía (correr primero)
 
 | # | Prueba | Resultado esperado |

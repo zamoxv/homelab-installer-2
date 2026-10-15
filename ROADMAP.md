@@ -669,6 +669,18 @@ Especificación acordada con el usuario (2026-10-06):
       restaurar Vaultwarden desde local y desde R2 a la foto anterior (la
       entrada borrada volvió en ambos casos). El backup nocturno del timer
       corrió solo (2026-10-10). Pendiente: simulacro "todo" en la X230.
+- [x] **Registro local de servicios** (`/etc/hli2.d/services/*.conf`): servicios
+      propios del usuario, fuera del repositorio público, con el formato de
+      `services/*.conf`. Entran en la misma corrida de backup (mismas fotos y
+      repositorios), en la restauración ("Todo" restaura primero el registro y
+      después los datos) y en el dashboard con la marca "(local)". Pensado para
+      aplicaciones desplegadas a mano en Dokploy, como JASJIC (ver la sección
+      correspondiente). Los archivos se cargan con `source`, así que solo se
+      aceptan si son de root, regulares, sin escritura para grupo/otros y en
+      directorios de root; las rutas de datos deben quedar bajo `/srv/appdata`.
+      Un id que coincide con un servicio incluido se ignora (gana el incluido)
+      y se avisa en el log. `/etc/hli2.d` se respalda. Documentado en el
+      README (pruebas en docs/VALIDACION.md).
 - [ ] Verificación en el M70q: backup manual, backup del timer, restaurar
       Vaultwarden desde local y desde R2 a una fecha anterior, y un
       "restaurar todo" de prueba en la X230 (docs/VALIDACION.md, pruebas
@@ -774,7 +786,8 @@ Por definir antes de diseñar el módulo:
 - [ ] Si se expone a Internet (depende de v2.4) o queda solo en la LAN.
 - [ ] Arquitectura: la Raspberry Pi es ARM y el M70q x86_64 — las imágenes o
       dependencias compiladas para ARM no sirven tal cual.
-- [ ] Respaldo: dumps de su base de datos (capa Dokploy) y archivos (capa HLI).
+- [ ] Respaldo: dumps de su base de datos (capa Dokploy) y archivos (capa HLI;
+      se registra como servicio local en `/etc/hli2.d/services`, ver v2.5).
 
 ## Pendiente: uso diario
 

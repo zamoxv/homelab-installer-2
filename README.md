@@ -58,7 +58,74 @@ lib/services.sh       Registro declarativo de servicios
 ui/menu.sh            Menú principal y dashboard
 modules/*.sh          Módulos de host (auto-descubiertos)
 services/*.conf       Un archivo por servicio (nativo o en contenedor)
+/etc/hli2.d/services  Servicios propios del usuario (registro local, ver más abajo)
 ```
 
 Logs por módulo en `/var/log/hli2/`; estado persistente en
 `/var/lib/hli2/state`.
+
+## Servicios propios (registro local)
+
+Si usted despliega a mano una aplicación (por ejemplo, desde Dokploy) y quiere
+que entre en los backups, en la restauración y en el dashboard, puede
+registrarla como **servicio local**, sin tocar este repositorio. El archivo vive
+en `/etc/hli2.d/services/` (directorio de root, **fuera** de `/etc/hli2`, que
+es de acceso exclusivo de root y guarda los secretos) y usa el mismo formato que
+`services/*.conf`. No debe contener secretos.
+
+Ejemplo (`miapp.conf`; el nombre del archivo es el identificador del servicio):
+
+```bash
+SERVICE_NAME="Mi App"
+SERVICE_KIND="container"
+SERVICE_CONTAINER="miapp-db-1"
+SERVICE_PORT=""
+SERVICE_URL_SCHEME=""
+SERVICE_DATA=("$APPDATA_ROOT/miapp/db")
+# "files": copia sin detener nada. "sqlite": el backup detiene el contenedor
+# unos segundos durante la foto local (para bases embebidas como SQLite o
+# CouchDB). "none": no se respalda.
+SERVICE_BACKUP_KIND="sqlite"
+```
+
+Instalación (el directorio y el archivo deben ser de root y no escribibles por
+otros; si no, se ignoran):
+
+```bash
+sudo install -d -m 0755 /etc/hli2.d /etc/hli2.d/services
+sudo install -m 0644 -o root -g root miapp.conf /etc/hli2.d/services/miapp.conf
+```
+
+Después ejecute **"Hacer backup ahora"** (`backup-now`) para comprobar que el
+servicio entra en la copia; si el archivo se rechaza, el motivo queda en
+`/var/log/hli2/backup.log` (línea `servicio local '<id>' ignorado`).
+
+Reglas:
+
+- **Nombre del archivo**: `^[a-z0-9][a-z0-9-]*\.conf$`.
+- **Seguridad**: estos archivos se cargan con `source`, de modo que solo se
+  aceptan si son archivos regulares (no enlaces simbólicos) de root, sin permiso
+  de escritura para grupo ni otros, dentro de un directorio de root (y con
+  `/etc/hli2.d` también de root) no escribible por otros.
+- **Campos**: `SERVICE_KIND` debe ser `container`; `SERVICE_CONTAINER` debe ser
+  un nombre de contenedor válido de Docker; `SERVICE_BACKUP_KIND` puede ser
+  `files`, `sqlite` o `none`; cada ruta de `SERVICE_DATA` debe ser absoluta, sin
+  `..`, bajo `$APPDATA_ROOT` (nunca `$APPDATA_ROOT` mismo ni rutas como `/etc`);
+  `SERVICE_BACKUP_EXCLUDE` y `SERVICE_BACKUP_LOCAL_ONLY` solo pueden listar
+  rutas de su propio `SERVICE_DATA`.
+- **Colisiones**: el identificador no puede coincidir con el de un servicio
+  incluido en el HLI (por ejemplo `jellyfin`). Gana siempre el incluido; el
+  archivo local se ignora y el backup lo avisa en su log.
+- **Backups**: los servicios locales entran en la **misma** corrida nocturna,
+  las mismas fotos y los mismos repositorios (local y R2); no hay un backup
+  aparte. `/etc/hli2.d` también se respalda, para que el registro sobreviva a un
+  desastre.
+- **Restauración**: aparecen como destinos en "Restaurar un backup". Al restaurar
+  **"Todo"** (por ejemplo, en un equipo nuevo) se devuelve primero
+  `/etc/hli2.d/services` y después los datos de cada servicio, de modo que los
+  servicios locales se reconocen aunque el equipo no tuviera nada. Restaurar un
+  solo servicio local requiere que su archivo ya esté registrado. El
+  contenedor no se vuelve a crear: se restauran los datos y usted lo despliega
+  de nuevo (por ejemplo, en Dokploy), con la misma ruta de datos.
+- **Dashboard**: se muestran junto a los demás con la marca "(local)".
+
