@@ -78,3 +78,22 @@ _bk_files_in() {
   fi
   printf '%s' "$out"
 }
+
+# Escribe el servicio local de ejemplo $1 (id) con KIND de backup $2.
+_ls_write() {
+  local id="$1" kind="${2:-files}" dir="$HLI2_LOCAL_SERVICES_DIR"
+  mkdir -p "$dir"
+  chmod 0755 "$dir" "$(dirname "$dir")"
+  cat > "$dir/$id.conf" <<CONF
+SERVICE_NAME="Mi App"
+SERVICE_KIND="container"
+SERVICE_CONTAINER="miapp-db-1"
+SERVICE_PORT=""
+SERVICE_URL_SCHEME=""
+SERVICE_DATA=("\$APPDATA_ROOT/miapp/db")
+SERVICE_BACKUP_KIND="$kind"
+CONF
+  chmod 0644 "$dir/$id.conf"
+  mkdir -p "$APPDATA_ROOT/miapp/db"
+  echo data > "$APPDATA_ROOT/miapp/db/file.txt"
+}

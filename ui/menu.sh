@@ -29,7 +29,7 @@ show_dashboard() {
   local services_block="" id name state url
   while read -r id; do
     [[ -n "$id" ]] || continue
-    name="$(service_get "$id" NAME)"
+    name="$(service_display_name "$id")"
     state="$(service_state "$id")"
     url="$(service_url "$id" "$ip")"
     services_block+="$(printf '  %-16s: %-18s %s' "$name" "$state" "$url")"$'\n'

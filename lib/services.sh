@@ -26,26 +26,174 @@ set -euo pipefail
 
 SERVICES_DIR="$SCRIPT_DIR/services"
 
-# IDs de servicios registrados (nombre de archivo sin .conf), orden alfabético.
-service_list() {
-  local f
-  for f in "$SERVICES_DIR"/*.conf; do
-    [[ -f "$f" ]] || continue
-    basename "$f" .conf
-  done | sort
+# Registro LOCAL: servicios propios del usuario (no incluidos en el repositorio
+# público), con el mismo formato que services/*.conf. Viven en un directorio
+# root-owned FUERA de /etc/hli2 (que es root 0700 y guarda secretos): el usuario
+# y el dashboard necesitan poder LEERLOS. Se hace 'source' de estos archivos,
+# así que solo se cargan si cumplen todas las condiciones de
+# _service_local_file_ok y _service_local_fields_ok (ver más abajo). El id de
+# un servicio local nunca puede coincidir con el de uno incluido: gana el
+# incluido y el archivo local se ignora (service_local_report lo informa).
+# 'HLI2_LOCAL_SERVICES_EXPECT_UID' existe solo para los tests (corren como un
+# usuario normal; en producción es siempre 0 = root).
+LOCAL_SERVICES_DIR="${HLI2_LOCAL_SERVICES_DIR:-/etc/hli2.d/services}"
+LOCAL_SERVICES_EXPECT_UID="${HLI2_LOCAL_SERVICES_EXPECT_UID:-0}"
+
+# Ruta de dato apta para tocar como root: absoluta, sin '..', sin caracteres de
+# patrón de restic ni espacios, y nunca '/' ni una carpeta de primer nivel.
+# (Única definición: la usa también _restore_path_ok en lib/restore.sh.)
+_service_path_ok() {
+  local p="$1"
+  [[ "$p" =~ ^/[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)+$ ]] || return 1
+  [[ "/$p/" != */../* && "$p" != *"/./"* ]]
 }
 
-# Carga en el shell actual las variables SERVICE_* del servicio $1, después de
-# resetearlas, para que no arrastre valores del servicio leído antes.
-_service_load() {
-  local id="$1"
-  local f="$SERVICES_DIR/$id.conf"
-  [[ -f "$f" ]] || return 1
+# ¿$1 es de root (o del uid esperado en tests) y no escribible por grupo/otros?
+_service_local_owner_ok() {
+  local uid mode
+  read -r uid mode < <(stat -c '%u %a' -- "$1" 2>/dev/null) || return 1
+  [[ "$uid" == "$LOCAL_SERVICES_EXPECT_UID" ]] || return 1
+  (( 8#$mode & 8#022 )) && return 1
+  return 0
+}
+
+# El directorio del registro local es usable: existe, no es un enlace simbólico
+# y ni él ni su padre (/etc/hli2.d) son escribibles por otros.
+_service_local_dir_ok() {
+  local d="$LOCAL_SERVICES_DIR"
+  [[ -d "$d" && ! -L "$d" ]] || return 1
+  _service_local_owner_ok "$d" || return 1
+  _service_local_owner_ok "$(dirname -- "$d")"
+}
+
+# Archivo local $1 (id) aceptable para 'source': nombre válido, archivo regular
+# (no enlace), de root, sin escritura para grupo/otros. Imprime el motivo si no.
+_service_local_file_ok() {
+  local id="$1" f="$LOCAL_SERVICES_DIR/$1.conf"
+  if [[ ! "$id" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then echo "nombre de archivo inválido (use minúsculas, números y guiones)"; return 1; fi
+  if ! _service_local_dir_ok; then echo "el directorio $LOCAL_SERVICES_DIR (o su padre) no es de root o es escribible por otros"; return 1; fi
+  if [[ -L "$f" || ! -f "$f" ]]; then echo "no es un archivo regular (los enlaces simbólicos se rechazan)"; return 1; fi
+  if ! _service_local_owner_ok "$f"; then echo "no es de root o es escribible por grupo/otros"; return 1; fi
+  if [[ -f "$SERVICES_DIR/$id.conf" ]]; then echo "el id coincide con un servicio incluido: se usa el incluido y se ignora este archivo"; return 1; fi
+  return 0
+}
+
+# Valida las variables SERVICE_* ya cargadas de un servicio local. Imprime el
+# motivo si no es válido. Solo contenedores Docker; las rutas de datos tienen
+# que quedar bajo $APPDATA_ROOT y las exclusiones, ser rutas de sus propios datos.
+_service_local_fields_ok() {
+  local p q found
+  if [[ -z "${SERVICE_NAME:-}" || "$SERVICE_NAME" == *$'\n'* || ${#SERVICE_NAME} -gt 60 ]]; then echo "SERVICE_NAME vacío o inválido"; return 1; fi
+  if [[ "${SERVICE_KIND:-}" != "container" ]]; then echo "SERVICE_KIND debe ser \"container\""; return 1; fi
+  if [[ ! "${SERVICE_CONTAINER:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then echo "SERVICE_CONTAINER inválido"; return 1; fi
+  if [[ ! "${SERVICE_PORT:-}" =~ ^[0-9]{0,5}$ ]]; then echo "SERVICE_PORT inválido"; return 1; fi
+  if [[ ! "${SERVICE_URL_SCHEME:-}" =~ ^[a-z]{0,10}$ ]]; then echo "SERVICE_URL_SCHEME inválido"; return 1; fi
+  case "${SERVICE_BACKUP_KIND:-}" in
+    files|sqlite|none) ;;
+    *) echo "SERVICE_BACKUP_KIND debe ser files, sqlite o none"; return 1 ;;
+  esac
+  for p in "${SERVICE_DATA[@]}"; do
+    if ! _service_path_ok "$p" || [[ "$p" != "$APPDATA_ROOT/"* || -z "${p#"$APPDATA_ROOT"/}" ]]; then
+      echo "SERVICE_DATA debe ser una ruta absoluta válida bajo $APPDATA_ROOT: $p"; return 1
+    fi
+  done
+  for p in "${SERVICE_BACKUP_EXCLUDE[@]}" "${SERVICE_BACKUP_LOCAL_ONLY[@]}"; do
+    found=0
+    for q in "${SERVICE_DATA[@]}"; do [[ "$p" == "$q" ]] && found=1; done
+    if [[ "$found" -eq 0 ]]; then echo "las exclusiones deben ser rutas de SERVICE_DATA: $p"; return 1; fi
+  done
+  return 0
+}
+
+# Resetea las variables SERVICE_* (para que no arrastre las del servicio anterior).
+_service_reset() {
   unset SERVICE_NAME SERVICE_KIND SERVICE_UNIT SERVICE_CONTAINER \
         SERVICE_PORT SERVICE_URL_SCHEME SERVICE_BACKUP_KIND 2>/dev/null || true
   SERVICE_DATA=()
   SERVICE_BACKUP_EXCLUDE=()
   SERVICE_BACKUP_LOCAL_ONLY=()
+}
+
+# Carga un servicio local ya aceptado por _service_local_file_ok y valida sus
+# campos. Imprime el motivo si no es válido.
+_service_local_load() {
+  local id="$1" why
+  why="$(_service_local_file_ok "$id")" || { echo "$why"; return 1; }
+  _service_reset
+  # shellcheck disable=SC1090
+  source "$LOCAL_SERVICES_DIR/$id.conf" || { _service_reset; echo "el archivo tiene errores de sintaxis"; return 1; }
+  why="$(_service_local_fields_ok)" || { _service_reset; echo "$why"; return 1; }
+  return 0
+}
+
+# Ids locales válidos (uno por línea). Cada archivo se evalúa en un subshell:
+# nada de lo que haga un .conf contamina al llamador.
+_service_local_list() {
+  local f id
+  _service_local_dir_ok || return 0
+  for f in "$LOCAL_SERVICES_DIR"/*.conf; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    id="$(basename "$f" .conf)"
+    if ( _service_local_load "$id" >/dev/null 2>&1 ); then printf '%s\n' "$id"; fi
+  done
+}
+
+# Imprime una línea 'id<TAB>motivo' por cada archivo local rechazado. La usa el
+# backup para dejar constancia en el log (service_list se mantiene en silencio).
+service_local_report() {
+  local f id why
+  [[ -d "$LOCAL_SERVICES_DIR" ]] || return 0
+  for f in "$LOCAL_SERVICES_DIR"/*; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    id="$(basename "$f")"
+    if [[ "$id" != *.conf ]]; then
+      printf '%s\t%s\n' "$id" "no termina en .conf: se ignora"
+      continue
+    fi
+    id="${id%.conf}"
+    if why="$( ( _service_local_load "$id" ) 2>&1 )"; then continue; fi
+    printf '%s\t%s\n' "$id" "${why//$'\n'/ }"
+  done
+  return 0
+}
+
+# ¿El servicio $1 es local (definido en el registro local)?
+service_is_local() {
+  [[ ! -f "$SERVICES_DIR/$1.conf" ]]
+}
+
+# Nombre para mostrar de $1: los locales llevan la marca "(local)".
+service_display_name() {
+  local name
+  name="$(service_get "$1" NAME)"
+  if service_is_local "$1"; then name="$name (local)"; fi
+  printf '%s\n' "$name"
+}
+
+# IDs de servicios registrados (nombre de archivo sin .conf) más los locales
+# válidos, orden alfabético.
+service_list() {
+  local f
+  {
+    for f in "$SERVICES_DIR"/*.conf; do
+      [[ -f "$f" ]] || continue
+      basename "$f" .conf
+    done
+    _service_local_list
+  } | sort
+}
+
+# Carga en el shell actual las variables SERVICE_* del servicio $1, después de
+# resetearlas, para que no arrastre valores del servicio leído antes. Un id que
+# no es de los incluidos se busca en el registro local (con su validación).
+_service_load() {
+  local id="$1"
+  local f="$SERVICES_DIR/$id.conf"
+  if [[ ! -f "$f" ]]; then
+    _service_local_load "$id" >/dev/null 2>&1
+    return
+  fi
+  _service_reset
   # shellcheck disable=SC1090
   source "$f"
 }

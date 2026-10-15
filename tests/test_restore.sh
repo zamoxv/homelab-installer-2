@@ -1802,3 +1802,41 @@ test_bk_files_in_reports_rg_errors_instead_of_hiding_them() {
   assert_not_contains "$(_bk_files_in "$HLI2_TEST_SCRATCH/vacio" '/\.')" ".b" || return 1
   assert_contains "$(_bk_files_in "$HLI2_TEST_SCRATCH/vacio" '(')" "RG-ERROR" "una expresión inválida también se reporta" || return 1
 }
+
+# --- Registro local de servicios (lib/services.sh) ---------------------------------
+
+test_restore_all_on_a_fresh_machine_restores_registry_before_local_data() {
+  _rs_prepare
+  local F="$STUB_RESTIC_FIXTURE" reg="$HLI2_LOCAL_SERVICES_DIR"
+  # La foto trae el registro local y los datos del servicio; el equipo no tiene nada.
+  _ls_write miapp sqlite
+  mkdir -p "$F$reg" "$F$APPDATA_ROOT/miapp/db"
+  cp "$reg/miapp.conf" "$F$reg/miapp.conf"
+  echo "snapshot-miapp" > "$F$APPDATA_ROOT/miapp/db/file.txt"
+  rm -rf "$reg" "$APPDATA_ROOT/miapp"
+  export STUB_DOCKER_NOT_FOUND="miapp-db-1"       # equipo nuevo: el contenedor aún no existe
+  ( source "$REPO_ROOT/lib/core.sh"; ! service_list | grep -qx miapp ) || { fail "el equipo nuevo no debe conocer miapp"; return 1; }
+
+  _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target all || { fail "la restauración debió terminar bien"; return 1; }
+  [[ -f "$reg/miapp.conf" ]] || { fail "no se restauró el registro local"; return 1; }
+  assert_eq "644" "$(stat -c %a "$reg/miapp.conf")" "modo 0644" || return 1
+  assert_eq "snapshot-miapp" "$(_rs_content "$APPDATA_ROOT/miapp/db/file.txt")" "los datos del servicio local" || return 1
+  assert_contains "$(_rs_status message)" "servicio local 'miapp'" "avisa que hay que volver a desplegarlo" || return 1
+  assert_not_contains "$(_rs_status modules)" "miapp" "un servicio local no tiene módulo" || return 1
+  local log reg_line data_line
+  log="$LOG_DIR/backup.log"
+  reg_line="$(grep -n 'Registro local de servicios restaurado' "$log" | head -1 | cut -d: -f1)"
+  data_line="$(grep -n "Restaurando $APPDATA_ROOT/miapp/db" "$log" | head -1 | cut -d: -f1)"
+  [[ -n "$reg_line" && -n "$data_line" ]] || { fail "faltan líneas en el log"; return 1; }
+  (( reg_line < data_line )) || { fail "el registro debe restaurarse ANTES que los datos"; return 1; }
+}
+
+test_restore_of_a_single_service_does_not_touch_the_local_registry() {
+  _rs_prepare
+  local F="$STUB_RESTIC_FIXTURE" reg="$HLI2_LOCAL_SERVICES_DIR"
+  _ls_write miapp
+  mkdir -p "$F$reg"
+  sed 's/Mi App/Otra App/' "$reg/miapp.conf" > "$F$reg/miapp.conf"
+  _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target vaultwarden || { fail "la restauración debió terminar bien"; return 1; }
+  assert_file_contains "$reg/miapp.conf" "Mi App" "el registro actual no se toca" || return 1
+}

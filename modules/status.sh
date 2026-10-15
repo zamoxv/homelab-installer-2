@@ -19,7 +19,7 @@ source "$(dirname "$0")/../lib/core.sh"
   ip="$(get_ip)"
   while read -r id; do
     [[ -n "$id" ]] || continue
-    name="$(service_get "$id" NAME)"
+    name="$(service_display_name "$id")"
     state="$(service_state "$id")"
     url="$(service_url "$id" "$ip")"
     printf "%-16s %-20s %s\n" "$name" "$state" "$url"

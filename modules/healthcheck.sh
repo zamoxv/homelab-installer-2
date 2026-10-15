@@ -67,7 +67,7 @@ REPORT=/tmp/hli2-healthcheck.txt
   echo "== Servicios (registro: services/*.conf) =="
   while read -r id; do
     [[ -n "$id" ]] || continue
-    printf "  %-16s %s\n" "$(service_get "$id" NAME)" "$(service_state "$id")"
+    printf "  %-16s %s\n" "$(service_display_name "$id")" "$(service_state "$id")"
   done < <(service_list)
   echo
 

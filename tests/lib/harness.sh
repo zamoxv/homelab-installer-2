@@ -150,6 +150,10 @@ harness_setup_env() {
   export HLI2_STATE_FILE="$STATE_FILE"
   export HLI2_LOG_DIR="$LOG_DIR"
   export HLI2_SECRETS_DIR="$SECRETS_DIR"
+  # Registro local de servicios: nunca el /etc/hli2.d real. Los archivos de
+  # prueba son del usuario del test, así que "root" es su propio uid.
+  export HLI2_LOCAL_SERVICES_DIR="$scratch/etc-hli2.d/services"
+  export HLI2_LOCAL_SERVICES_EXPECT_UID="$(id -u)"
   export HLI2_DOKPLOY_ENV_FILE="$DOKPLOY_ENV_FILE"
   export HLI2_DOKPLOY_STATE_FILE="$DOKPLOY_STATE_FILE"
   export HLI2_DNS_PORT_STATE_DIR="$DNS_PORT_STATE_DIR"

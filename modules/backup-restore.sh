@@ -25,7 +25,7 @@ _br_target_label() {
   if [[ "$target" == "all" ]]; then
     printf 'TODO (todos los servicios con datos, la configuración de Samba y los secretos de /etc/hli2)'
   else
-    service_get "$target" NAME
+    service_display_name "$target"
   fi
 }
 
@@ -37,7 +37,7 @@ _br_target_items() {
   while read -r id; do
     [[ -n "$id" ]] || continue
     [[ -n "$(service_get "$id" DATA)" ]] || continue
-    name="$(service_get "$id" NAME)"
+    name="$(service_display_name "$id")"
     note=""
     if [[ "$source" == "r2" && -n "$(service_get "$id" BACKUP_LOCAL_ONLY)" ]]; then
       note=" (solo la configuración: los archivos no están en la copia externa)"

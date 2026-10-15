@@ -134,9 +134,7 @@ restore_fmt_time() {
 # Ruta de dato apta para tocar como root: absoluta, sin '..', sin caracteres de
 # patrón de restic ni espacios, y nunca '/' ni una carpeta de primer nivel.
 _restore_path_ok() {
-  local p="$1"
-  [[ "$p" =~ ^/[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)+$ ]] || return 1
-  [[ "/$p/" != */../* && "$p" != *"/./"* ]]
+  _service_path_ok "$1"
 }
 
 # --- Validación de argumentos ------------------------------------------------------------
@@ -540,7 +538,15 @@ _restore_containers_plan() {
 
   # Para los contenedores, el id del servicio es también el nombre del módulo
   # que lo despliega (la copia root-owned no trae modules/, no se puede comprobar).
-  for id in "${missing[@]}"; do RS_MODULES+="${RS_MODULES:+ }$id"; done
+  # Los servicios locales no tienen módulo: se vuelven a desplegar a mano (Dokploy).
+  for id in "${missing[@]}"; do
+    if service_is_local "$id"; then
+      _restore_worse warning
+      _restore_msg_add "el contenedor del servicio local '$id' no existe: se restauraron sus datos; vuelva a desplegarlo (por ejemplo en Dokploy)"
+    else
+      RS_MODULES+="${RS_MODULES:+ }$id"
+    fi
+  done
   if [[ "$presence" == "absent" ]]; then
     _restore_msg_add "Docker no está instalado: se restauran solo los datos"
     RS_MODULES="dokploy${RS_MODULES:+ }$RS_MODULES"
@@ -676,6 +682,39 @@ _restore_secrets_old_dir_prepare() {
     _restore_msg_add "$RESTORE_OLD_SECRETS_DIR no está en el mismo sistema de archivos que $SECRETS_DIR: no se restauran los secretos"
     return 1
   fi
+  return 0
+}
+
+# Fase 0 (solo 'todo'): devuelve primero el registro local de servicios
+# ($LOCAL_SERVICES_DIR), ANTES de resolver qué servicios hay que restaurar: en un
+# equipo nuevo ese directorio no existe y, sin esto, los servicios propios ni
+# siquiera aparecerían entre los destinos (ni sus rutas pasarían la lista de
+# rutas permitidas). Es un conjunto de archivos .conf diminutos: se restauran en
+# una carpeta de paso y se copian uno a uno (root, 0644) sobre los actuales; los
+# que ya existen se sobrescriben y los demás no se tocan. Aunque algo raro llegara
+# en la foto, service_list solo acepta lo que cumple las reglas de
+# lib/services.sh. 0 = listo o la foto no lo contiene (no es un error: nunca se
+# registró nada); 1 = error.
+_restore_registry_restore() {
+  local rc=0 dir f name n=0
+  _restore_stage_path "$LOCAL_SERVICES_DIR" || rc=$?
+  case "$rc" in
+    0) ;;
+    2) return 0 ;;
+    *) return 1 ;;
+  esac
+  dir="$LOCAL_SERVICES_DIR$RESTORE_STAGE_SUFFIX$LOCAL_SERVICES_DIR"
+  _restore_priv install -d -m 0755 -- "$LOCAL_SERVICES_DIR" || return 1
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    name="$(basename -- "$f")"
+    [[ "$name" =~ ^[a-z0-9][a-z0-9-]*\.conf$ ]] || continue
+    _restore_priv test -L "$f" && continue
+    _restore_priv install -m 0644 -- "$f" "$LOCAL_SERVICES_DIR/$name" || return 1
+    n=$(( n + 1 ))
+  done < <(_restore_priv find "$dir" -maxdepth 1 -type f -print 2>/dev/null)
+  _restore_stage_drop "$LOCAL_SERVICES_DIR$RESTORE_STAGE_SUFFIX"
+  _backup_log "Registro local de servicios restaurado: $n archivo(s) en $LOCAL_SERVICES_DIR"
   return 0
 }
 
@@ -1183,6 +1222,11 @@ restore_run() {
   fi
   _backup_log "Foto $RS_RID ($(restore_fmt_time "$RS_STIME"))"
 
+  if [[ "$RS_TARGET" == "all" ]] && ! _restore_registry_restore; then
+    _restore_msg_add "falló la restauración del registro local de servicios ($LOCAL_SERVICES_DIR)"
+    _restore_abort
+    return 1
+  fi
   mapfile -t services < <(_restore_target_services)
   _restore_containers_plan || { _restore_abort; return 1; }
 

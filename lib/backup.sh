@@ -235,7 +235,9 @@ _backup_collect() {
     done < <(service_get "$id" BACKUP_LOCAL_ONLY)
   done < <(service_list)
 
-  all+=("/etc/samba/smb.conf" "$SECRETS_DIR" "$STATE_DIR" "$SCRIPT_DIR/config")
+  # /etc/hli2.d (registro local de servicios) viaja en los backups: sin él, tras
+  # un desastre no se sabría qué servicios propios restaurar.
+  all+=("/etc/samba/smb.conf" "$SECRETS_DIR" "$STATE_DIR" "$SCRIPT_DIR/config" "$(dirname -- "$LOCAL_SERVICES_DIR")")
   if [[ -f "$SCRIPT_DIR/source-dir" ]]; then
     IFS= read -r src < "$SCRIPT_DIR/source-dir" || true
     if [[ "$src" == /* ]]; then all+=("$src/config"); fi
@@ -807,6 +809,10 @@ backup_run() {
     return 1
   fi
 
+  local lid lwhy
+  while IFS=$'\t' read -r lid lwhy; do
+    [[ -z "$lid" ]] || _backup_log "AVISO: servicio local '$lid' ignorado: $lwhy"
+  done < <(service_local_report)
   _backup_collect
   _backup_warmup
 
