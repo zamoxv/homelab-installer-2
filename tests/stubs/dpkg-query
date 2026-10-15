@@ -1,13 +1,25 @@
 #!/usr/bin/env bash
-# Stub de 'dpkg-query -W -f=${Status} tailscale': el paquete cuenta como
-# instalado solo si el 'tailscale' que resuelve el PATH es el falso (dentro de
-# STUB_SAFE_ROOT). Así un /usr/bin/tailscale real del equipo de desarrollo nunca
+# Stub de 'dpkg-query -W -f=<formato> tailscale'. Por defecto el paquete cuenta
+# como instalado solo si el 'tailscale' que resuelve el PATH es el falso (dentro
+# de STUB_SAFE_ROOT): un /usr/bin/tailscale real del equipo de desarrollo nunca
 # hace pasar por instalado a un test que parte de "no instalado".
+# STUB_DPKG_STATUS="<deseo> <error> <estado>" (ej. "hold ok installed",
+# "deinstall ok config-files") fuerza el estado de dpkg.
 set -uo pipefail
-bin="$(command -v tailscale 2>/dev/null || true)"
-if [[ "${*: -1}" == "tailscale" && -n "$bin" && "$bin" == "${STUB_SAFE_ROOT:-/nonexistent}"/* ]]; then
-  printf 'install ok installed'
-  exit 0
+fmt="" pkg="${*: -1}"
+for a in "$@"; do case "$a" in -f=*) fmt="${a#-f=}" ;; esac; done
+status="${STUB_DPKG_STATUS:-}"
+if [[ -z "$status" ]]; then
+  bin="$(command -v tailscale 2>/dev/null || true)"
+  if [[ "$pkg" == "tailscale" && -n "$bin" && "$bin" == "${STUB_SAFE_ROOT:-/nonexistent}"/* ]]; then
+    status="install ok installed"
+  fi
 fi
-echo "dpkg-query: no packages found matching ${*: -1}" >&2
-exit 1
+if [[ -z "$status" ]]; then
+  echo "dpkg-query: no packages found matching $pkg" >&2
+  exit 1
+fi
+case "$fmt" in
+  *'db:Status-Status'*) printf '%s' "${status##* }" ;;
+  *) printf '%s' "$status" ;;
+esac

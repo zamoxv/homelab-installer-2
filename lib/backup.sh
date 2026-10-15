@@ -246,6 +246,8 @@ _backup_collect() {
   # (restic.env SÍ se respalda, cifrado: hace falta para recuperarse de un
   # desastre; ver ROADMAP v2.5.)
   excl+=("$BACKUP_PASSWORD_FILE" "$SECRETS_DIR/.restic-password.*")
+  # Restos de restauraciones (carpetas de paso y copias previas) dentro de /etc/hli2.d.
+  excl+=("$(dirname -- "$LOCAL_SERVICES_DIR")/*${RESTORE_STAGE_SUFFIX:-.hli2-restore-tmp}" "$(dirname -- "$LOCAL_SERVICES_DIR")/*${RESTORE_OLD_SUFFIX:-.hli2-before-restore}-*")
 
   for p in "${excl[@]}"; do is_excl[$p]=1; BK_EXCLUDE_ARGS+=("--exclude=$p"); done
   for p in "${lonly[@]}"; do is_lonly[$p]=1; BK_LOCAL_ONLY+=("$p"); done

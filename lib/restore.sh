@@ -685,18 +685,21 @@ _restore_secrets_old_dir_prepare() {
   return 0
 }
 
-# Fase 0 (solo 'todo'): devuelve primero el registro local de servicios
-# ($LOCAL_SERVICES_DIR), ANTES de resolver qué servicios hay que restaurar: en un
+# Fase 0 (solo 'todo'): devuelve el registro local de servicios
+# ($LOCAL_SERVICES_DIR) ANTES de resolver qué servicios hay que restaurar: en un
 # equipo nuevo ese directorio no existe y, sin esto, los servicios propios ni
 # siquiera aparecerían entre los destinos (ni sus rutas pasarían la lista de
-# rutas permitidas). Es un conjunto de archivos .conf diminutos: se restauran en
-# una carpeta de paso y se copian uno a uno (root, 0644) sobre los actuales; los
-# que ya existen se sobrescriben y los demás no se tocan. Aunque algo raro llegara
-# en la foto, service_list solo acepta lo que cumple las reglas de
-# lib/services.sh. 0 = listo o la foto no lo contiene (no es un error: nunca se
-# registró nada); 1 = error.
+# rutas permitidas). Corre después de las comprobaciones previas (bloqueo, diario,
+# repositorio, foto, estado de Docker). Semántica de equipo nuevo: solo se
+# instalan los .conf que NO existen; los que ya existen no se tocan (se informan)
+# y el directorio, si existe, no se modifica. Cada archivo de la foto se
+# revisa con el mismo filtro que se aplica antes de cargar un .conf local
+# (_service_conf_lint) porque root lo cargará con 'source'; los enlaces simbólicos
+# y los nombres inválidos se omiten. Aunque algo raro llegara en la foto,
+# service_list solo acepta lo que cumple las reglas de lib/services.sh.
+# 0 = listo o la foto no lo contiene; 1 = error.
 _restore_registry_restore() {
-  local rc=0 dir f name n=0
+  local rc=0 dir f name n=0 tmp why
   _restore_stage_path "$LOCAL_SERVICES_DIR" || rc=$?
   case "$rc" in
     0) ;;
@@ -704,17 +707,40 @@ _restore_registry_restore() {
     *) return 1 ;;
   esac
   dir="$LOCAL_SERVICES_DIR$RESTORE_STAGE_SUFFIX$LOCAL_SERVICES_DIR"
-  _restore_priv install -d -m 0755 -- "$LOCAL_SERVICES_DIR" || return 1
+  if ! _restore_priv test -d "$LOCAL_SERVICES_DIR"; then
+    _restore_priv install -d -m 0755 -- "$LOCAL_SERVICES_DIR" || return 1
+  fi
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
     name="$(basename -- "$f")"
-    [[ "$name" =~ ^[a-z0-9][a-z0-9-]*\.conf$ ]] || continue
-    _restore_priv test -L "$f" && continue
+    if [[ ! "$name" =~ ^[a-z0-9][a-z0-9-]*\.conf$ ]]; then
+      _restore_worse warning
+      _restore_msg_add "registro local: se omitió '$name' (nombre no válido)"
+      continue
+    fi
+    if _restore_exists "$LOCAL_SERVICES_DIR/$name"; then
+      _backup_log "Registro local: ya existe $name; se conserva el actual"
+      _restore_msg_add "registro local: se conservó el '$name' existente (no se sobrescribe)"
+      continue
+    fi
+    tmp="$(mktemp "$BACKUP_STATE_DIR/.regconf.XXXXXX")" || return 1
+    if ! _restore_priv cat -- "$f" > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+    if ! why="$(_service_conf_lint "$tmp")"; then
+      rm -f "$tmp"
+      _restore_worse warning
+      _restore_msg_add "registro local: se omitió '$name' ($why)"
+      continue
+    fi
+    rm -f "$tmp"
     _restore_priv install -m 0644 -- "$f" "$LOCAL_SERVICES_DIR/$name" || return 1
     n=$(( n + 1 ))
-  done < <(_restore_priv find "$dir" -maxdepth 1 -type f -print 2>/dev/null)
+  done < <(_restore_priv find "$dir" -maxdepth 1 -type f -print 2>/dev/null | sort)
+  # Los enlaces simbólicos de la foto nunca se instalan.
+  while IFS= read -r f; do
+    [[ -z "$f" ]] || { _restore_worse warning; _restore_msg_add "registro local: se omitió '$(basename -- "$f")' (enlace simbólico)"; }
+  done < <(_restore_priv find "$dir" -maxdepth 1 -type l -print 2>/dev/null)
   _restore_stage_drop "$LOCAL_SERVICES_DIR$RESTORE_STAGE_SUFFIX"
-  _backup_log "Registro local de servicios restaurado: $n archivo(s) en $LOCAL_SERVICES_DIR"
+  _backup_log "Registro local de servicios restaurado: $n archivo(s) nuevo(s) en $LOCAL_SERVICES_DIR"
   return 0
 }
 
@@ -1222,6 +1248,11 @@ restore_run() {
   fi
   _backup_log "Foto $RS_RID ($(restore_fmt_time "$RS_STIME"))"
 
+  if [[ "$RS_TARGET" == "all" && "$(hli_docker_presence)" == "unknown" ]]; then
+    _restore_msg_add "no se pudo confirmar el estado de Docker (¿sudo sin sesión?); no se restaura nada"
+    _restore_abort
+    return 1
+  fi
   if [[ "$RS_TARGET" == "all" ]] && ! _restore_registry_restore; then
     _restore_msg_add "falló la restauración del registro local de servicios ($LOCAL_SERVICES_DIR)"
     _restore_abort

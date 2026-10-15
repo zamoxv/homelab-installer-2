@@ -219,3 +219,82 @@ test_dashboard_lists_the_local_service_with_marker() {
   assert_file_contains "$STUB_TEXTBOX_LOG" "Mi App (local)" "el dashboard lo muestra" || return 1
   assert_file_contains "$STUB_TEXTBOX_LOG" "Jellyfin" || return 1
 }
+
+# --- Rutas canónicas, filtro de contenido y solapes ------------------------------------------
+
+test_service_path_ok_rejects_dot_segments_and_non_canonical_forms() {
+  local p
+  ( source "$REPO_ROOT/lib/core.sh"
+    for p in /srv/appdata/x/y /srv/appdata/a.b/c; do _service_path_ok "$p" || { echo "debía aceptar $p"; exit 1; }; done
+    for p in /srv/appdata/. /srv/appdata/x/. /srv/appdata/x/./y /srv/appdata/.. /srv/appdata/x/../y \
+             /srv/appdata/x/ /srv/appdata//x /srv /./srv/x; do
+      if _service_path_ok "$p"; then echo "debía rechazar $p"; exit 1; fi
+    done ) || return 1
+  _ls_expect_rejected_data '"$APPDATA_ROOT/."' "terminada en /." || return 1
+  _ls_expect_rejected_data '"$APPDATA_ROOT/miapp/."' "terminada en /x/." || return 1
+  _ls_expect_rejected_data '"$APPDATA_ROOT/miapp/"' "con barra final" || return 1
+}
+
+# Agrega la línea $1 a miapp.conf y comprueba que se rechaza sin ejecutar nada.
+_ls_expect_rejected_line() {
+  local line="$1" why="$2"
+  _ls_write miapp
+  rm -f "$HLI2_TEST_SCRATCH/pwned"
+  printf '%s\n' "$line" >> "$HLI2_LOCAL_SERVICES_DIR/miapp.conf"
+  ! _ls_listed || { fail "$why: debe rechazarse"; return 1; }
+  [[ ! -e "$HLI2_TEST_SCRATCH/pwned" ]] || { fail "$why: se ejecutó código"; return 1; }
+}
+
+test_local_service_content_lint_rejects_anything_executable() {
+  local P="$HLI2_TEST_SCRATCH/pwned"
+  _ls_expect_rejected_line "touch $P" "comando suelto" || return 1
+  _ls_expect_rejected_line "SERVICE_PORT=\"\$(touch $P)\"" 'sustitución $()' || return 1
+  _ls_expect_rejected_line "SERVICE_PORT=\"\`touch $P\`\"" "comillas invertidas" || return 1
+  _ls_expect_rejected_line "SERVICE_PORT=\"\"; touch $P" "punto y coma" || return 1
+  _ls_expect_rejected_line "SERVICE_PORT=\"\" & touch $P" "ampersand" || return 1
+  _ls_expect_rejected_line "SERVICE_PORT=\"\" | touch $P" "tubería" || return 1
+  _ls_expect_rejected_line "SERVICE_PORT=\"\" > $P" "redirección >" || return 1
+  _ls_expect_rejected_line "SERVICE_PORT=\"\" < /etc/passwd" "redirección <" || return 1
+  _ls_expect_rejected_line 'SERVICE_URL_SCHEME="$HOME"' 'variable $HOME' || return 1
+  _ls_expect_rejected_line 'SERVICE_URL_SCHEME="$APPDATA_ROOTx"' 'variable $APPDATA_ROOTx' || return 1
+  _ls_expect_rejected_line 'SERVICE_URL_SCHEME=http' "valor sin comillas" || return 1
+  _ls_expect_rejected_line 'export SERVICE_PORT=""' "línea que no es una asignación" || return 1
+  _ls_expect_rejected_line 'SERVICE_URL_SCHEME="a\"b"' "barra invertida" || return 1
+  # Comentarios, líneas en blanco y ${APPDATA_ROOT} sí se aceptan.
+  _ls_write miapp
+  printf '\n# comentario con $ y ; sin efecto\nSERVICE_BACKUP_EXCLUDE=("${APPDATA_ROOT}/miapp/db")\n' >> "$HLI2_LOCAL_SERVICES_DIR/miapp.conf"
+  _ls_listed || { fail "comentarios y \${APPDATA_ROOT} deben aceptarse"; return 1; }
+}
+
+test_local_service_data_overlapping_shipped_or_system_paths_is_rejected() {
+  _ls_expect_rejected_data '"$APPDATA_ROOT/jellyfin/config"' "igual a un servicio incluido" || return 1
+  _ls_expect_rejected_data '"$APPDATA_ROOT/jellyfin"' "padre de datos de un servicio incluido" || return 1
+  _ls_expect_rejected_data '"$APPDATA_ROOT/jellyfin/config/sub"' "dentro de datos de un servicio incluido" || return 1
+  _ls_write miapp
+  sed -i 's|^SERVICE_DATA=.*|SERVICE_DATA=("$APPDATA_ROOT/bk/x")|' "$HLI2_LOCAL_SERVICES_DIR/miapp.conf"
+  if ( source "$REPO_ROOT/lib/core.sh"; BACKUP_ROOT="$APPDATA_ROOT/bk"; service_list | grep -qx miapp ); then
+    fail "dentro de BACKUP_ROOT debe rechazarse"; return 1
+  fi
+  if ( source "$REPO_ROOT/lib/core.sh"; STATE_DIR="$APPDATA_ROOT/bk"; service_list | grep -qx miapp ); then
+    fail "dentro de STATE_DIR debe rechazarse"; return 1
+  fi
+  if ( source "$REPO_ROOT/lib/core.sh"; SECRETS_DIR="$APPDATA_ROOT/bk/x"; service_list | grep -qx miapp ); then
+    fail "igual a SECRETS_DIR debe rechazarse"; return 1
+  fi
+}
+
+test_service_display_name_falls_back_to_the_id() {
+  local out
+  out="$( ( source "$REPO_ROOT/lib/core.sh"; service_display_name no-existe ) )"
+  assert_contains "$out" "no-existe" || return 1
+}
+
+test_backup_excludes_restore_leftovers_in_the_registry_parent() {
+  _bk_prepare
+  _ls_write miapp
+  local out reg
+  reg="$(dirname "$HLI2_LOCAL_SERVICES_DIR")"
+  out="$( ( source "$REPO_ROOT/lib/core.sh"; _backup_collect; printf '%s\n' "${BK_EXCLUDE_ARGS[@]}" ) )"
+  assert_contains "$out" "--exclude=$reg/*.hli2-restore-tmp" || return 1
+  assert_contains "$out" "--exclude=$reg/*.hli2-before-restore-*" || return 1
+}

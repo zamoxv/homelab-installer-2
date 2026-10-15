@@ -142,3 +142,19 @@ test_tailscale_unknown_codename_aborts() {
     fail "no debe descargar nada del repositorio"; return 1
   fi
 }
+
+test_tailscale_installed_check_uses_the_dpkg_state() {
+  _ts_env
+  mkdir -p "$TS_BIN"; cp "$REPO_ROOT/tests/stubs/fake/tailscale" "$TS_BIN/tailscale"
+  PATH="$TS_BIN:$PATH"
+  local st
+  for st in "install ok installed" "hold ok installed" "deinstall ok installed"; do
+    ( export STUB_DPKG_STATUS="$st"; source "$REPO_ROOT/lib/core.sh"; source "$REPO_ROOT/modules/tailscale.sh"; _tailscale_installed ) \
+      || { fail "'$st' debe contar como instalado"; return 1; }
+  done
+  for st in "deinstall ok config-files" "install ok not-installed" "install ok half-installed"; do
+    if ( export STUB_DPKG_STATUS="$st"; source "$REPO_ROOT/lib/core.sh"; source "$REPO_ROOT/modules/tailscale.sh"; _tailscale_installed ); then
+      fail "'$st' no debe contar como instalado"; return 1
+    fi
+  done
+}

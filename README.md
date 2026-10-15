@@ -113,6 +113,16 @@ Reglas:
   `..`, bajo `$APPDATA_ROOT` (nunca `$APPDATA_ROOT` mismo ni rutas como `/etc`);
   `SERVICE_BACKUP_EXCLUDE` y `SERVICE_BACKUP_LOCAL_ONLY` solo pueden listar
   rutas de su propio `SERVICE_DATA`.
+- **Formato permitido** (filtro previo a cargar el archivo): solo líneas en
+  blanco, comentarios (`#`) y asignaciones de una sola línea `SERVICE_X="texto"`
+  o `SERVICE_X=("texto" "texto")`. Se rechaza todo lo que ejecute o redirija
+  (`$(`, comillas invertidas, `;`, `&`, `|`, `<`, `>`, barra invertida) y
+  cualquier `$` que no sea `$APPDATA_ROOT` o `${APPDATA_ROOT}`. Los arrays no
+  pueden partirse en varias líneas.
+- **Rutas**: cada ruta debe estar en forma canónica (sin `.`, `..`, `//` ni
+  barra final) y no puede coincidir ni anidarse (en ningún sentido) con los datos
+  de un servicio incluido ni con `/etc/hli2`, el estado del HLI o el
+  repositorio de backups.
 - **Colisiones**: el identificador no puede coincidir con el de un servicio
   incluido en el HLI (por ejemplo `jellyfin`). Gana siempre el incluido; el
   archivo local se ignora y el backup lo avisa en su log.
@@ -123,7 +133,13 @@ Reglas:
 - **Restauración**: aparecen como destinos en "Restaurar un backup". Al restaurar
   **"Todo"** (por ejemplo, en un equipo nuevo) se devuelve primero
   `/etc/hli2.d/services` y después los datos de cada servicio, de modo que los
-  servicios locales se reconocen aunque el equipo no tuviera nada. Restaurar un
+  servicios locales se reconocen aunque el equipo no tuviera nada. Solo se
+  restaura `/etc/hli2.d/services` (no el resto de `/etc/hli2.d`) y con
+  semántica de equipo nuevo: se instalan únicamente los `.conf` que no existen
+  (los existentes no se sobrescriben y se informan), pasando antes por el mismo
+  filtro de formato; los enlaces simbólicos y los nombres inválidos se omiten.
+  Los restos de restauraciones (`*.hli2-restore-tmp`, `*.hli2-before-restore-*`)
+  dentro de `/etc/hli2.d` no entran en los backups. Restaurar un
   solo servicio local requiere que su archivo ya esté registrado. El
   contenedor no se vuelve a crear: se restauran los datos y usted lo despliega
   de nuevo (por ejemplo, en Dokploy), con la misma ruta de datos.

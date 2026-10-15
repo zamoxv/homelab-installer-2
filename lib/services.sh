@@ -45,7 +45,50 @@ LOCAL_SERVICES_EXPECT_UID="${HLI2_LOCAL_SERVICES_EXPECT_UID:-0}"
 _service_path_ok() {
   local p="$1"
   [[ "$p" =~ ^/[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)+$ ]] || return 1
-  [[ "/$p/" != */../* && "$p" != *"/./"* ]]
+  # Ningún segmento puede ser '.' ni '..' (tampoco al final: '/x/.').
+  [[ "/$p/" != *"/../"* && "/$p/" != *"/./"* ]] || return 1
+  # Forma canónica (sin '//' ni barra final); -s: sin resolver enlaces.
+  [[ "$(realpath -m -s -- "$p" 2>/dev/null)" == "$p" ]]
+}
+
+# Revisión de un .conf local ANTES de hacer 'source' (solo estos archivos los
+# lee root, así que se acepta únicamente un subconjunto inofensivo): líneas en
+# blanco, comentarios y asignaciones 'SERVICE_X="texto"' o
+# 'SERVICE_X=("texto" "texto")' de una sola línea. Se rechaza todo lo que
+# ejecute o redirija ($(, comillas invertidas, ; & | < >, barra invertida) y
+# cualquier '$' que no sea $APPDATA_ROOT / ${APPDATA_ROOT}. Imprime el motivo.
+_service_conf_lint() {
+  local f="$1" line t n=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$(( n + 1 ))
+    [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    if [[ ! "$line" =~ ^SERVICE_[A-Z_]+=(\"[^\"]*\"|\(([[:space:]]*\"[^\"]*\")*[[:space:]]*\))$ ]]; then
+      echo "línea $n no permitida (solo SERVICE_X=\"valor\" o SERVICE_X=(\"a\" \"b\"))"; return 1
+    fi
+    if [[ "$line" == *'$('* || "$line" == *'`'* || "$line" == *';'* || "$line" == *'&'* \
+          || "$line" == *'|'* || "$line" == *'<'* || "$line" == *'>'* || "$line" == *'\'* ]]; then
+      echo "línea $n con caracteres no permitidos"; return 1
+    fi
+    if [[ "$line" =~ \$APPDATA_ROOT[A-Za-z0-9_] ]]; then echo "línea $n con una variable no permitida"; return 1; fi
+    t="${line//'${APPDATA_ROOT}'/}"
+    t="${t//'$APPDATA_ROOT'/}"
+    if [[ "$t" == *'$'* ]]; then echo "línea $n usa una variable distinta de APPDATA_ROOT"; return 1; fi
+  done < "$f"
+  return 0
+}
+
+# ¿Se solapan las rutas $1 y $2 (iguales, o una dentro de la otra)?
+_service_paths_overlap() {
+  [[ "$1" == "$2" || "$1" == "$2/"* || "$2" == "$1/"* ]]
+}
+
+# Rutas de datos de los servicios incluidos (una por línea).
+_service_shipped_data() {
+  local f
+  for f in "$SERVICES_DIR"/*.conf; do
+    [[ -f "$f" ]] || continue
+    ( _service_reset; source "$f" 2>/dev/null; [[ ${#SERVICE_DATA[@]} -eq 0 ]] || printf '%s\n' "${SERVICE_DATA[@]}" ) || true
+  done
 }
 
 # ¿$1 es de root (o del uid esperado en tests) y no escribible por grupo/otros?
@@ -97,6 +140,16 @@ _service_local_fields_ok() {
       echo "SERVICE_DATA debe ser una ruta absoluta válida bajo $APPDATA_ROOT: $p"; return 1
     fi
   done
+  local shipped sys
+  shipped="$(_service_shipped_data)"
+  for p in "${SERVICE_DATA[@]}"; do
+    while IFS= read -r q; do
+      if [[ -n "$q" ]] && _service_paths_overlap "$p" "$q"; then echo "SERVICE_DATA coincide o se anida con los datos de un servicio incluido: $p"; return 1; fi
+    done <<< "$shipped"
+    for sys in "${SECRETS_DIR:-}" "${STATE_DIR:-}" "${BACKUP_ROOT:-}"; do
+      if [[ -n "$sys" ]] && _service_paths_overlap "$p" "$sys"; then echo "SERVICE_DATA coincide o se anida con una ruta del sistema ($sys): $p"; return 1; fi
+    done
+  done
   for p in "${SERVICE_BACKUP_EXCLUDE[@]}" "${SERVICE_BACKUP_LOCAL_ONLY[@]}"; do
     found=0
     for q in "${SERVICE_DATA[@]}"; do [[ "$p" == "$q" ]] && found=1; done
@@ -118,8 +171,9 @@ _service_reset() {
 # campos. Imprime el motivo si no es válido.
 _service_local_load() {
   local id="$1" why
-  why="$(_service_local_file_ok "$id")" || { echo "$why"; return 1; }
   _service_reset
+  why="$(_service_local_file_ok "$id")" || { echo "$why"; return 1; }
+  why="$(_service_conf_lint "$LOCAL_SERVICES_DIR/$id.conf")" || { echo "$why"; return 1; }
   # shellcheck disable=SC1090
   source "$LOCAL_SERVICES_DIR/$id.conf" || { _service_reset; echo "el archivo tiene errores de sintaxis"; return 1; }
   why="$(_service_local_fields_ok)" || { _service_reset; echo "$why"; return 1; }
@@ -165,7 +219,8 @@ service_is_local() {
 # Nombre para mostrar de $1: los locales llevan la marca "(local)".
 service_display_name() {
   local name
-  name="$(service_get "$1" NAME)"
+  name="$(service_get "$1" NAME 2>/dev/null)" || name="$1"
+  [[ -n "$name" ]] || name="$1"
   if service_is_local "$1"; then name="$name (local)"; fi
   printf '%s\n' "$name"
 }

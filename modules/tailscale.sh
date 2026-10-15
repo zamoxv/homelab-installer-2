@@ -27,7 +27,10 @@ TAILSCALE_CODENAME="noble"
 _tailscale_installed() {
   # Paquete instalado según dpkg Y comando disponible: un binario suelto en el
   # PATH (instalación manual, otro origen) no cuenta como instalado por el módulo.
-  [[ "$(dpkg-query -W -f='${Status}' tailscale 2>/dev/null)" == *"install ok installed"* ]] \
+  # Se usa el estado real ('installed'), sin importar la marca de deseo
+  # ('hold ok installed', 'deinstall ok installed' siguen teniendo los archivos);
+  # 'config-files' (desinstalado sin purgar) significa que ya no están.
+  [[ "$(dpkg-query -W -f='${db:Status-Status}' tailscale 2>/dev/null)" == "installed" ]] \
     && command -v tailscale >/dev/null 2>&1
 }
 

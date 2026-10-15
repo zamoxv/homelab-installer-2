@@ -1840,3 +1840,44 @@ test_restore_of_a_single_service_does_not_touch_the_local_registry() {
   _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target vaultwarden || { fail "la restauración debió terminar bien"; return 1; }
   assert_file_contains "$reg/miapp.conf" "Mi App" "el registro actual no se toca" || return 1
 }
+
+# Prepara la foto con un registro local de 'miapp' y borra lo actual (equipo nuevo).
+_rs_registry_fixture() {
+  local F="$STUB_RESTIC_FIXTURE" reg="$HLI2_LOCAL_SERVICES_DIR"
+  _ls_write miapp sqlite
+  mkdir -p "$F$reg" "$F$APPDATA_ROOT/miapp/db"
+  cp "$reg/miapp.conf" "$F$reg/miapp.conf"
+  echo "snapshot-miapp" > "$F$APPDATA_ROOT/miapp/db/file.txt"
+}
+
+test_restore_all_does_not_overwrite_existing_registry_files_nor_chmod_the_dir() {
+  _rs_prepare
+  _rs_registry_fixture
+  local reg="$HLI2_LOCAL_SERVICES_DIR"
+  sed -i 's/Mi App/Version Actual/' "$reg/miapp.conf"
+  chmod 0750 "$reg"
+  # La carpeta 0750 no es escribible por otros: la validación sigue aceptándola.
+  _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target all || { fail "la restauración debió terminar bien"; return 1; }
+  assert_file_contains "$reg/miapp.conf" "Version Actual" "el conf existente no se sobrescribe" || return 1
+  assert_eq "750" "$(stat -c %a "$reg")" "el modo del directorio no cambia" || return 1
+  assert_contains "$(_rs_status message)" "se conservó el 'miapp.conf' existente" "se informa" || return 1
+  assert_eq "snapshot-miapp" "$(_rs_content "$APPDATA_ROOT/miapp/db/file.txt")" "los datos sí se restauran" || return 1
+}
+
+test_restore_all_skips_unsafe_registry_files_from_the_snapshot() {
+  _rs_prepare
+  _rs_registry_fixture
+  local F="$STUB_RESTIC_FIXTURE" reg="$HLI2_LOCAL_SERVICES_DIR" fr
+  fr="$F$reg"
+  cp "$fr/miapp.conf" "$fr/Bad_Name.conf"
+  cp "$fr/miapp.conf" "$fr/evil.conf"; echo "touch $HLI2_TEST_SCRATCH/pwned" >> "$fr/evil.conf"
+  ln -s miapp.conf "$fr/link.conf"
+  rm -rf "$reg" "$APPDATA_ROOT/miapp"
+  _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target all || { fail "la restauración debió terminar bien"; return 1; }
+  [[ -f "$reg/miapp.conf" ]] || { fail "el conf válido debe restaurarse"; return 1; }
+  [[ ! -e "$reg/Bad_Name.conf" && ! -e "$reg/evil.conf" && ! -e "$reg/link.conf" ]] || { fail "no debían instalarse los archivos inseguros"; ls "$reg"; return 1; }
+  [[ ! -e "$HLI2_TEST_SCRATCH/pwned" ]] || { fail "se ejecutó código de la foto"; return 1; }
+  assert_contains "$(_rs_status message)" "'evil.conf'" || return 1
+  assert_contains "$(_rs_status message)" "'Bad_Name.conf'" || return 1
+  assert_contains "$(_rs_status message)" "enlace simbólico" || return 1
+}
