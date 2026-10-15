@@ -25,7 +25,10 @@ TAILSCALE_REPO_BASE="https://pkgs.tailscale.com/stable/ubuntu"
 TAILSCALE_CODENAME="noble"
 
 _tailscale_installed() {
-  command -v tailscale >/dev/null 2>&1
+  # Paquete instalado según dpkg Y comando disponible: un binario suelto en el
+  # PATH (instalación manual, otro origen) no cuenta como instalado por el módulo.
+  [[ "$(dpkg-query -W -f='${Status}' tailscale 2>/dev/null)" == *"install ok installed"* ]] \
+    && command -v tailscale >/dev/null 2>&1
 }
 
 # ¿Hay sesión iniciada? 'tailscale status' sale 0 solo con el nodo conectado

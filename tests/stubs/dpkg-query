@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Stub de 'dpkg-query -W -f=${Status} tailscale': el paquete cuenta como
+# instalado solo si el 'tailscale' que resuelve el PATH es el falso (dentro de
+# STUB_SAFE_ROOT). Así un /usr/bin/tailscale real del equipo de desarrollo nunca
+# hace pasar por instalado a un test que parte de "no instalado".
+set -uo pipefail
+bin="$(command -v tailscale 2>/dev/null || true)"
+if [[ "${*: -1}" == "tailscale" && -n "$bin" && "$bin" == "${STUB_SAFE_ROOT:-/nonexistent}"/* ]]; then
+  printf 'install ok installed'
+  exit 0
+fi
+echo "dpkg-query: no packages found matching ${*: -1}" >&2
+exit 1
