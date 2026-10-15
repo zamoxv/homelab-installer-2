@@ -845,3 +845,17 @@ Por definir antes de diseñar el módulo:
       `ssh -t <servidor> hli2`. Requiere acceso SSH por clave.
 - [x] **Repositorio remoto en GitHub** para el HLI 2 (hoy los commits viven solo
       en el Fedora y se copian con `git bundle`).
+
+- [ ] **Webhook de autodeploy para apps propias en Dokploy** (caso JASJIC: hoy
+      los deploys son manuales porque GitHub no llega al panel, que es solo
+      LAN/Tailscale). Exponer SOLO la ruta del webhook por el túnel, con un
+      nombre dedicado y en este orden: `deploy.<dominio>` ruta `^/api/deploy/`
+      → HTTP `dokploy:3000`; `deploy.<dominio>` (resto) → `HTTP_STATUS 404`.
+      El panel nunca queda expuesto; la URL del webhook lleva un token secreto.
+      Opcional: regla WAF de Cloudflare que solo acepte `POST` (y, si se
+      quiere, solo las IPs `hooks` publicadas en `https://api.github.com/meta`).
+      Verificar: `https://deploy.<dominio>/` da 404 desde fuera; "Recent
+      Deliveries" del webhook en GitHub responde 200 y el push despliega. Si el
+      túnel no resuelve `dokploy`, usar el nombre real del servicio en
+      `dokploy-network`. Alternativa sin exponer nada: GitHub Actions + Tailscale
+      (más compleja).
