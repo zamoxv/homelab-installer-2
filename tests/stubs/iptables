@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Stub de 'iptables': solo registra los argumentos (STUB_CALL_LOG); nunca toca
+# reglas reales. Con STUB_IPTABLES_HAVE=1, las comprobaciones '-C' tienen
+# éxito (la regla ya existe); si no, fallan (no existe).
+set -uo pipefail
+source "$(dirname "$0")/_stublib.sh"
+log_call iptables "$@"
+# STUB_IPTABLES_MISSING=1: 'iptables' no está instalado (código 127).
+[[ -n "${STUB_IPTABLES_MISSING:-}" ]] && exit 127
+for a in "$@"; do
+  if [[ "$a" == "-C" ]]; then
+    [[ -n "${STUB_IPTABLES_HAVE:-}" ]] && exit 0 || exit 1
+  fi
+done
+exit 0

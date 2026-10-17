@@ -191,23 +191,36 @@ compose_render_cloudflared() {
 
 # --- Hermes Agent --------------------------------------------------------------
 
-# Argumentos: una o más IPv4 del host en las que publicar 8642 (API) y 9119
-# (dashboard): la de la LAN y, si Tailscale está activo, la de Tailscale.
+# Argumentos: <subred /24 privada de la red del contenedor> <DNS: IPs
+# separadas por comas> <IP del host>... (una o más: la de la LAN y, si
+# Tailscale está activo, la de Tailscale; en ellas se publican 8642 (API) y
+# 9119 (dashboard)).
 # Nunca 0.0.0.0 ni un puerto "pelado" (que Docker publicaría en todas las
 # interfaces): cada IP se valida y se rechaza lo que no sea una IPv4 concreta.
 # Los secretos (OPENROUTER_API_KEY, API_SERVER_KEY, clave del dashboard) NO
 # pasan por acá: el template ya trae "${VAR}" literal (los sustituye Dokploy
 # vía su campo "env", ver modules/hermes.sh).
+_compose_valid_ipv4() {
+  [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 )) || return 1
+  [[ "$1" != "0.0.0.0" ]]
+}
+
 compose_render_hermes() {
   local template="$SCRIPT_DIR/compose/hermes/docker-compose.yml"
   [[ -f "$template" ]] || { echo "ERROR: falta $template" >&2; return 1; }
-  [[ $# -ge 1 ]] || { echo "ERROR: compose_render_hermes necesita al menos una IP." >&2; return 1; }
+  [[ $# -ge 3 ]] || { echo "ERROR: compose_render_hermes necesita subred, DNS y al menos una IP." >&2; return 1; }
 
-  local ip port_lines="" uid gid
+  local subnet="$1" dns_csv="$2"
+  shift 2
+  if [[ ! "$subnet" =~ ^(10\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]{1,3}\.0/24$ ]]; then
+    echo "ERROR: subred no válida para la red de Hermes: '$subnet' (se espera una /24 privada, ej. 10.x.y.0/24)." >&2
+    return 1
+  fi
+
+  local ip port_lines="" dns_lines="" uid gid
   for ip in "$@"; do
-    if [[ ! "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] \
-       || (( BASH_REMATCH[1] > 255 || BASH_REMATCH[2] > 255 || BASH_REMATCH[3] > 255 || BASH_REMATCH[4] > 255 )) \
-       || [[ "$ip" == "0.0.0.0" ]]; then
+    if ! _compose_valid_ipv4 "$ip"; then
       echo "ERROR: IP no válida para publicar los puertos de Hermes: '$ip'." >&2
       return 1
     fi
@@ -216,6 +229,16 @@ compose_render_hermes() {
   done
   port_lines="${port_lines%$'\n'}"
 
+  local d
+  local -a dns_list
+  IFS=',' read -r -a dns_list <<<"$dns_csv"
+  [[ ${#dns_list[@]} -ge 1 ]] || { echo "ERROR: falta al menos un servidor DNS." >&2; return 1; }
+  for d in "${dns_list[@]}"; do
+    _compose_valid_ipv4 "$d" || { echo "ERROR: servidor DNS no válido: '$d'." >&2; return 1; }
+    dns_lines+="      - ${d}"$'\n'
+  done
+  dns_lines="${dns_lines%$'\n'}"
+
   uid="$(id -u "$SERVER_USER")" || { echo "ERROR: no existe el usuario '$SERVER_USER'." >&2; return 1; }
   gid="$(id -g "$SERVER_USER")" || { echo "ERROR: no se pudo resolver el grupo primario de '$SERVER_USER'." >&2; return 1; }
 
@@ -223,5 +246,7 @@ compose_render_hermes() {
     | _compose_subst "__APPDATA__" "$APPDATA_ROOT" \
     | _compose_subst "__UID__" "$uid" \
     | _compose_subst "__GID__" "$gid" \
+    | _compose_subst "__SUBNET__" "$subnet" \
+    | _compose_subst "__DNS_LINES__" "$dns_lines" \
     | _compose_subst "__PORT_LINES__" "$port_lines"
 }

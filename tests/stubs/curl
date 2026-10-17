@@ -104,6 +104,9 @@ case "$url" in
   # 200 solo con 'Authorization: Bearer ...' recibido por stdin (-K -).
   *:8642/health)
     [[ -n "${STUB_HERMES_HEALTH_FAIL:-}" ]] && exit 7
+    # STUB_HERMES_HEALTH_FAIL_AFTER_RESTART=1: /health deja de responder una
+    # vez que hubo un 'docker restart' (cambio de modelos).
+    if [[ -n "${STUB_HERMES_HEALTH_FAIL_AFTER_RESTART:-}" ]] && grep -q $'^docker\trestart\t' "${STUB_CALL_LOG:-/dev/null}" 2>/dev/null; then exit 7; fi
     resp='{"status":"ok"}'
     ;;
   *:8642/v1/models)

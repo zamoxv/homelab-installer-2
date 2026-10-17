@@ -39,6 +39,13 @@
 #   https://hermes-agent.nousresearch.com/docs/user-guide/features/fallback-providers
 #   https://openrouter.ai/docs/cookbook/coding-agents/hermes-integration
 #
+# Aislamiento de salida: el contenedor vive en su propia red (subred /24 fija,
+# HLI2_HERMES_SUBNET, por defecto 10.213.144.0/24) y el módulo instala reglas
+# de iptables para que el agente NO pueda iniciar conexiones hacia la LAN,
+# Tailscale, la propia máquina ni otras redes privadas (el agente tiene una
+# terminal: sin esto alcanzaría el panel de Dokploy, AdGuard, Home Assistant,
+# el router). Ver _hermes_render_egress_script.
+#
 # Secretos (OPENROUTER_API_KEY, API_SERVER_KEY, clave y secreto del
 # dashboard): root-only en /etc/hli2/hermes.env (lib/secrets.sh), al compose
 # solo por el canal "env" de Dokploy entre comillas simples; nunca por argv
@@ -52,6 +59,15 @@ source "$(dirname "$0")/../lib/core.sh"
 # 0,13 (0,10 / 0,40 sobre 32k de prompt), herramientas, texto+imagen+video.
 # El usuario puede cambiarlos en el cuadro de entrada.
 HERMES_DEFAULT_MODEL="deepseek/deepseek-v4.1-flash"
+# Subred de la red del contenedor: una /24 privada que no choca con el pool
+# de Swarm de Dokploy (172.20-31), las redes por defecto de Docker (172.17-31
+# y 192.168.0.0/16 en trozos /20) ni con LAN típicas. Configurable.
+HERMES_SUBNET="${HLI2_HERMES_SUBNET:-10.213.144.0/24}"
+# Dónde se instalan el script/unidad de aislamiento y el drop-in de Docker
+# (variables HLI2_* para los tests, mismo criterio que el resto del proyecto).
+HERMES_SBIN_DIR="${HLI2_HERMES_SBIN_DIR:-/usr/local/sbin}"
+HERMES_SYSTEMD_DIR="${HLI2_SYSTEMD_DIR:-/etc/systemd/system}"
+HERMES_DOCKER_DROPIN_DIR="${HLI2_DOCKER_DROPIN_DIR:-/etc/systemd/system/docker.service.d}"
 HERMES_DEFAULT_AUX_MODEL="qwen/qwen3.7-flash"
 
 # Tareas auxiliares de Hermes v0.22.2 que usan un LLM
@@ -92,6 +108,27 @@ _hermes_valid_ipv4() {
   [[ "$1" != "0.0.0.0" ]]
 }
 
+# IPv4 privada de LAN (RFC 1918). Rechaza públicas, 127/8, 169.254/16, etc.
+_hermes_private_lan_ip() {
+  _hermes_valid_ipv4 "$1" || return 1
+  local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}"
+  (( a == 10 )) && return 0
+  (( a == 172 && b >= 16 && b <= 31 )) && return 0
+  (( a == 192 && b == 168 )) && return 0
+  return 1
+}
+
+# IPv4 del rango CGNAT de Tailscale (100.64.0.0/10).
+_hermes_tailscale_range_ip() {
+  _hermes_valid_ipv4 "$1" || return 1
+  (( BASH_REMATCH[1] == 100 && BASH_REMATCH[2] >= 64 && BASH_REMATCH[2] <= 127 ))
+}
+
+# ¿La IP $1 cae dentro de la /24 $2?
+_hermes_ip_in_subnet24() {
+  [[ "${1%.*}" == "${2%.*}" ]]
+}
+
 # --- Generación de secretos -------------------------------------------------
 
 _hermes_rand_hex32() {
@@ -118,6 +155,18 @@ HERMES_DASHBOARD_BASIC_AUTH_SECRET=${H_DASH_SECRET}
 HLI_CREDENTIALS_PENDING=${H_PENDING}"
 }
 
+# Valor de CLAVE en el contenido ($1) de un archivo CLAVE=valor ('' si no
+# está). Parseo explícito, nunca 'source' (mismo criterio que secret_get).
+_hermes_env_value() {
+  local content="$1" key="$2" line
+  while IFS= read -r line; do
+    case "$line" in
+      "${key}="*) printf '%s' "${line#"${key}="}"; return 0 ;;
+    esac
+  done <<<"$content"
+  return 0
+}
+
 _hermes_ask_openrouter_key() {
   msg "Antes de continuar, cree la clave de OpenRouter CON UN LÍMITE DE GASTO:\n\n1. Entre a openrouter.ai -> Keys -> 'Create key'.\n2. Ponga un nombre (por ejemplo 'hermes') y fije un límite de crédito de 5 USD (si el panel ofrece reinicio mensual, elíjalo).\n3. Copie la clave (empieza con 'sk-or-').\n\nEl límite en la clave es el tope DURO de gasto: si el agente se descontrola o la clave se filtra, OpenRouter deja de cobrar al llegar a ese monto. Se recomienda mucho no omitirlo.\n\nEn el siguiente paso se le pedirá la clave; no se muestra en pantalla ni se registra en logs."
   local key
@@ -134,28 +183,57 @@ _hermes_ask_openrouter_key() {
   key=""
 }
 
-# Deja H_* completos y guardados en /etc/hli2/hermes.env. En una re-ejecución
-# conserva lo guardado y solo cambia lo que el usuario pida explícitamente.
+# Deja H_* completos y guardados en /etc/hli2/hermes.env.
+# - Si el archivo existe se cargan TODOS sus secretos tal cual; solo se pide
+#   (clave de OpenRouter) o se genera (el resto) lo que falte. Nunca se rota
+#   nada sin que el usuario lo pida en las preguntas de más abajo.
+# - Si el archivo existe pero no se puede leer (sudo sin caché, etc.) se
+#   aborta: regenerar en ese caso rotaría en silencio claves que sí existen.
 _hermes_ensure_secrets() {
-  local existing=0 changed=0
-  if secret_file_exists hermes \
-     && H_OR_KEY="$(secret_get hermes OPENROUTER_API_KEY 2>/dev/null)" && [[ -n "$H_OR_KEY" ]]; then
+  local existing=0 changed=0 f content
+  f="$(secret_file_path hermes)"
+  if ! sudo -n true 2>/dev/null; then
+    msg "No se pudo verificar /etc/hli2/hermes.env porque 'sudo' no está disponible sin contraseña (¿expiró la sesión de sudo?). Se cancela el despliegue de Hermes para no regenerar claves que podrían existir. Vuelva a correr el módulo desde una sesión con sudo activo."
+    return 1
+  fi
+  if priv_file_exists "$f"; then
+    content="$(priv_file_read "$f")" || {
+      msg "Existe /etc/hli2/hermes.env pero no se pudo leer. Se cancela el despliegue de Hermes para no regenerar claves que ya existen."
+      return 1
+    }
     existing=1
-    H_API_KEY="$(secret_get hermes API_SERVER_KEY 2>/dev/null || true)"
-    H_DASH_PASS="$(secret_get hermes HERMES_DASHBOARD_BASIC_AUTH_PASSWORD 2>/dev/null || true)"
-    H_DASH_SECRET="$(secret_get hermes HERMES_DASHBOARD_BASIC_AUTH_SECRET 2>/dev/null || true)"
-    H_PENDING="$(secret_get hermes HLI_CREDENTIALS_PENDING 2>/dev/null || echo 1)"
+    H_OR_KEY="$(_hermes_env_value "$content" OPENROUTER_API_KEY)"
+    H_API_KEY="$(_hermes_env_value "$content" API_SERVER_KEY)"
+    H_DASH_PASS="$(_hermes_env_value "$content" HERMES_DASHBOARD_BASIC_AUTH_PASSWORD)"
+    H_DASH_SECRET="$(_hermes_env_value "$content" HERMES_DASHBOARD_BASIC_AUTH_SECRET)"
+    H_PENDING="$(_hermes_env_value "$content" HLI_CREDENTIALS_PENDING)"
+    [[ "$H_PENDING" == "0" ]] || H_PENDING="1"
+    content=""
+    # Valores presentes pero con forma inesperada: no se reemplazan solos.
+    if [[ -n "$H_OR_KEY" ]] && ! _hermes_valid_openrouter_key "$H_OR_KEY"; then
+      msg "La clave de OpenRouter guardada en /etc/hli2/hermes.env tiene una forma inesperada. Corríjala a mano (o bórrela del archivo para que se vuelva a pedir) y vuelva a correr el módulo."
+      return 1
+    fi
+    if { [[ -n "$H_API_KEY" && ! "$H_API_KEY" =~ ^[A-Za-z0-9]{8,128}$ ]]; } \
+       || { [[ -n "$H_DASH_PASS" && ! "$H_DASH_PASS" =~ ^[A-Za-z0-9]{8,128}$ ]]; } \
+       || { [[ -n "$H_DASH_SECRET" && ! "$H_DASH_SECRET" =~ ^[A-Za-z0-9]{8,128}$ ]]; }; then
+      msg "Alguno de los secretos guardados en /etc/hli2/hermes.env (clave de API, contraseña o secreto del dashboard) tiene una forma inesperada (solo letras y números, 8 a 128). Corríjalo a mano y vuelva a correr el módulo; no se reemplaza solo."
+      return 1
+    fi
   fi
 
   if [[ "$existing" -eq 1 ]]; then
     if confirm "Ya hay secretos guardados para Hermes.\n\n¿Generar una clave de API nueva? (rota API_SERVER_KEY: habrá que cargar la nueva en hermes-android.)" "no"; then
       H_API_KEY=""
     fi
-    if confirm "¿Reemplazar la clave de OpenRouter guardada por otra?" "no"; then
-      _hermes_ask_openrouter_key || return 1
-      changed=1
+    if [[ -n "$H_OR_KEY" ]]; then
+      if confirm "¿Reemplazar la clave de OpenRouter guardada por otra?" "no"; then
+        _hermes_ask_openrouter_key || return 1
+        changed=1
+      fi
     fi
-  else
+  fi
+  if [[ -z "$H_OR_KEY" ]]; then
     _hermes_ask_openrouter_key || return 1
     changed=1
   fi
@@ -169,7 +247,7 @@ _hermes_ensure_secrets() {
   if [[ -z "$H_DASH_SECRET" ]]; then
     H_DASH_SECRET="$(_hermes_rand_hex32)"; changed=1
   fi
-  if [[ ! "$H_API_KEY" =~ ^[0-9a-f]{64}$ || "${#H_DASH_PASS}" -ne 24 || ! "$H_DASH_SECRET" =~ ^[0-9a-f]{64}$ ]]; then
+  if [[ ! "$H_API_KEY" =~ ^[A-Za-z0-9]{8,128}$ || ! "$H_DASH_PASS" =~ ^[A-Za-z0-9]{8,128}$ || ! "$H_DASH_SECRET" =~ ^[A-Za-z0-9]{8,128}$ ]]; then
     msg "No se pudieron generar los secretos aleatorios de Hermes (¿falla /dev/urandom?). Se cancela el despliegue."
     return 1
   fi
@@ -247,21 +325,43 @@ terminal:
 EOF
 }
 
-# Siembra config.yaml SOLO si no existe (nunca pisa ediciones del usuario o
-# del agente). Creado con 'install' (modo y dueño finales desde el inicio) y
-# escrito con 'tee' sobre ese archivo ya existente; sin mktemp del usuario +
-# 'sudo tee' (fs.protected_regular).
-H_CONFIG_SEEDED=0
-_hermes_seed_config() {
-  local model="$1" aux="$2" cfg
+# ¿Hay un config.yaml utilizable? Un archivo vacío, ilegible o sin la clave
+# 'model:' (restos de una escritura interrumpida) cuenta como ausente.
+_hermes_config_valid() {
+  local cfg content
   cfg="$(_hermes_config_path)"
-  if sudo -n test -f "$cfg" 2>/dev/null; then
-    H_CONFIG_SEEDED=0
-    return 0
+  sudo -n test -f "$cfg" 2>/dev/null || return 1
+  content="$(sudo -n cat -- "$cfg" 2>/dev/null)" || return 1
+  [[ -n "$content" ]] || return 1
+  grep -Eq '^model:' <<<"$content"
+}
+
+# Siembra config.yaml SOLO si no hay uno utilizable (nunca pisa ediciones del
+# usuario o del agente). Escritura atómica: se renderiza a un archivo
+# temporal en la MISMA carpeta (creado con 'install': modo y dueño finales
+# desde el inicio, escrito con 'tee' sobre ese archivo ya existente; sin
+# mktemp del usuario + 'sudo tee', fs.protected_regular) y se mueve con 'mv'
+# (rename atómico). Un config.yaml inválido no vacío se conserva como
+# 'config.yaml.invalido-<fecha>' antes de reemplazarlo.
+_hermes_seed_config() {
+  local model="$1" aux="$2" cfg stage
+  cfg="$(_hermes_config_path)"
+  _hermes_config_valid && return 0
+  stage="${cfg}.tmp.$$"
+  if ! sudo install -m 0640 -o "$H_UID" -g "$H_GID" /dev/null "$stage"; then
+    return 1
   fi
-  sudo install -m 0640 -o "$H_UID" -g "$H_GID" /dev/null "$cfg"
-  _hermes_render_config "$model" "$aux" | sudo tee "$cfg" >/dev/null
-  H_CONFIG_SEEDED=1
+  if ! _hermes_render_config "$model" "$aux" | sudo tee "$stage" >/dev/null; then
+    sudo rm -f "$stage"
+    return 1
+  fi
+  if sudo -n test -s "$cfg" 2>/dev/null; then
+    sudo cp -f "$cfg" "${cfg}.invalido-$(date +%Y%m%d%H%M%S)" || true
+  fi
+  if ! sudo mv -f "$stage" "$cfg"; then
+    sudo rm -f "$stage"
+    return 1
+  fi
   log "config.yaml de Hermes sembrado en $cfg"
 }
 
@@ -282,13 +382,16 @@ _hermes_ask_models() {
 # En una re-ejecución, con config.yaml ya existente: cambia SOLO las claves de
 # modelo, con la propia CLI de Hermes dentro del contenedor ya desplegado
 # (no se edita YAML a mano: el archivo puede haber sido reescrito por el
-# agente). INCERTIDUMBRE: 'hermes config set' con rutas anidadas de tres
-# niveles (auxiliary.<tarea>.model) no está documentado explícitamente.
+# agente). Se ejecuta con el uid/gid del agente ('-u'): 'docker exec' como
+# root dejaría archivos de root dentro de /opt/data. INCERTIDUMBRE: 'hermes
+# config set' con rutas anidadas de tres niveles (auxiliary.<tarea>.model) no
+# está documentado explícitamente.
 _hermes_apply_model_change() {
   local hermes_bin="/opt/hermes/.venv/bin/hermes" task failed=0
-  hli_docker exec hermes "$hermes_bin" config set model.default "$H_MODEL" >/dev/null 2>&1 || failed=1
+  local -a run=(exec -u "${H_UID}:${H_GID}" hermes "$hermes_bin" config set)
+  hli_docker "${run[@]}" model.default "$H_MODEL" >/dev/null 2>&1 || failed=1
   for task in "${HERMES_AUX_TASKS[@]}"; do
-    hli_docker exec hermes "$hermes_bin" config set "auxiliary.${task}.model" "$H_AUX_MODEL" >/dev/null 2>&1 || failed=1
+    hli_docker "${run[@]}" "auxiliary.${task}.model" "$H_AUX_MODEL" >/dev/null 2>&1 || failed=1
   done
   if [[ "$failed" -eq 1 ]]; then
     msg "No se pudieron cambiar todos los modelos con la CLI de Hermes. Edite a mano ${APPDATA_ROOT}/hermes/config.yaml (claves model.default y auxiliary.<tarea>.model) y reinicie el contenedor 'hermes'."
@@ -303,9 +406,188 @@ _hermes_apply_model_change() {
 _hermes_tailscale_ip() {
   local ip
   ip="$(sudo -n tailscale ip -4 2>/dev/null | head -n1)" || ip=""
-  if [[ "$ip" =~ ^100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && _hermes_valid_ipv4 "$ip"; then
+  if _hermes_tailscale_range_ip "$ip"; then
     printf '%s' "$ip"
   fi
+}
+
+# IP de LAN del servidor: la de la interfaz de la ruta por defecto ('ip -4
+# route get', campo 'src'); si 'ip' no la da, la primera de 'hostname -I'
+# (get_ip). Se exige una IPv4 privada (RFC 1918): nunca una pública, 127/8,
+# 169.254/16 ni nada que no sea de la LAN.
+_hermes_lan_ip() {
+  local ip
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')" || ip=""
+  [[ -n "$ip" ]] || ip="$(get_ip 2>/dev/null || true)"
+  printf '%s' "$ip"
+}
+
+# --- Aislamiento de salida (iptables) -------------------------------------------
+
+# Script que aplica/quita las reglas (se instala en $HERMES_SBIN_DIR y lo
+# ejecuta la unidad de systemd en cada arranque; idempotente: reconstruye las
+# cadenas y solo inserta los saltos si faltan). Argumentos de generación:
+# $1 = subred del contenedor, $2 = IPs de DNS permitidas en el host.
+#
+# Diseño (las dos rutas que puede tomar un paquete del agente):
+# - Hacia OTRAS máquinas o contenedores (FORWARD): se engancha en DOCKER-USER
+#   (se evalúa antes que las reglas de Docker). Cadena HLI2-HERMES-FWD:
+#   ESTABLISHED/RELATED aceptado; hook HLI2-HERMES-ALLOW; DNS permitido; DROP
+#   hacia 10/8, 172.16/12, 192.168/16, 100.64/10 y 169.254/16; el resto
+#   (Internet) RETURN, o sea sigue a las reglas normales de Docker.
+#   Los puertos publicados (8642/9119) no se ven afectados: la conexión
+#   entrante LAN -> contenedor tiene origen en la LAN (no en la subred), y las
+#   respuestas contenedor -> LAN son ESTABLISHED, aceptadas por la primera
+#   regla. Solo las conexiones NUEVAS iniciadas desde la subred se filtran.
+# - Hacia la PROPIA máquina (INPUT): servicios en la red del host (AdGuard,
+#   Home Assistant, SSH, etc.) no pasan por FORWARD ni DOCKER-USER, así que
+#   hace falta además HLI2-HERMES-IN en INPUT: ESTABLISHED/RELATED, hook, DNS
+#   y DROP de todo lo demás.
+# - Hook para permitir un destino local concreto (por ejemplo Ollama en
+#   v2.6c): agregar reglas ACCEPT a la cadena HLI2-HERMES-ALLOW (no la
+#   reconstruye el script), p. ej.
+#   iptables -A HLI2-HERMES-ALLOW -d <ip> -p tcp --dport 11434 -j ACCEPT
+#   (persistir con un script propio After= de esta unidad).
+# - DNS: el contenedor usa los servidores de 'dns:' del compose (el DNS de la
+#   LAN solo si AdGuard está instalado, o resolvers públicos); el DNS interno
+#   de Docker (127.0.0.11) vive dentro del contenedor y reenvía a esos.
+# - IPv6: la red no lo habilita (Docker por defecto no lo hace).
+_hermes_render_egress_script() {
+  local subnet="$1" dns_hosts="$2"
+  cat <<EOF
+#!/usr/bin/env bash
+# Generado por el HLI 2 (modules/hermes.sh). Aislamiento de salida del
+# contenedor de Hermes: ver el comentario de _hermes_render_egress_script.
+# Uso: hli2-hermes-egress apply | remove
+set -euo pipefail
+SUBNET="${subnet}"
+DNS_HOSTS="${dns_hosts}"
+BLOCKED="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16"
+
+rebuild_chain() {
+  local chain="\$1" kind="\$2" d r
+  iptables -w -N "\$chain" 2>/dev/null || true
+  iptables -w -F "\$chain"
+  iptables -w -A "\$chain" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -w -A "\$chain" -j HLI2-HERMES-ALLOW
+  for d in \$DNS_HOSTS; do
+    iptables -w -A "\$chain" -d "\$d" -p udp --dport 53 -j ACCEPT
+    iptables -w -A "\$chain" -d "\$d" -p tcp --dport 53 -j ACCEPT
+  done
+  if [[ "\$kind" == "fwd" ]]; then
+    for r in \$BLOCKED; do
+      iptables -w -A "\$chain" -d "\$r" -j DROP
+    done
+    iptables -w -A "\$chain" -j RETURN
+  else
+    iptables -w -A "\$chain" -j DROP
+  fi
+}
+
+ensure_jump() {
+  local from="\$1" to="\$2"
+  iptables -w -C "\$from" -s "\$SUBNET" -j "\$to" 2>/dev/null \\
+    || iptables -w -I "\$from" 1 -s "\$SUBNET" -j "\$to"
+}
+
+case "\${1:-apply}" in
+  apply)
+    iptables -w -N DOCKER-USER 2>/dev/null || true
+    iptables -w -N HLI2-HERMES-ALLOW 2>/dev/null || true
+    rebuild_chain HLI2-HERMES-FWD fwd
+    rebuild_chain HLI2-HERMES-IN in
+    ensure_jump DOCKER-USER HLI2-HERMES-FWD
+    ensure_jump INPUT HLI2-HERMES-IN
+    ;;
+  remove)
+    iptables -w -D DOCKER-USER -s "\$SUBNET" -j HLI2-HERMES-FWD 2>/dev/null || true
+    iptables -w -D INPUT -s "\$SUBNET" -j HLI2-HERMES-IN 2>/dev/null || true
+    for c in HLI2-HERMES-FWD HLI2-HERMES-IN HLI2-HERMES-ALLOW; do
+      iptables -w -F "\$c" 2>/dev/null || true
+      iptables -w -X "\$c" 2>/dev/null || true
+    done
+    ;;
+  *)
+    echo "uso: \$0 apply|remove" >&2
+    exit 2
+    ;;
+esac
+EOF
+}
+
+_hermes_render_egress_unit() {
+  cat <<EOF
+[Unit]
+Description=HLI 2: aislamiento de salida del contenedor de Hermes
+After=docker.service
+Wants=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${HERMES_SBIN_DIR}/hli2-hermes-egress apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# Instala (root:root) el script y la unidad, la habilita y aplica las reglas
+# YA, antes de desplegar el contenedor (sin ventana sin protección). Para
+# quitarlo: systemctl disable --now hli2-hermes-egress.service;
+# <sbin>/hli2-hermes-egress remove; y borrar los dos archivos.
+_hermes_install_egress() {
+  local subnet="$1" dns_hosts="$2" script unit
+  script="${HERMES_SBIN_DIR}/hli2-hermes-egress"
+  unit="${HERMES_SYSTEMD_DIR}/hli2-hermes-egress.service"
+  if ! sudo -n sh -c 'iptables -w -S' >/dev/null 2>&1; then
+    msg "No se encontró 'iptables' (o no se pudo consultar) en el servidor: hace falta para impedir que el agente alcance la LAN. Instale el paquete 'iptables' y vuelva a correr este módulo. Se cancela el despliegue de Hermes."
+    return 1
+  fi
+  sudo install -d -m 0755 -o root -g root "$HERMES_SBIN_DIR" "$HERMES_SYSTEMD_DIR" || return 1
+  sudo install -m 0755 -o root -g root /dev/null "$script" || return 1
+  _hermes_render_egress_script "$subnet" "$dns_hosts" | sudo tee "$script" >/dev/null || return 1
+  sudo install -m 0644 -o root -g root /dev/null "$unit" || return 1
+  _hermes_render_egress_unit | sudo tee "$unit" >/dev/null || return 1
+  sudo systemctl daemon-reload || true
+  sudo systemctl enable hli2-hermes-egress.service >/dev/null 2>&1 || true
+  if ! sudo "$script" apply; then
+    msg "No se pudieron aplicar las reglas de aislamiento de salida de Hermes (iptables). Se cancela el despliegue: sin ellas el agente podría alcanzar la LAN."
+    return 1
+  fi
+  log "Aislamiento de salida de Hermes aplicado (subred $subnet)."
+}
+
+# --- Orden de arranque con Tailscale ------------------------------------------------
+
+_hermes_render_docker_dropin() {
+  cat <<'EOF'
+# Generado por el HLI 2 (modules/hermes.sh): Hermes publica puertos en la IP
+# de Tailscale, que debe existir antes de que Docker arranque el contenedor.
+[Unit]
+After=tailscaled.service network-online.target
+Wants=tailscaled.service network-online.target
+
+[Service]
+# Espera (hasta 30 s) a que Tailscale tenga IPv4; nunca hace fallar a Docker.
+ExecStartPre=-/bin/sh -c 'i=0; while [ "$i" -lt 30 ]; do tailscale ip -4 >/dev/null 2>&1 && exit 0; i=$((i+1)); sleep 1; done; exit 0'
+EOF
+}
+
+# Solo si hay IP de Tailscale publicada y el servicio tailscaled existe.
+# Idempotente: no reescribe ni recarga systemd si el contenido ya es el mismo.
+_hermes_install_docker_dropin() {
+  local file="${HERMES_DOCKER_DROPIN_DIR}/hli2-tailscale.conf" want have
+  systemctl cat tailscaled.service >/dev/null 2>&1 || return 0
+  want="$(_hermes_render_docker_dropin)"
+  have="$(sudo -n cat -- "$file" 2>/dev/null || true)"
+  [[ "$have" == "$want" ]] && return 0
+  sudo install -d -m 0755 -o root -g root "$HERMES_DOCKER_DROPIN_DIR" || return 1
+  sudo install -m 0644 -o root -g root /dev/null "$file" || return 1
+  printf '%s\n' "$want" | sudo tee "$file" >/dev/null || return 1
+  sudo systemctl daemon-reload || true
+  log "Drop-in de Docker instalado: $file (arranca después de Tailscale)."
 }
 
 # Código HTTP de GET $1 (URL); $2 opcional = clave Bearer, que va a curl por
@@ -386,7 +668,7 @@ _hermes_main() {
 
   local cfg change_models=0
   cfg="$(_hermes_config_path)"
-  if sudo -n test -f "$cfg" 2>/dev/null; then
+  if _hermes_config_valid; then
     if confirm "Ya existe config.yaml de Hermes (${cfg}). No se modifica.\n\n¿Cambiar solamente los modelos (principal y auxiliares)?" "no"; then
       change_models=1
       _hermes_ask_models || return 1
@@ -394,17 +676,34 @@ _hermes_main() {
   else
     _hermes_ask_models || return 1
   fi
-  _hermes_seed_config "$H_MODEL" "$H_AUX_MODEL" || return 1
+  _hermes_seed_config "$H_MODEL" "$H_AUX_MODEL" || { msg "No se pudo escribir config.yaml de Hermes. Se cancela el despliegue."; return 1; }
 
   local lan_ip ts_ip
-  lan_ip="$(get_ip 2>/dev/null || true)"
-  if ! _hermes_valid_ipv4 "$lan_ip"; then
-    msg "No se pudo determinar la IP de la LAN del servidor (se obtuvo '${lan_ip}'). Se cancela el despliegue de Hermes: sus puertos nunca se publican en todas las interfaces."
+  lan_ip="$(_hermes_lan_ip)"
+  if ! _hermes_private_lan_ip "$lan_ip"; then
+    msg "La IP de la LAN del servidor ('${lan_ip}') no es una dirección privada válida (10.x, 172.16-31.x o 192.168.x). Se cancela el despliegue de Hermes: sus puertos solo se publican en la LAN y en Tailscale, nunca en una IP pública ni en todas las interfaces."
+    return 1
+  fi
+  if ! [[ "$HERMES_SUBNET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.0/24$ ]] || _hermes_ip_in_subnet24 "$lan_ip" "$HERMES_SUBNET"; then
+    msg "La subred de la red de Hermes ('${HERMES_SUBNET}') no es una /24 válida o coincide con la de la LAN del servidor. Defina otra con la variable HLI2_HERMES_SUBNET (una /24 privada sin uso) y vuelva a correr el módulo."
     return 1
   fi
   ts_ip="$(_hermes_tailscale_ip)"
   local -a ips=("$lan_ip")
-  [[ -z "$ts_ip" ]] || ips+=("$ts_ip")
+  [[ -z "$ts_ip" || "$ts_ip" == "$lan_ip" ]] || ips+=("$ts_ip")
+
+  # DNS del contenedor: el de la LAN (AdGuard en este servidor) solo si
+  # AdGuard está instalado; si no, resolvers públicos (salen por Internet).
+  local dns_csv
+  if is_done adguard; then
+    dns_csv="$lan_ip"
+  else
+    dns_csv="1.1.1.1,9.9.9.9"
+  fi
+
+  # Aislamiento de salida ANTES de crear el contenedor.
+  _hermes_install_egress "$HERMES_SUBNET" "${dns_csv//,/ }" || return 1
+  [[ -z "$ts_ip" ]] || _hermes_install_docker_dropin || log "No se pudo instalar el drop-in de Docker para Tailscale."
 
   dokploy_preflight || return 1
 
@@ -413,7 +712,7 @@ _hermes_main() {
   environment_id="$(dokploy_environment_default_id "$project_json")" || { msg "No se pudo resolver el ambiente por defecto del proyecto 'homelab' en Dokploy."; return 1; }
 
   compose_file="$(mktemp)"
-  if ! compose_render_hermes "${ips[@]}" > "$compose_file"; then
+  if ! compose_render_hermes "$HERMES_SUBNET" "$dns_csv" "${ips[@]}" > "$compose_file"; then
     msg "No se pudo renderizar el compose de Hermes."
     rm -f "$compose_file"
     return 1
@@ -439,8 +738,8 @@ _hermes_main() {
   env_content=""
   rm -f "$compose_file"
 
-  if ! service_wait_active hermes 120; then
-    msg "El contenedor 'hermes' no llegó a 'activo' dentro de los 120 segundos de espera. Revise el panel de Dokploy y los logs (sudo docker logs hermes). Puede deberse a que una IP publicada (LAN o Tailscale) todavía no existe en el host: vuelva a correr este módulo cuando esté arriba."
+  if ! service_wait_active hermes 300; then
+    msg "El contenedor 'hermes' no llegó a 'activo' dentro de los 300 segundos de espera (la primera vez descarga la imagen). Revise el panel de Dokploy y los logs (sudo docker logs hermes). Puede deberse a que una IP publicada (LAN o Tailscale) todavía no existe en el host, o a las opciones de endurecimiento del compose (ver la prueba 119 de docs/VALIDACION.md): vuelva a correr este módulo cuando esté arriba."
     return 1
   fi
 
@@ -454,7 +753,13 @@ _hermes_main() {
   fi
 
   if [[ "$change_models" -eq 1 ]]; then
-    _hermes_apply_model_change || true
+    if ! _hermes_apply_model_change; then
+      return 1
+    fi
+    if ! _hermes_wait_health "http://${lan_ip}:8642/health"; then
+      msg "Se cambiaron los modelos y se reinició Hermes, pero http://${lan_ip}:8642/health no volvió a responder a tiempo. Revise los logs (sudo docker logs --tail 50 hermes) y config.yaml (${cfg})."
+      return 1
+    fi
   fi
 
   if [[ "$H_PENDING" == "1" ]]; then
@@ -467,7 +772,7 @@ _hermes_main() {
   else
     ts_note="Tailscale no está activo en el servidor: por ahora Hermes solo responde en la LAN. Instale/inicie sesión con el módulo 'tailscale' y vuelva a correr este módulo para publicarlo también en la IP de Tailscale."
   fi
-  msg "Hermes desplegado (composeId=$composeId) y respondiendo en http://${lan_ip}:8642.\n\n${ts_note}\n\nApp Android: descargue el APK desde GitHub (https://github.com/rusty4444/hermes-android/releases; el de arm64-v8a sirve para teléfonos modernos). Permita instalar de orígenes desconocidos, agregue una conexión con servidor, puerto 8642 y la clave de API.\n\nDashboard: http://${ts_ip:-$lan_ip}:9119 (usuario admin).\n\nLos puertos 8642 y 9119 solo se publican en la IP de la LAN y en la de Tailscale: no hay acceso desde Internet. Recomendación: reserve en el router (DHCP) la IP ${lan_ip} para este servidor; si cambia la IP de la LAN o de Tailscale, vuelva a correr este módulo para volver a publicar los puertos."
+  msg "Hermes desplegado (composeId=$composeId) y respondiendo en http://${lan_ip}:8642.\n\n${ts_note}\n\nApp Android: descargue el APK desde GitHub (https://github.com/rusty4444/hermes-android/releases; el de arm64-v8a sirve para teléfonos modernos). Permita instalar de orígenes desconocidos, agregue una conexión con servidor, puerto 8642 y la clave de API.\n\nDashboard: http://${ts_ip:-$lan_ip}:9119 (usuario admin).\n\nLos puertos 8642 y 9119 solo se publican en la IP de la LAN y en la de Tailscale: no hay acceso desde Internet. El agente, por su parte, no puede iniciar conexiones hacia la LAN, Tailscale ni el propio servidor (reglas de iptables 'HLI2-HERMES-*', servicio hli2-hermes-egress); sí tiene Internet.\n\nRecomendación: reserve en el router (DHCP) la IP ${lan_ip} para este servidor; si cambia la IP de la LAN o de Tailscale, vuelva a correr este módulo para volver a publicar los puertos."
 
   mark_done hermes
   return 0

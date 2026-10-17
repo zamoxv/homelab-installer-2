@@ -6,4 +6,9 @@
 set -uo pipefail
 source "$(dirname "$0")/_stublib.sh"
 log_call systemctl "$@"
+# STUB_TAILSCALED_UNIT=1: 'systemctl cat tailscaled.service' existe (Tailscale
+# instalado como servicio); en cualquier otro caso, "no disponible".
+if [[ "${1:-}" == "cat" && "${2:-}" == "tailscaled.service" && -n "${STUB_TAILSCALED_UNIT:-}" ]]; then
+  echo "[Unit]"; exit 0
+fi
 exit 1

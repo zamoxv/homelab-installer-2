@@ -7,9 +7,11 @@
 #
 # Imagen FIJADA a v0.22.2 (publicada el 2026-10-15; etiquetas 'latest' y
 # 'stable' apuntan a la misma, la guía las describe como "stable release
-# gate"). Nunca ':latest': una actualización silenciosa podría cambiar el
-# comportamiento del agente con acceso a terminal. Para actualizar se cambia
-# esta línea a mano y se vuelve a correr el módulo.
+# gate") Y por digest: sha256:3609... es el digest de la lista de manifiestos
+# (amd64 + arm64) de esa etiqueta según la API de Docker Hub, verificado el
+# 2026-10-16. Nunca ':latest': una actualización silenciosa podría cambiar el
+# comportamiento del agente con acceso a terminal. Para actualizar se cambian
+# etiqueta y digest juntos y se vuelve a correr el módulo.
 #
 # Secretos: SOLO referencias "${VAR}" (sustitución de Dokploy vía su campo
 # "env", ver dokploy_compose_create_or_update en lib/dokploy_api.sh y
@@ -23,6 +25,20 @@
 # no se fuerza 'user:' porque el entrypoint necesita ese arranque para
 # ajustar permisos de /opt/data.
 #
+# Endurecimiento: 'no-new-privileges' y 'pids_limit' son compatibles con el
+# arranque de la imagen: el entrypoint (s6-overlay) corre como root y baja al
+# uid del agente con s6-setuidgid, es decir con llamadas setuid/setgid, no
+# ejecutando binarios setuid (docker/main-wrapper.sh y stage2-hook.sh del
+# repositorio, v0.22.2); la imagen documenta además que no trae sudo. Si en
+# el servidor el contenedor no arranca, ver el plan de contingencia en
+# docs/VALIDACION.md (prueba 119).
+#
+# Red propia con subred fija (aislamiento de salida): el módulo instala
+# reglas de iptables (cadenas HLI2-HERMES-*, ver modules/hermes.sh) que le
+# impiden al agente iniciar conexiones hacia la LAN, Tailscale, la propia
+# máquina y otras redes privadas; Internet queda abierta. dns: servidores que
+# usa el contenedor (el DNS de la LAN solo si AdGuard está instalado).
+#
 # Puertos: SOLO en IPs concretas del host (la de la LAN y, si Tailscale
 # está activo, la de Tailscale), nunca en 0.0.0.0. compose_render_hermes
 # arma las líneas de puertos (un par 8642/9119 por IP). Sin dominio ni
@@ -33,11 +49,18 @@
 # no se comportan igual en Swarm (mismo motivo que compose/adguard).
 services:
   hermes:
-    image: nousresearch/hermes-agent:v0.22.2
+    image: nousresearch/hermes-agent:v0.22.2@sha256:36099926da316742423544e055d4734777105ffe6341873af5459b957d0c2919
     container_name: hermes
     restart: unless-stopped
     command: gateway run
     shm_size: 1g
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    networks:
+      - hermes-net
+    dns:
+__DNS_LINES__
     ports:
 __PORT_LINES__
     environment:
@@ -59,3 +82,10 @@ __PORT_LINES__
         limits:
           memory: 4G
           cpus: "2.0"
+
+networks:
+  hermes-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: __SUBNET__

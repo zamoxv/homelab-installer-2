@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Stub de 'ip': con STUB_ROUTE_SRC definido, 'ip -4 route get <destino>'
+# responde con ese origen (la IP de la interfaz de la ruta por defecto);
+# sin esa variable falla (el módulo hermes recurre entonces a 'hostname -I').
+# Cualquier otro subcomando se delega al 'ip' real.
+set -uo pipefail
+if [[ "${1:-}" == "-4" && "${2:-}" == "route" && "${3:-}" == "get" ]]; then
+  [[ -n "${STUB_ROUTE_SRC:-}" ]] || exit 1
+  echo "${4:-1.1.1.1} via 192.0.2.1 dev eth0 src ${STUB_ROUTE_SRC} uid 1000"
+  exit 0
+fi
+self_dir="$(cd "$(dirname "$0")" && pwd)"
+real="$(PATH="${PATH//"$self_dir":/}" command -v ip)" || exit 127
+exec "$real" "$@"
