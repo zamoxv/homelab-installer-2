@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Stub de 'hostname': con STUB_HOSTNAME_I definido, 'hostname -I' devuelve ese
+# valor (get_ip en lib/hw.sh); en cualquier otro caso delega al 'hostname'
+# real del sistema.
+set -uo pipefail
+if [[ "${1:-}" == "-I" && -n "${STUB_HOSTNAME_I:-}" ]]; then
+  echo "$STUB_HOSTNAME_I"
+  exit 0
+fi
+self_dir="$(cd "$(dirname "$0")" && pwd)"
+real="$(PATH="${PATH//"$self_dir":/}" command -v hostname)" || exit 127
+exec "$real" "$@"

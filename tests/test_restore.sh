@@ -458,7 +458,7 @@ test_restore_second_signal_does_not_abort_restart() {
   _rs_run restore --source local --snapshot "$_RS_FULL_NEW" --target all || true
   [[ -f "$STUB_DOCKER_STATE_DIR/.killed-stop" && -f "$STUB_DOCKER_STATE_DIR/.killed" ]] || { fail "no se enviaron las dos señales (test vacío)"; return 1; }
   assert_eq "" "$(_bk_files_in "$STUB_DOCKER_STATE_DIR" \'/\.\')" "ningún contenedor quedó detenido" || return 1
-  assert_eq "6" "$(_bk_calls '^docker\tstart\t' | wc -l | tr -d ' ')" "los 6 contenedores con datos volvieron a iniciar" || return 1
+  assert_eq "7" "$(_bk_calls '^docker\tstart\t' | wc -l | tr -d ' ')" "los 7 contenedores con datos (con hermes) volvieron a iniciar" || return 1
   assert_eq "current-vaultwarden/data" "$(_rs_content "$APPDATA_ROOT/vaultwarden/data/file.txt")" "no se reemplazó nada" || return 1
   assert_eq "interrupted" "$(_rs_status result)" || return 1
 }

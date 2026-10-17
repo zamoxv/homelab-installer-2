@@ -1,0 +1,61 @@
+# Plantilla renderizada por lib/compose.sh (compose_render_hermes).
+# Hermes Agent (Nous Research), base de v2.6a. Partiendo de la plantilla
+# oficial de Dokploy (dokploy.com/templates/hermes, verificada 2026-10-16) y
+# de la guía de Docker (hermes-agent.nousresearch.com/docs/user-guide/docker):
+# imagen nousresearch/hermes-agent, 'command: gateway run', datos en
+# /opt/data, API compatible con OpenAI en 8642 y dashboard en 9119.
+#
+# Imagen FIJADA a v0.22.2 (publicada el 2026-10-15; etiquetas 'latest' y
+# 'stable' apuntan a la misma, la guía las describe como "stable release
+# gate"). Nunca ':latest': una actualización silenciosa podría cambiar el
+# comportamiento del agente con acceso a terminal. Para actualizar se cambia
+# esta línea a mano y se vuelve a correr el módulo.
+#
+# Secretos: SOLO referencias "${VAR}" (sustitución de Dokploy vía su campo
+# "env", ver dokploy_compose_create_or_update en lib/dokploy_api.sh y
+# modules/hermes.sh). Ningún valor real vive en este archivo versionado.
+#
+# Aislamiento (decisión de v2.6a): sin docker.sock (el backend de terminal
+# 'docker' equivale a root en el host), sin montar /srv ni el home (solo
+# el directorio de datos), sin red del host. La imagen arranca con s6-overlay
+# como root y baja a HERMES_UID/HERMES_GID para el agente y todos sus
+# servicios (la guía: 'gateway run' como root se rechaza por defecto);
+# no se fuerza 'user:' porque el entrypoint necesita ese arranque para
+# ajustar permisos de /opt/data.
+#
+# Puertos: SOLO en IPs concretas del host (la de la LAN y, si Tailscale
+# está activo, la de Tailscale), nunca en 0.0.0.0. compose_render_hermes
+# arma las líneas de puertos (un par 8642/9119 por IP). Sin dominio ni
+# ruta del túnel. Dentro del contenedor la API escucha en 0.0.0.0
+# (API_SERVER_HOST), porque Docker publica hacia la interfaz del contenedor.
+#
+# Compose "docker-compose" (no "stack"): las publicaciones con IP del host
+# no se comportan igual en Swarm (mismo motivo que compose/adguard).
+services:
+  hermes:
+    image: nousresearch/hermes-agent:v0.22.2
+    container_name: hermes
+    restart: unless-stopped
+    command: gateway run
+    shm_size: 1g
+    ports:
+__PORT_LINES__
+    environment:
+      - HERMES_UID=__UID__
+      - HERMES_GID=__GID__
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_PORT=8642
+      - API_SERVER_KEY=${API_SERVER_KEY}
+      - HERMES_DASHBOARD=1
+      - HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
+      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD}
+      - HERMES_DASHBOARD_BASIC_AUTH_SECRET=${HERMES_DASHBOARD_BASIC_AUTH_SECRET}
+    volumes:
+      - __APPDATA__/hermes:/opt/data
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"

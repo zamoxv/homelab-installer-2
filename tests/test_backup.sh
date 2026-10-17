@@ -542,7 +542,7 @@ test_backup_second_signal_does_not_abort_restart() {
   local left; left="$(_bk_files_in "$STUB_DOCKER_STATE_DIR" \'/\.\')"
   [[ -z "$left" ]] || { fail "una segunda señal dejó contenedores detenidos: $left"; return 1; }
   [[ -f "$STUB_DOCKER_STATE_DIR/.killed" ]] || { fail "no se envió la segunda señal (test vacío)"; return 1; }
-  assert_eq "4" "$(_bk_calls '^docker\tstart\t' | wc -l | tr -d ' ')" "los 4 contenedores volvieron a iniciar" || return 1
+  assert_eq "5" "$(_bk_calls '^docker\tstart\t' | wc -l | tr -d ' ')" "los 5 contenedores (con hermes) volvieron a iniciar" || return 1
 }
 
 test_backup_restart_retries_until_container_is_really_running() {
@@ -570,7 +570,7 @@ test_backup_writes_recovery_list_before_stopping_and_clears_it() {
   while IFS= read -r l; do
     assert_contains "$l" "yes" "la lista de recuperación existe antes de detener: $l" || return 1
   done < <(_bk_calls '^recovery-at-stop\t')
-  assert_eq "4" "$(_bk_calls '^recovery-at-stop\t' | wc -l | tr -d ' ')" "se verificó cada parada" || return 1
+  assert_eq "5" "$(_bk_calls '^recovery-at-stop\t' | wc -l | tr -d ' ')" "se verificó cada parada" || return 1
   [[ ! -s "$BACKUP_STATE_DIR/recovery-containers" ]] || { fail "la lista no se limpió"; return 1; }
 }
 

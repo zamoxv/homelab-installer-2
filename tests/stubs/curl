@@ -98,6 +98,23 @@ fi
 resp="{}"
 
 case "$url" in
+  # Hermes (modules/hermes.sh): API en el puerto 8642 del host.
+  # STUB_HERMES_HEALTH_FAIL=1: /health no responde (conexión rechazada).
+  # STUB_HERMES_MODELS_CODE=<código>: fuerza el código de /v1/models; si no,
+  # 200 solo con 'Authorization: Bearer ...' recibido por stdin (-K -).
+  *:8642/health)
+    [[ -n "${STUB_HERMES_HEALTH_FAIL:-}" ]] && exit 7
+    resp='{"status":"ok"}'
+    ;;
+  *:8642/v1/models)
+    if [[ -n "${STUB_HERMES_MODELS_CODE:-}" ]]; then
+      http_code="$STUB_HERMES_MODELS_CODE"
+    elif grep -qF 'Authorization: Bearer ' <<<"${stdin_config:-}"; then
+      resp='{"data":[{"id":"hermes-agent"}]}'
+    else
+      http_code=401
+    fi
+    ;;
   *project.all*)
     # STUB_DOKPLOY_NO_PROJECT=1 simula un Dokploy recién instalado (sin el
     # proyecto "homelab"), para ejercitar el camino de project.create.

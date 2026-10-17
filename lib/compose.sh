@@ -188,3 +188,40 @@ compose_render_cloudflared() {
   [[ -f "$template" ]] || { echo "ERROR: falta $template" >&2; return 1; }
   cat "$template" | _compose_subst "__NONE__" ""
 }
+
+# --- Hermes Agent --------------------------------------------------------------
+
+# Argumentos: una o más IPv4 del host en las que publicar 8642 (API) y 9119
+# (dashboard): la de la LAN y, si Tailscale está activo, la de Tailscale.
+# Nunca 0.0.0.0 ni un puerto "pelado" (que Docker publicaría en todas las
+# interfaces): cada IP se valida y se rechaza lo que no sea una IPv4 concreta.
+# Los secretos (OPENROUTER_API_KEY, API_SERVER_KEY, clave del dashboard) NO
+# pasan por acá: el template ya trae "${VAR}" literal (los sustituye Dokploy
+# vía su campo "env", ver modules/hermes.sh).
+compose_render_hermes() {
+  local template="$SCRIPT_DIR/compose/hermes/docker-compose.yml"
+  [[ -f "$template" ]] || { echo "ERROR: falta $template" >&2; return 1; }
+  [[ $# -ge 1 ]] || { echo "ERROR: compose_render_hermes necesita al menos una IP." >&2; return 1; }
+
+  local ip port_lines="" uid gid
+  for ip in "$@"; do
+    if [[ ! "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] \
+       || (( BASH_REMATCH[1] > 255 || BASH_REMATCH[2] > 255 || BASH_REMATCH[3] > 255 || BASH_REMATCH[4] > 255 )) \
+       || [[ "$ip" == "0.0.0.0" ]]; then
+      echo "ERROR: IP no válida para publicar los puertos de Hermes: '$ip'." >&2
+      return 1
+    fi
+    port_lines+="      - \"${ip}:8642:8642\""$'\n'
+    port_lines+="      - \"${ip}:9119:9119\""$'\n'
+  done
+  port_lines="${port_lines%$'\n'}"
+
+  uid="$(id -u "$SERVER_USER")" || { echo "ERROR: no existe el usuario '$SERVER_USER'." >&2; return 1; }
+  gid="$(id -g "$SERVER_USER")" || { echo "ERROR: no se pudo resolver el grupo primario de '$SERVER_USER'." >&2; return 1; }
+
+  cat "$template" \
+    | _compose_subst "__APPDATA__" "$APPDATA_ROOT" \
+    | _compose_subst "__UID__" "$uid" \
+    | _compose_subst "__GID__" "$gid" \
+    | _compose_subst "__PORT_LINES__" "$port_lines"
+}
