@@ -686,27 +686,136 @@ Especificación acordada con el usuario (2026-10-06):
       "restaurar todo" de prueba en la X230 (docs/VALIDACION.md, pruebas
       48-80; la validación en hardware sigue pendiente).
 
-### v2.6 — Agente IA siempre activo (opcional)
+### v2.6 — Agente IA siempre activo
 
-- [ ] **Hermes Agent** (Nous Research) como contenedor, con **OpenRouter** como proveedor de
-      modelos. Aislado: sin socket de Docker, sin montar `/srv`, sin red del host.
-- [ ] **Canal principal: [hermes-android](https://github.com/rusty4444/hermes-android)**
-      (decidido 2026-10-15; el usuario usa Android, Hermex es solo iOS). Cliente
-      nativo MIT que habla con el Gateway API Server de Hermes (puerto 8642,
-      `API_SERVER_KEY`) y, opcionalmente, con su dashboard (9119) para memoria,
-      cron y skills. **Solo por Tailscale/LAN**: el API server y el dashboard
-      nunca pasan por el túnel de Cloudflare ni se abren en el router (el propio
-      README lo exige). Se instala desde el APK de GitHub Releases. Verificar:
-      chat con streaming y voz fuera de casa con Tailscale encendido; con
-      Tailscale apagado no responde.
-- [ ] **Canal alternativo: Telegram** (modo polling: sin puertos entrantes),
-      restringido al ID del usuario. Útil si Tailscale no está disponible; las
-      conversaciones pasan por los servidores de Telegram.
-- [ ] Optimización de tokens: modelos auxiliares baratos en Hermes + `openrouter/auto` con nivel
-      de costo `low`/`medium`. Límite de crédito en OpenRouter desde el primer día.
-- [ ] LiteLLM como proxy de ruteo y presupuesto por agente, solo si hay varios agentes.
-- [ ] **Open WebUI** (opcional, última tarea): interfaz tipo ChatGPT conectada al API server de
-      Hermes, solo LAN.
+Arquitectura acordada con el usuario (2026-10-16). Objetivo: un agente 24/7 en
+el M70q que atienda consultas y tareas (y en el futuro el correo) **pagando lo
+menos posible**, sin dejar de tener Claude para el trabajo pesado.
+
+**Conceptos que fijan el diseño (verificados):**
+- **Hermes es el cuerpo, no el cerebro.** Aporta memoria, herramientas,
+  canales y tareas programadas; el cerebro es el modelo que se le conecta, y
+  se puede cambiar según la tarea.
+- **Estar encendido no cuesta.** Un agente esperando no gasta tokens; el costo
+  es solo por trabajo hecho.
+- **Paralelizar no ahorra.** N agentes terminan antes pero cada uno lee su
+  contexto: el gasto se multiplica, no se divide.
+- **La suscripción de Claude NO puede usarse en Hermes.** Los términos de
+  Anthropic (aclaración de febrero de 2026, con bloqueos desde enero y abril
+  de 2026) limitan el OAuth de Free/Pro/Max a Claude Code y Claude.ai; las
+  herramientas de terceros deben usar claves de API (pago por token).
+- **Por qué un agente por API "gasta más tokens" que el chat (y cómo se
+  controla):** el token es la misma unidad en ambos casos, pero la API no
+  tiene memoria: en cada llamada el agente reenvía instrucciones, definiciones
+  de herramientas, memoria e historial, y un agente hace varias llamadas por
+  pedido (piensa → usa una herramienta → lee el resultado → responde). Con la
+  suscripción ese costo existe igual, solo que queda oculto en la tarifa fija.
+  Se controla con: caché de prompts (el prefijo repetido se cobra mucho más
+  barato en los proveedores que lo soportan), compresión del contexto
+  (tarea auxiliar de Hermes, con modelo barato), menos herramientas activas
+  (cada definición viaja en cada llamada), sesiones cortas (empezar una nueva
+  por tema), límite de iteraciones por tarea, modelos baratos para lo simple y
+  **medición** (panel de actividad de OpenRouter, por modelo y por día).
+
+**Dos agentes complementarios:**
+
+| | Hermes (24/7, en el M70q) | Claude Code (suscripción fija) |
+|---|---|---|
+| Para qué | Consultas, investigación, recordatorios, tareas programadas, diagnóstico del servidor, (futuro) correo | Trabajo pesado: código, el HLI, proyectos |
+| Cerebro | Modelos abiertos baratos vía OpenRouter + IA local; Claude por API solo a pedido | Claude, con la suscripción |
+| Cómo se usa | hermes-android (Tailscale) o Telegram | Terminal, o desde el teléfono con Remote Control y rutinas programadas (producto oficial: permitido) |
+| Costo | Por token, con tope mensual | Fijo (la suscripción actual) |
+
+Hermes no invoca a Claude Code (sería usar la suscripción desde un tercero);
+si una tarea lo amerita, Hermes avisa y el usuario la abre en Claude Code.
+
+#### v2.6a — Hermes base
+- [ ] Compose en Dokploy (proyecto propio) partiendo de la plantilla oficial de
+      Dokploy: imagen `nousresearch/hermes-agent` **fijada a una versión**
+      (`X.Y.Z` o digest), `command: gateway run`, datos en
+      `/srv/appdata/hermes` → `/opt/data` (bind, ext4), `HERMES_UID/GID`
+      coherentes con el dueño de la carpeta, `restart: unless-stopped`,
+      `shm_size: 1g` (navegador), límites 4 GB / 2 CPU.
+- [ ] Aislamiento: **sin** socket de Docker (descarta el backend de terminal
+      `docker`: equivale a root en el host), sin montar `/srv` ni el home, sin
+      red del host, nunca como root. La frontera es el contenedor
+      (`terminal.backend: local`).
+- [ ] API (8642, `API_SERVER_ENABLED`, `API_SERVER_HOST=0.0.0.0` dentro del
+      contenedor, `API_SERVER_KEY` de 64 hex): la clave equivale a control total
+      del agente → secreto root-only en `/etc/hli2`, publicada en el host solo
+      en las IPs de LAN y Tailscale (nunca `0.0.0.0` del host, nunca por el
+      túnel ni el router).
+- [ ] Dashboard (9119) con autenticación obligatoria (basic auth con
+      `HERMES_DASHBOARD_BASIC_AUTH_SECRET`), mismo criterio de exposición.
+- [ ] Aprobaciones: arrancar con `approvals.mode: manual`; pasar a `smart`
+      cuando haya confianza. `security.website_blocklist` y protección SSRF
+      activas.
+- [ ] Backup: registrar `hermes` en `/etc/hli2.d/services` (tipo con parada:
+      usa SQLite) para que entre en el backup nocturno.
+- [ ] Canal principal **[hermes-android](https://github.com/rusty4444/hermes-android)**
+      (Android; Hermex es solo iOS): habla con la API 8642 y opcionalmente con
+      el dashboard. Solo por Tailscale/LAN (el propio README lo exige). APK de
+      GitHub Releases. Verificar: chat con streaming y voz fuera de casa con
+      Tailscale encendido; con Tailscale apagado no responde.
+
+#### v2.6b — Modelos y costo
+- [ ] OpenRouter: clave propia **con límite de gasto mensual en la clave**
+      (monto pendiente de decidir por el usuario) y `data_collection: deny`.
+- [ ] Niveles: modelo abierto barato por defecto; `openrouter/auto` con nivel
+      de costo bajo/medio donde convenga; Claude (vía OpenRouter, por token)
+      solo cuando el usuario lo pida explícitamente.
+- [ ] **Cada tarea auxiliar con proveedor y modelo explícitos** (títulos,
+      compresión, visión, etc.) y `fallback_providers` definido: el issue
+      #24029 (auxiliares que caían en un modelo pago) está cerrado desde
+      2026-06-28, pero no se depende de los valores automáticos.
+- [ ] Caché de prompts, compresión de contexto, herramientas mínimas
+      activas, límite de iteraciones.
+- [ ] Medición: una semana de uso real y revisión del gasto por modelo en
+      OpenRouter antes de ajustar niveles o el tope.
+
+#### v2.6c — IA local
+- [ ] Ollama (o llama.cpp) como contenedor en Dokploy. Primero **medir** en el
+      M70q (i5-12400T, 32 GB, sin GPU dedicada) modelos de 3–4 mil millones
+      de parámetros con soporte de herramientas (p. ej. Gemma 4 E4B, Qwen3.5
+      4B, Granite 4.1 3B, Phi-4-mini): tokens/s de generación y de lectura
+      del contexto.
+- [ ] Uso previsto: tareas auxiliares y de fondo (clasificar, resumir,
+      recordatorios), no como cerebro principal (en CPU, el contexto grande de
+      un agente haría cada respuesta muy lenta). BitNet descartado como
+      cerebro: no hay evidencia de soporte de herramientas.
+
+#### v2.6d — Diagnóstico del servidor (solo lectura)
+- [ ] Timer del HLI (cada 5 min) que genera un **informe filtrado**: estado de
+      servicios, disco, último backup, errores recientes de logs, recursos;
+      **sin secretos** (redacción antes de escribir). Montado en Hermes en solo
+      lectura. Hermes diagnostica y recomienda; el usuario aplica.
+- [ ] Descartados: socket de Docker (aun con `:ro` da root en el host) y proxy
+      del socket solo-lectura (`inspect` y logs exponen secretos que un agente
+      manipulado por una página web podría enviar afuera).
+
+#### v2.6e — Canal alternativo: Telegram
+- [ ] Polling (sin puertos entrantes), `TELEGRAM_ALLOWED_USERS` con el ID del
+      usuario (sin lista, todos rechazados). Las conversaciones pasan por los
+      servidores de Telegram.
+
+#### v2.6f — Claude Code como segundo agente
+- [ ] Documentar el uso desde el teléfono (Remote Control, sesiones en la nube,
+      rutinas programadas) con la suscripción actual. Sin integración con
+      Hermes.
+
+#### v2.6g — Correo (futuro)
+- [ ] Lectura del correo con diseño anti-*prompt injection*: cualquiera puede
+      enviar un correo con instrucciones ocultas. Solo lectura y clasificación
+      (idealmente con el modelo local), sin acciones automáticas: toda acción
+      derivada de un correo requiere confirmación del usuario.
+
+#### v2.6h — Gateway (solo si hay varios agentes)
+- [ ] Evaluar **Bifrost** (Go, binario único, presupuestos en la versión
+      libre según su fabricante) frente a **LiteLLM** para ruteo y presupuesto
+      por agente. Con un solo agente no aporta: agrega un servicio a mantener.
+
+#### v2.6i — Open WebUI (opcional, última tarea)
+- [ ] Interfaz tipo ChatGPT conectada a la API de Hermes, solo LAN/Tailscale.
 
 ## Limitaciones conocidas
 
