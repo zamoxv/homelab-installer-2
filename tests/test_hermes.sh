@@ -305,7 +305,8 @@ test_hermes_compose_template_hardening() {
   grep -Eq '^[[:space:]]*image: nousresearch/hermes-agent:v[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}$' <<<"$code" \
     || { fail "la imagen debe estar fijada a una versión vX.Y.Z y a un digest sha256"; return 1; }
   assert_contains "$code" "no-new-privileges:true" || return 1
-  assert_contains "$code" "pids_limit: 512" || return 1
+  assert_contains "$code" "pids: 512" || return 1
+  if [[ "$code" == *"pids_limit"* ]]; then fail "pids_limit choca con deploy.resources.limits en Compose v2"; return 1; fi
   assert_contains "$code" "subnet: __SUBNET__" "red propia con subred fija" || return 1
   assert_contains "$code" "- hermes-net" || return 1
   assert_contains "$code" "command: gateway run" || return 1

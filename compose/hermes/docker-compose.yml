@@ -25,7 +25,7 @@
 # no se fuerza 'user:' porque el entrypoint necesita ese arranque para
 # ajustar permisos de /opt/data.
 #
-# Endurecimiento: 'no-new-privileges' y 'pids_limit' son compatibles con el
+# Endurecimiento: 'no-new-privileges' y el límite de procesos son compatibles con el
 # arranque de la imagen: el entrypoint (s6-overlay) corre como root y baja al
 # uid del agente con s6-setuidgid, es decir con llamadas setuid/setgid, no
 # ejecutando binarios setuid (docker/main-wrapper.sh y stage2-hook.sh del
@@ -56,7 +56,6 @@ services:
     shm_size: 1g
     security_opt:
       - no-new-privileges:true
-    pids_limit: 512
     networks:
       - hermes-net
     dns:
@@ -82,6 +81,11 @@ __PORT_LINES__
         limits:
           memory: 4G
           cpus: "2.0"
+          # Límite de procesos aquí y no como 'pids_limit' de servicio: con un
+          # bloque deploy.resources.limits presente, Docker Compose v2 rechaza
+          # el proyecto si ambos valores difieren ("can't set distinct values on
+          # 'pids_limit' and 'deploy.resources.limits.pids'", visto en el M70q).
+          pids: 512
 
 networks:
   hermes-net:
