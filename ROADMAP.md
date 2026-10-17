@@ -817,6 +817,42 @@ si una tarea lo amerita, Hermes avisa y el usuario la abre en Claude Code.
 #### v2.6i — Open WebUI (opcional, última tarea)
 - [ ] Interfaz tipo ChatGPT conectada a la API de Hermes, solo LAN/Tailscale.
 
+### v2.7 — Espacio de trabajo: proyectos en el servidor + Obsidian
+
+Acordado con el usuario (2026-10-16).
+
+- [ ] **Proyectos en el M70q con VS Code Remote-SSH** (por Tailscale): el
+      editor corre en el equipo del usuario; archivos, terminal y compilación en
+      el servidor. Claude Code puede correr en esa sesión (producto oficial, con
+      la suscripción) y seguirse desde el teléfono con Remote Control.
+- [ ] Backup de los proyectos: git cubre lo publicado, pero el trabajo sin
+      commit debe entrar en el backup nocturno (definir la ruta, p. ej.
+      `~/src`, y cómo se registra: hoy el registro solo admite datos bajo
+      `$APPDATA_ROOT`). Excluir dependencias regenerables (`node_modules`,
+      `.venv`, `target`, cachés de build).
+- [ ] **Bóveda de Obsidian en el servidor**, sincronizada con la Fedora y el
+      teléfono. Opción por defecto: **Syncthing** (contenedor, por Tailscale,
+      gratis, simple). Alternativas: *Self-hosted LiveSync* (plugin sobre
+      CouchDB, tiempo real) u OpenCloud (bien en escritorio, la sincronización
+      de carpetas en Android es limitada). La bóveda entra en el backup.
+- [ ] **Hermes y Obsidian**: Hermes lee la bóveda (contexto y memoria de largo
+      plazo legible y corregible por el usuario) y escribe solo en una
+      subcarpeta propia (p. ej. `Hermes/`: resúmenes, recordatorios, diario).
+      Montaje: bóveda en solo lectura + `Hermes/` en lectura/escritura. Si un
+      contenido web manipulara al agente, no puede alterar el resto de las
+      notas; el backup cubre cualquier error.
+- [ ] Buenas prácticas para que la bóveda ahorre tokens de verdad: notas
+      cortas, bien nombradas y enlazadas; el agente busca y lee solo las notas
+      relevantes en vez de arrastrar historial.
+
+**Descartado por ahora — "cluster" con la Fedora:** la Fedora es un notebook
+(ThinkPad T480, sin GPU dedicada) que sale de casa. Un cluster no fusiona la
+RAM de dos equipos en uno; repartir un modelo entre máquinas por la red (p. ej.
+llama.cpp RPC) solo sirve para cargar modelos que no caben y suele ser más
+lento; en el M70q el límite es la CPU, no la RAM. Se reconsidera si se suma un
+equipo fijo con GPU: Hermes lo usaría primero como backend local y, si no
+responde, pasaría al servidor o a la API (cadena de respaldo).
+
 ## Limitaciones conocidas
 
 - **Huella de discos en `datadisk`**: se compone de tamaño, serie, WWN, modelo
