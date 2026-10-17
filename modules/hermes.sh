@@ -68,6 +68,7 @@ HERMES_SUBNET="${HLI2_HERMES_SUBNET:-10.213.144.0/24}"
 HERMES_SBIN_DIR="${HLI2_HERMES_SBIN_DIR:-/usr/local/sbin}"
 HERMES_SYSTEMD_DIR="${HLI2_SYSTEMD_DIR:-/etc/systemd/system}"
 HERMES_DOCKER_DROPIN_DIR="${HLI2_DOCKER_DROPIN_DIR:-/etc/systemd/system/docker.service.d}"
+HERMES_SYSCTL_DIR="${HLI2_SYSCTL_DIR:-/etc/sysctl.d}"
 HERMES_DEFAULT_AUX_MODEL="qwen/qwen3.7-flash"
 
 # Tareas auxiliares de Hermes v0.22.2 que usan un LLM
@@ -122,11 +123,6 @@ _hermes_private_lan_ip() {
 _hermes_tailscale_range_ip() {
   _hermes_valid_ipv4 "$1" || return 1
   (( BASH_REMATCH[1] == 100 && BASH_REMATCH[2] >= 64 && BASH_REMATCH[2] <= 127 ))
-}
-
-# ¿La IP $1 cae dentro de la /24 $2?
-_hermes_ip_in_subnet24() {
-  [[ "${1%.*}" == "${2%.*}" ]]
 }
 
 # --- Generación de secretos -------------------------------------------------
@@ -422,35 +418,131 @@ _hermes_lan_ip() {
   printf '%s' "$ip"
 }
 
+# --- Validación de la subred del contenedor ---------------------------------------
+
+_hermes_ip2int() {
+  local a b c d
+  IFS=. read -r a b c d <<<"$1"
+  printf '%s' $(( (a << 24) | (b << 16) | (c << 8) | d ))
+}
+
+# ¿Se solapan los prefijos $1 y $2 (a.b.c.d o a.b.c.d/n)?
+_hermes_prefix_overlap() {
+  local p1="$1" p2="$2" l1=32 l2=32 s1 s2 e1 e2 m1 m2
+  [[ "$p1" == */* ]] && l1="${p1#*/}"
+  [[ "$p2" == */* ]] && l2="${p2#*/}"
+  s1="$(_hermes_ip2int "${p1%/*}")"; s2="$(_hermes_ip2int "${p2%/*}")"
+  m1=$(( (0xFFFFFFFF << (32 - l1)) & 0xFFFFFFFF ))
+  m2=$(( (0xFFFFFFFF << (32 - l2)) & 0xFFFFFFFF ))
+  s1=$(( s1 & m1 )); s2=$(( s2 & m2 ))
+  e1=$(( s1 | (~m1 & 0xFFFFFFFF) )); e2=$(( s2 | (~m2 & 0xFFFFFFFF) ))
+  (( s1 <= e2 && s2 <= e1 ))
+}
+
+# Valida la subred $1 de la red del contenedor ANTES de instalar nada:
+# a.b.c.0/24 con octetos numéricos, solo RFC 1918 (queda fuera 127/8,
+# 100.64/10, 169.254/16 y todo lo público), sin contener la IP de la LAN $2 y
+# sin solaparse con ninguna ruta del servidor ('ip -4 route show') ni con la
+# subred de ninguna red de Docker existente. La red 'hermes-net' ya creada en
+# una ejecución anterior con ESTA misma subred no cuenta como choque.
+_hermes_validate_subnet() {
+  local subnet="$1" lan_ip="$2" a b c prefix name line own=0 conflicts=""
+  if [[ ! "$subnet" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.0/24$ ]]; then
+    msg "La subred de la red de Hermes ('${subnet}') no tiene la forma a.b.c.0/24. Defina una /24 privada sin uso con la variable HLI2_HERMES_SUBNET y vuelva a correr el módulo."
+    return 1
+  fi
+  a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"; c="${BASH_REMATCH[3]}"
+  if (( a > 255 || b > 255 || c > 255 )) \
+     || ! { (( a == 10 )) || (( a == 172 && b >= 16 && b <= 31 )) || (( a == 192 && b == 168 )); }; then
+    msg "La subred de la red de Hermes ('${subnet}') debe ser privada (10.x.y.0/24, 172.16-31.x.0/24 o 192.168.x.0/24); se rechazan 127/8, 100.64/10, 169.254/16 y las públicas. Defina otra con HLI2_HERMES_SUBNET."
+    return 1
+  fi
+  if _hermes_prefix_overlap "$subnet" "$lan_ip"; then
+    msg "La subred de la red de Hermes ('${subnet}') contiene la IP de la LAN del servidor (${lan_ip}). Defina otra con HLI2_HERMES_SUBNET."
+    return 1
+  fi
+
+  # Redes de Docker existentes: "<nombre> <subred> [<subred>...]" por línea.
+  local -a dnets=()
+  local ids
+  ids="$(hli_docker network ls -q 2>/dev/null | tr '\n' ' ')" || ids=""
+  if [[ -n "${ids// /}" ]]; then
+    # shellcheck disable=SC2086
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && dnets+=("$line")
+    done < <(hli_docker network inspect $ids --format '{{.Name}} {{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null || true)
+  fi
+  for line in "${dnets[@]}"; do
+    name="${line%% *}"
+    if [[ "$name" == *hermes-net ]]; then
+      for prefix in ${line#* }; do [[ "$prefix" == "$subnet" ]] && own=1; done
+    fi
+  done
+  for line in "${dnets[@]}"; do
+    name="${line%% *}"
+    for prefix in ${line#* }; do
+      [[ "$prefix" =~ ^[0-9.]+/[0-9]+$ ]] || continue
+      [[ "$prefix" == "$subnet" && "$own" -eq 1 && "$name" == *hermes-net ]] && continue
+      _hermes_prefix_overlap "$subnet" "$prefix" && conflicts+="red de Docker ${name} (${prefix}) "
+    done
+  done
+  while IFS= read -r line; do
+    prefix="${line%% *}"
+    [[ "$prefix" =~ ^[0-9.]+(/[0-9]+)?$ ]] || continue
+    [[ "$prefix" == "$subnet" && "$own" -eq 1 ]] && continue
+    _hermes_prefix_overlap "$subnet" "$prefix" && conflicts+="ruta ${prefix} "
+  done < <(ip -4 route show 2>/dev/null || true)
+  if [[ -n "$conflicts" ]]; then
+    msg "La subred de la red de Hermes ('${subnet}') se solapa con: ${conflicts}. Defina otra /24 privada sin uso con HLI2_HERMES_SUBNET y vuelva a correr el módulo. No se instaló nada."
+    return 1
+  fi
+  return 0
+}
+
 # --- Aislamiento de salida (iptables) -------------------------------------------
 
-# Script que aplica/quita las reglas (se instala en $HERMES_SBIN_DIR y lo
-# ejecuta la unidad de systemd en cada arranque; idempotente: reconstruye las
-# cadenas y solo inserta los saltos si faltan). Argumentos de generación:
+# Script que aplica/quita las reglas (se instala en $HERMES_SBIN_DIR; lo
+# ejecutan la unidad de systemd antes de que arranque Docker y un drop-in de
+# docker.service después de cada (re)inicio). Argumentos de generación:
 # $1 = subred del contenedor, $2 = IPs de DNS permitidas en el host.
 #
 # Diseño (las dos rutas que puede tomar un paquete del agente):
 # - Hacia OTRAS máquinas o contenedores (FORWARD): se engancha en DOCKER-USER
 #   (se evalúa antes que las reglas de Docker). Cadena HLI2-HERMES-FWD:
 #   ESTABLISHED/RELATED aceptado; hook HLI2-HERMES-ALLOW; DNS permitido; DROP
-#   hacia 10/8, 172.16/12, 192.168/16, 100.64/10 y 169.254/16; el resto
-#   (Internet) RETURN, o sea sigue a las reglas normales de Docker.
-#   Los puertos publicados (8642/9119) no se ven afectados: la conexión
-#   entrante LAN -> contenedor tiene origen en la LAN (no en la subred), y las
-#   respuestas contenedor -> LAN son ESTABLISHED, aceptadas por la primera
-#   regla. Solo las conexiones NUEVAS iniciadas desde la subred se filtran.
+#   hacia rangos privados, CGNAT, link-local, loopback, multicast, reservados y
+#   de pruebas; el resto (Internet) RETURN, o sea sigue a las reglas normales de
+#   Docker. Los puertos publicados (8642/9119) no se ven afectados: la
+#   conexión entrante LAN -> contenedor tiene origen en la LAN (no en la
+#   subred), y las respuestas contenedor -> LAN son ESTABLISHED, aceptadas por
+#   la primera regla. Solo las conexiones NUEVAS iniciadas desde la subred se
+#   filtran.
 # - Hacia la PROPIA máquina (INPUT): servicios en la red del host (AdGuard,
 #   Home Assistant, SSH, etc.) no pasan por FORWARD ni DOCKER-USER, así que
 #   hace falta además HLI2-HERMES-IN en INPUT: ESTABLISHED/RELATED, hook, DNS
 #   y DROP de todo lo demás.
+# - Aplicación atómica: las cadenas nuevas se arman completas bajo otro
+#   nombre (-new), se inserta el salto a la nueva, se borran TODOS los saltos
+#   a la anterior (sea cual sea su subred de origen, así se limpian restos de
+#   una subred vieja), se elimina la anterior y la nueva se renombra (-E). Nunca
+#   hay un salto a una cadena vacía o a medio armar.
+# - DOCKER-USER: el script la crea si falta. Es el comportamiento que Docker
+#   tolera y conserva: en moby (libnetwork/firewall_linux.go, v27.3.1)
+#   setupUserChain llama a NewChain, que solo crea la cadena si no existe, agrega
+#   un RETURN al final solo si falta y asegura el salto desde FORWARD; el comentario
+#   del código dice que el demonio "does not delete or modify any pre-existing
+#   rules from the DOCKER-USER filter chain". La documentación publicada de
+#   Docker no lo afirma de forma explícita (no verificado en la doc).
 # - Hook para permitir un destino local concreto (por ejemplo Ollama en
-#   v2.6c): agregar reglas ACCEPT a la cadena HLI2-HERMES-ALLOW (no la
-#   reconstruye el script), p. ej.
+#   v2.6c): agregar reglas ACCEPT a la cadena HLI2-HERMES-ALLOW, que 'apply' no
+#   reconstruye (pero 'remove' SÍ la vacía y la borra), p. ej.
 #   iptables -A HLI2-HERMES-ALLOW -d <ip> -p tcp --dport 11434 -j ACCEPT
 #   (persistir con un script propio After= de esta unidad).
 # - DNS: el contenedor usa los servidores de 'dns:' del compose (el DNS de la
 #   LAN solo si AdGuard está instalado, o resolvers públicos); el DNS interno
 #   de Docker (127.0.0.11) vive dentro del contenedor y reenvía a esos.
+# - Backend: se usa la ruta absoluta de iptables y se registra '-V' (iptables
+#   legacy o nf_tables) en el journal; debe coincidir con el que usa Docker.
 # - IPv6: la red no lo habilita (Docker por defecto no lo hace).
 _hermes_render_egress_script() {
   local subnet="$1" dns_hosts="$2"
@@ -460,51 +552,74 @@ _hermes_render_egress_script() {
 # contenedor de Hermes: ver el comentario de _hermes_render_egress_script.
 # Uso: hli2-hermes-egress apply | remove
 set -euo pipefail
+IPT="\${HLI2_IPTABLES:-/usr/sbin/iptables}"
 SUBNET="${subnet}"
 DNS_HOSTS="${dns_hosts}"
-BLOCKED="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16"
+BLOCKED="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4"
 
-rebuild_chain() {
+ipt() { "\$IPT" -w "\$@"; }
+
+# Borra TODOS los saltos de la cadena \$1 hacia la cadena \$2, sea cual sea su
+# origen (restos de una subred anterior incluidos).
+delete_jumps() {
+  local line
+  local -a parts
+  while IFS= read -r line; do
+    [[ "\$line" == "-A "* && "\$line" == *" -j \$2" ]] || continue
+    read -ra parts <<<"\$line"
+    ipt -D "\${parts[@]:1}" 2>/dev/null || true
+  done < <(ipt -S "\$1" 2>/dev/null || true)
+}
+
+fill_chain() {
   local chain="\$1" kind="\$2" d r
-  iptables -w -N "\$chain" 2>/dev/null || true
-  iptables -w -F "\$chain"
-  iptables -w -A "\$chain" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  iptables -w -A "\$chain" -j HLI2-HERMES-ALLOW
+  ipt -N "\$chain"
+  ipt -A "\$chain" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  ipt -A "\$chain" -j HLI2-HERMES-ALLOW
   for d in \$DNS_HOSTS; do
-    iptables -w -A "\$chain" -d "\$d" -p udp --dport 53 -j ACCEPT
-    iptables -w -A "\$chain" -d "\$d" -p tcp --dport 53 -j ACCEPT
+    ipt -A "\$chain" -d "\$d" -p udp --dport 53 -j ACCEPT
+    ipt -A "\$chain" -d "\$d" -p tcp --dport 53 -j ACCEPT
   done
   if [[ "\$kind" == "fwd" ]]; then
     for r in \$BLOCKED; do
-      iptables -w -A "\$chain" -d "\$r" -j DROP
+      ipt -A "\$chain" -d "\$r" -j DROP
     done
-    iptables -w -A "\$chain" -j RETURN
+    ipt -A "\$chain" -j RETURN
   else
-    iptables -w -A "\$chain" -j DROP
+    ipt -A "\$chain" -j DROP
   fi
 }
 
-ensure_jump() {
-  local from="\$1" to="\$2"
-  iptables -w -C "\$from" -s "\$SUBNET" -j "\$to" 2>/dev/null \\
-    || iptables -w -I "\$from" 1 -s "\$SUBNET" -j "\$to"
+# Reemplazo atómico de la cadena \$2 enganchada en \$1 (ver el diseño en
+# modules/hermes.sh).
+swap_chain() {
+  local parent="\$1" live="\$2" kind="\$3" new="\$2-new"
+  delete_jumps "\$parent" "\$new"
+  ipt -F "\$new" 2>/dev/null || true
+  ipt -X "\$new" 2>/dev/null || true
+  fill_chain "\$new" "\$kind"
+  ipt -I "\$parent" 1 -s "\$SUBNET" -j "\$new"
+  delete_jumps "\$parent" "\$live"
+  ipt -F "\$live" 2>/dev/null || true
+  ipt -X "\$live" 2>/dev/null || true
+  ipt -E "\$new" "\$live"
 }
 
 case "\${1:-apply}" in
   apply)
-    iptables -w -N DOCKER-USER 2>/dev/null || true
-    iptables -w -N HLI2-HERMES-ALLOW 2>/dev/null || true
-    rebuild_chain HLI2-HERMES-FWD fwd
-    rebuild_chain HLI2-HERMES-IN in
-    ensure_jump DOCKER-USER HLI2-HERMES-FWD
-    ensure_jump INPUT HLI2-HERMES-IN
+    echo "hli2-hermes-egress: backend \$("\$IPT" -V)" >&2
+    ipt -N DOCKER-USER 2>/dev/null || true
+    ipt -N HLI2-HERMES-ALLOW 2>/dev/null || true
+    swap_chain DOCKER-USER HLI2-HERMES-FWD fwd
+    swap_chain INPUT HLI2-HERMES-IN in
     ;;
   remove)
-    iptables -w -D DOCKER-USER -s "\$SUBNET" -j HLI2-HERMES-FWD 2>/dev/null || true
-    iptables -w -D INPUT -s "\$SUBNET" -j HLI2-HERMES-IN 2>/dev/null || true
-    for c in HLI2-HERMES-FWD HLI2-HERMES-IN HLI2-HERMES-ALLOW; do
-      iptables -w -F "\$c" 2>/dev/null || true
-      iptables -w -X "\$c" 2>/dev/null || true
+    for c in HLI2-HERMES-FWD HLI2-HERMES-FWD-new; do delete_jumps DOCKER-USER "\$c"; done
+    for c in HLI2-HERMES-IN HLI2-HERMES-IN-new; do delete_jumps INPUT "\$c"; done
+    # Las cadenas FWD e IN referencian a ALLOW: se borran primero.
+    for c in HLI2-HERMES-FWD HLI2-HERMES-FWD-new HLI2-HERMES-IN HLI2-HERMES-IN-new HLI2-HERMES-ALLOW; do
+      ipt -F "\$c" 2>/dev/null || true
+      ipt -X "\$c" 2>/dev/null || true
     done
     ;;
   *)
@@ -515,13 +630,15 @@ esac
 EOF
 }
 
+# Se ejecuta ANTES de docker.service (Before=): las reglas ya están cuando el
+# demonio levanta los contenedores con 'restart: unless-stopped'. WantedBy de
+# docker.service hace que Docker la arrastre al arrancar; sin PartOf, así que
+# reiniciar Docker no la detiene (eso lo cubre el drop-in de ExecStartPost).
 _hermes_render_egress_unit() {
   cat <<EOF
 [Unit]
 Description=HLI 2: aislamiento de salida del contenedor de Hermes
-After=docker.service
-Wants=docker.service
-PartOf=docker.service
+Before=docker.service
 
 [Service]
 Type=oneshot
@@ -529,29 +646,60 @@ RemainAfterExit=yes
 ExecStart=${HERMES_SBIN_DIR}/hli2-hermes-egress apply
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target docker.service
 EOF
 }
 
-# Instala (root:root) el script y la unidad, la habilita y aplica las reglas
-# YA, antes de desplegar el contenedor (sin ventana sin protección). Para
-# quitarlo: systemctl disable --now hli2-hermes-egress.service;
-# <sbin>/hli2-hermes-egress remove; y borrar los dos archivos.
+# Drop-in de docker.service: vuelve a aplicar las reglas tras cada
+# (re)inicio de Docker ('-' = un fallo no impide que Docker quede activo;
+# rápido, sin esperas).
+_hermes_render_egress_dropin() {
+  cat <<EOF
+# Generado por el HLI 2 (modules/hermes.sh).
+[Service]
+ExecStartPost=-${HERMES_SBIN_DIR}/hli2-hermes-egress apply
+EOF
+}
+
+# Escribe el archivo root:root \$1 con el contenido \$2 y modo \$3 solo si es
+# distinto del actual. Deja H_FILE_CHANGED en 1/0. Creado con 'install' (modo
+# final desde el inicio) y escrito con 'tee'.
+H_FILE_CHANGED=0
+_hermes_install_root_file() {
+  local file="$1" content="$2" mode="$3" have
+  have="$(sudo -n cat -- "$file" 2>/dev/null || true)"
+  if [[ "$have" == "$content" ]]; then
+    H_FILE_CHANGED=0
+    return 0
+  fi
+  sudo install -d -m 0755 -o root -g root "$(dirname "$file")" || return 1
+  sudo install -m "$mode" -o root -g root /dev/null "$file" || return 1
+  printf '%s\n' "$content" | sudo tee "$file" >/dev/null || return 1
+  H_FILE_CHANGED=1
+}
+
+# Instala (root:root) el script, la unidad y el drop-in de Docker, habilita y
+# arranca la unidad y aplica las reglas YA, antes de desplegar el contenedor
+# (sin ventana sin protección). Para quitarlo: systemctl disable --now
+# hli2-hermes-egress.service; <sbin>/hli2-hermes-egress remove; y borrar el
+# script, la unidad y docker.service.d/hli2-hermes-egress.conf.
 _hermes_install_egress() {
-  local subnet="$1" dns_hosts="$2" script unit
+  local subnet="$1" dns_hosts="$2" script unit dropin changed=0
   script="${HERMES_SBIN_DIR}/hli2-hermes-egress"
   unit="${HERMES_SYSTEMD_DIR}/hli2-hermes-egress.service"
+  dropin="${HERMES_DOCKER_DROPIN_DIR}/hli2-hermes-egress.conf"
   if ! sudo -n sh -c 'iptables -w -S' >/dev/null 2>&1; then
     msg "No se encontró 'iptables' (o no se pudo consultar) en el servidor: hace falta para impedir que el agente alcance la LAN. Instale el paquete 'iptables' y vuelva a correr este módulo. Se cancela el despliegue de Hermes."
     return 1
   fi
-  sudo install -d -m 0755 -o root -g root "$HERMES_SBIN_DIR" "$HERMES_SYSTEMD_DIR" || return 1
-  sudo install -m 0755 -o root -g root /dev/null "$script" || return 1
-  _hermes_render_egress_script "$subnet" "$dns_hosts" | sudo tee "$script" >/dev/null || return 1
-  sudo install -m 0644 -o root -g root /dev/null "$unit" || return 1
-  _hermes_render_egress_unit | sudo tee "$unit" >/dev/null || return 1
-  sudo systemctl daemon-reload || true
-  sudo systemctl enable hli2-hermes-egress.service >/dev/null 2>&1 || true
+  _hermes_install_root_file "$script" "$(_hermes_render_egress_script "$subnet" "$dns_hosts")" 0755 || return 1
+  [[ "$H_FILE_CHANGED" -eq 0 ]] || changed=1
+  _hermes_install_root_file "$unit" "$(_hermes_render_egress_unit)" 0644 || return 1
+  [[ "$H_FILE_CHANGED" -eq 0 ]] || changed=1
+  _hermes_install_root_file "$dropin" "$(_hermes_render_egress_dropin)" 0644 || return 1
+  [[ "$H_FILE_CHANGED" -eq 0 ]] || changed=1
+  [[ "$changed" -eq 0 ]] || sudo systemctl daemon-reload || true
+  sudo systemctl enable --now hli2-hermes-egress.service >/dev/null 2>&1 || true
   if ! sudo "$script" apply; then
     msg "No se pudieron aplicar las reglas de aislamiento de salida de Hermes (iptables). Se cancela el despliegue: sin ellas el agente podría alcanzar la LAN."
     return 1
@@ -559,35 +707,66 @@ _hermes_install_egress() {
   log "Aislamiento de salida de Hermes aplicado (subred $subnet)."
 }
 
-# --- Orden de arranque con Tailscale ------------------------------------------------
+# --- Publicación en la IP de Tailscale tras un reinicio ---------------------------------
 
+# Sin esperas: ni 'network-online.target' ni un bucle sobre 'tailscale ip'
+# retrasarían a Docker (y con él a AdGuard, el DNS de toda la LAN).
+# - docker.service queda After=tailscaled.service (sin Wants): si Tailscale
+#   está instalado, arranca antes, pero Docker no lo espera ni lo exige.
+# - net.ipv4.ip_nonlocal_bind=1 permite que docker-proxy haga bind() sobre la
+#   IP de Tailscale aunque tailscale0 todavía no exista. Las reglas DNAT de
+#   Docker para el puerto publicado se crean con '-d <ip>' y no exigen que la
+#   IP esté asignada: el kernel solo las evalúa cuando llega un paquete con ese
+#   destino, o sea cuando la interfaz ya está arriba. Efecto lateral: el
+#   sistema entero acepta bind() a IPs no locales (menor riesgo; ver ROADMAP).
+#   Si en el servidor esto no alcanzara, la alternativa sin esperas es un
+#   servicio aparte que reinicie el contenedor cuando tailscale0 obtenga IP
+#   (p. ej. un tailscale-online.path/dispatcher), no un retraso de Docker.
 _hermes_render_docker_dropin() {
   cat <<'EOF'
-# Generado por el HLI 2 (modules/hermes.sh): Hermes publica puertos en la IP
-# de Tailscale, que debe existir antes de que Docker arranque el contenedor.
+# Generado por el HLI 2 (modules/hermes.sh): si Tailscale está instalado,
+# arranca antes que Docker. Sin Wants y sin esperas.
 [Unit]
-After=tailscaled.service network-online.target
-Wants=tailscaled.service network-online.target
-
-[Service]
-# Espera (hasta 30 s) a que Tailscale tenga IPv4; nunca hace fallar a Docker.
-ExecStartPre=-/bin/sh -c 'i=0; while [ "$i" -lt 30 ]; do tailscale ip -4 >/dev/null 2>&1 && exit 0; i=$((i+1)); sleep 1; done; exit 0'
+After=tailscaled.service
 EOF
 }
 
-# Solo si hay IP de Tailscale publicada y el servicio tailscaled existe.
-# Idempotente: no reescribe ni recarga systemd si el contenido ya es el mismo.
-_hermes_install_docker_dropin() {
-  local file="${HERMES_DOCKER_DROPIN_DIR}/hli2-tailscale.conf" want have
-  systemctl cat tailscaled.service >/dev/null 2>&1 || return 0
-  want="$(_hermes_render_docker_dropin)"
-  have="$(sudo -n cat -- "$file" 2>/dev/null || true)"
-  [[ "$have" == "$want" ]] && return 0
-  sudo install -d -m 0755 -o root -g root "$HERMES_DOCKER_DROPIN_DIR" || return 1
-  sudo install -m 0644 -o root -g root /dev/null "$file" || return 1
-  printf '%s\n' "$want" | sudo tee "$file" >/dev/null || return 1
-  sudo systemctl daemon-reload || true
-  log "Drop-in de Docker instalado: $file (arranca después de Tailscale)."
+_hermes_render_sysctl() {
+  cat <<'EOF'
+# Generado por el HLI 2 (modules/hermes.sh): permite publicar el puerto de
+# Hermes en la IP de Tailscale antes de que exista la interfaz tailscale0.
+net.ipv4.ip_nonlocal_bind = 1
+EOF
+}
+
+# Solo si hay IP de Tailscale publicada. Idempotente: no reescribe ni recarga
+# nada si el contenido ya es el mismo.
+_hermes_install_tailscale_boot_support() {
+  local sysctl_file="${HERMES_SYSCTL_DIR}/90-hli2-hermes.conf"
+  if systemctl cat tailscaled.service >/dev/null 2>&1; then
+    _hermes_install_root_file "${HERMES_DOCKER_DROPIN_DIR}/hli2-tailscale.conf" "$(_hermes_render_docker_dropin)" 0644 || return 1
+    [[ "$H_FILE_CHANGED" -eq 0 ]] || sudo systemctl daemon-reload || true
+  fi
+  _hermes_install_root_file "$sysctl_file" "$(_hermes_render_sysctl)" 0644 || return 1
+  if [[ "$H_FILE_CHANGED" -eq 1 ]]; then
+    sudo sysctl -w net.ipv4.ip_nonlocal_bind=1 >/dev/null 2>&1 || true
+    log "ip_nonlocal_bind activado ($sysctl_file)."
+  fi
+}
+
+# Redes a las que Dokploy dejó conectado el contenedor: debe ser solo
+# 'hermes-net'; cualquier otra (p. ej. dokploy-network) le daría alcance a
+# otros contenedores sin pasar por las reglas de la subred propia.
+_hermes_check_container_networks() {
+  local nets
+  nets="$(hli_docker inspect hermes --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null)" || nets=""
+  nets="${nets%"${nets##*[![:space:]]}"}"
+  if [[ -z "$nets" ]]; then
+    msg "No se pudo verificar a qué redes quedó conectado el contenedor 'hermes' (docker inspect). Compruébelo a mano: debe estar SOLO en 'hermes-net' (docker inspect hermes --format '{{json .NetworkSettings.Networks}}')."
+    return 0
+  fi
+  [[ "$nets" =~ ^[^[:space:]]*hermes-net$ ]] && return 0
+  msg "ATENCIÓN: el contenedor 'hermes' está conectado a estas redes: ${nets}. Debería estar SOLO en 'hermes-net'. Con otra red conectada (por ejemplo 'dokploy-network') el agente podría alcanzar otros contenedores sin pasar por el aislamiento de salida. Revise el compose en el panel de Dokploy y vuelva a desplegar."
 }
 
 # Código HTTP de GET $1 (URL); $2 opcional = clave Bearer, que va a curl por
@@ -663,6 +842,19 @@ _hermes_show_credentials() {
 # --- Principal -----------------------------------------------------------------
 
 _hermes_main() {
+  # Todo lo que no tiene efectos (IPs y subred) se valida primero: si algo no
+  # sirve, no se pregunta ni se instala nada.
+  local lan_ip ts_ip
+  lan_ip="$(_hermes_lan_ip)"
+  if ! _hermes_private_lan_ip "$lan_ip"; then
+    msg "La IP de la LAN del servidor ('${lan_ip}') no es una dirección privada válida (10.x, 172.16-31.x o 192.168.x). Se cancela el despliegue de Hermes: sus puertos solo se publican en la LAN y en Tailscale, nunca en una IP pública ni en todas las interfaces."
+    return 1
+  fi
+  _hermes_validate_subnet "$HERMES_SUBNET" "$lan_ip" || return 1
+  ts_ip="$(_hermes_tailscale_ip)"
+  local -a ips=("$lan_ip")
+  [[ -z "$ts_ip" || "$ts_ip" == "$lan_ip" ]] || ips+=("$ts_ip")
+
   _hermes_ensure_secrets || return 1
   _hermes_prepare_dirs || return 1
 
@@ -678,20 +870,6 @@ _hermes_main() {
   fi
   _hermes_seed_config "$H_MODEL" "$H_AUX_MODEL" || { msg "No se pudo escribir config.yaml de Hermes. Se cancela el despliegue."; return 1; }
 
-  local lan_ip ts_ip
-  lan_ip="$(_hermes_lan_ip)"
-  if ! _hermes_private_lan_ip "$lan_ip"; then
-    msg "La IP de la LAN del servidor ('${lan_ip}') no es una dirección privada válida (10.x, 172.16-31.x o 192.168.x). Se cancela el despliegue de Hermes: sus puertos solo se publican en la LAN y en Tailscale, nunca en una IP pública ni en todas las interfaces."
-    return 1
-  fi
-  if ! [[ "$HERMES_SUBNET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.0/24$ ]] || _hermes_ip_in_subnet24 "$lan_ip" "$HERMES_SUBNET"; then
-    msg "La subred de la red de Hermes ('${HERMES_SUBNET}') no es una /24 válida o coincide con la de la LAN del servidor. Defina otra con la variable HLI2_HERMES_SUBNET (una /24 privada sin uso) y vuelva a correr el módulo."
-    return 1
-  fi
-  ts_ip="$(_hermes_tailscale_ip)"
-  local -a ips=("$lan_ip")
-  [[ -z "$ts_ip" || "$ts_ip" == "$lan_ip" ]] || ips+=("$ts_ip")
-
   # DNS del contenedor: el de la LAN (AdGuard en este servidor) solo si
   # AdGuard está instalado; si no, resolvers públicos (salen por Internet).
   local dns_csv
@@ -703,7 +881,7 @@ _hermes_main() {
 
   # Aislamiento de salida ANTES de crear el contenedor.
   _hermes_install_egress "$HERMES_SUBNET" "${dns_csv//,/ }" || return 1
-  [[ -z "$ts_ip" ]] || _hermes_install_docker_dropin || log "No se pudo instalar el drop-in de Docker para Tailscale."
+  [[ -z "$ts_ip" ]] || _hermes_install_tailscale_boot_support || log "No se pudo instalar el soporte de arranque con Tailscale."
 
   dokploy_preflight || return 1
 
@@ -742,6 +920,8 @@ _hermes_main() {
     msg "El contenedor 'hermes' no llegó a 'activo' dentro de los 300 segundos de espera (la primera vez descarga la imagen). Revise el panel de Dokploy y los logs (sudo docker logs hermes). Puede deberse a que una IP publicada (LAN o Tailscale) todavía no existe en el host, o a las opciones de endurecimiento del compose (ver la prueba 119 de docs/VALIDACION.md): vuelva a correr este módulo cuando esté arriba."
     return 1
   fi
+
+  _hermes_check_container_networks
 
   if ! _hermes_wait_health "http://${lan_ip}:8642/health"; then
     msg "El contenedor 'hermes' está corriendo pero http://${lan_ip}:8642/health no respondió OK a tiempo. Revise los logs (sudo docker logs --tail 50 hermes). No se muestran credenciales hasta que la API responda."

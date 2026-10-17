@@ -9,6 +9,12 @@ if [[ "${1:-}" == "-4" && "${2:-}" == "route" && "${3:-}" == "get" ]]; then
   echo "${4:-1.1.1.1} via 192.0.2.1 dev eth0 src ${STUB_ROUTE_SRC} uid 1000"
   exit 0
 fi
+# STUB_ROUTES: salida de 'ip -4 route show' (una ruta por línea; vacía si no
+# se define, para que los tests no dependan de las rutas reales del equipo).
+if [[ "${1:-}" == "-4" && "${2:-}" == "route" && ( -z "${3:-}" || "${3:-}" == "show" ) ]]; then
+  [[ -z "${STUB_ROUTES:-}" ]] || printf '%s\n' "$STUB_ROUTES"
+  exit 0
+fi
 self_dir="$(cd "$(dirname "$0")" && pwd)"
 real="$(PATH="${PATH//"$self_dir":/}" command -v ip)" || exit 127
 exec "$real" "$@"

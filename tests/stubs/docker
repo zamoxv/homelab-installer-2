@@ -82,6 +82,24 @@ if [[ -n "${STUB_DOCKER_STATE_DIR:-}" ]]; then
   esac
 fi
 
+# Redes de Docker para validar la subred de Hermes (modules/hermes.sh):
+# STUB_DOCKER_NETWORKS = líneas "<nombre> <subred> [<subred>...]".
+if [[ "${1:-}" == "network" && "${2:-}" == "ls" ]]; then
+  [[ -z "${STUB_DOCKER_NETWORKS:-}" ]] || echo "net1"
+  exit 0
+fi
+if [[ "${1:-}" == "network" && "${2:-}" == "inspect" ]]; then
+  [[ -z "${STUB_DOCKER_NETWORKS:-}" ]] || printf '%s\n' "$STUB_DOCKER_NETWORKS"
+  exit 0
+fi
+# Redes a las que quedó conectado un contenedor ('inspect --format ...Networks...').
+# STUB_DOCKER_INSPECT_NETWORKS: nombres separados por espacio (por defecto, solo
+# la red propia de Hermes).
+if [[ "${1:-}" == "inspect" && "$*" == *"NetworkSettings.Networks"* ]]; then
+  echo "${STUB_DOCKER_INSPECT_NETWORKS-hermes_hermes-net}"
+  exit 0
+fi
+
 case "$*" in
   "run --rm -i httpd:2-alpine htpasswd -n -i -B -C 10 "*)
     # Lee y descarta la contraseña de stdin (igual que haría el htpasswd

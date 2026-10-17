@@ -25,6 +25,7 @@ _hm_setup() {
   export HLI2_HERMES_SBIN_DIR="$HLI2_TEST_SCRATCH/sbin"
   export HLI2_SYSTEMD_DIR="$HLI2_TEST_SCRATCH/systemd"
   export HLI2_DOCKER_DROPIN_DIR="$HLI2_TEST_SCRATCH/docker.service.d"
+  export HLI2_SYSCTL_DIR="$HLI2_TEST_SCRATCH/sysctl"
   export STUB_TEXTBOX_LOG="$HLI2_TEST_SCRATCH/textbox.log"
   : > "$STUB_TEXTBOX_LOG"
   # Hermético: sin sesión de Tailscale aunque el equipo que corre los tests
@@ -573,122 +574,7 @@ test_hermes_health_failure_after_model_change_is_reported() {
 
 # --- Orden de arranque con Tailscale (W4) -------------------------------------------------
 
-test_hermes_docker_dropin_installed_with_tailscale_and_idempotent() {
-  _hm_setup
-  _hm_tailscale_up
-  export STUB_TAILSCALED_UNIT=1
-  _hm_first_run_queues
-  bash "$REPO_ROOT/modules/hermes.sh" || return 1
-  local f="$HLI2_DOCKER_DROPIN_DIR/hli2-tailscale.conf"
-  [[ -f "$f" ]] || { fail "no se instaló el drop-in"; return 1; }
-  assert_file_contains "$f" "After=tailscaled.service network-online.target" || return 1
-  assert_file_contains "$f" "Wants=tailscaled.service network-online.target" || return 1
-  assert_file_contains "$f" "tailscale ip -4" "espera a la IP de Tailscale" || return 1
-  assert_file_contains "$f" "ExecStartPre=-" "la espera nunca hace fallar a Docker" || return 1
-  # Segunda corrida: contenido idéntico, no se reescribe.
-  : > "$STUB_CALL_LOG"
-  printf 'no\nno\nno\n' > "$DIALOG_YESNO_QUEUE"
-  : > "$DIALOG_PASSWORDBOX_QUEUE"
-  bash "$REPO_ROOT/modules/hermes.sh" || return 1
-  if grep -P "^sudo\t(install|tee)\t" "$STUB_CALL_LOG" | grep -qF "hli2-tailscale.conf"; then fail "reescribió el drop-in sin cambios"; return 1; fi
-}
-
-test_hermes_no_docker_dropin_without_tailscale() {
-  _hm_setup
-  export STUB_TAILSCALED_UNIT=1          # el servicio existe pero no hay IP: no se agrega
-  _hm_first_run_queues
-  bash "$REPO_ROOT/modules/hermes.sh" || return 1
-  [[ ! -e "$HLI2_DOCKER_DROPIN_DIR/hli2-tailscale.conf" ]] || { fail "drop-in sin Tailscale"; return 1; }
-  # IP de Tailscale presente pero sin servicio tailscaled: tampoco.
-  rm -f "$SECRETS_DIR/hermes.env" 2>/dev/null || { chmod u+rwx "$SECRETS_DIR"; rm -f "$SECRETS_DIR/hermes.env"; chmod 000 "$SECRETS_DIR"; }
-  rm -f "$APPDATA_ROOT/hermes/config.yaml"
-  unset STUB_TAILSCALED_UNIT
-  _hm_tailscale_up
-  _hm_first_run_queues
-  bash "$REPO_ROOT/modules/hermes.sh" || return 1
-  [[ ! -e "$HLI2_DOCKER_DROPIN_DIR/hli2-tailscale.conf" ]] || { fail "drop-in sin tailscaled"; return 1; }
-}
-
 # --- Aislamiento de salida (iptables) ----------------------------------------------------
-
-test_hermes_egress_unit_and_script_installed_before_deploy() {
-  _hm_setup
-  _hm_first_run_queues
-  bash "$REPO_ROOT/modules/hermes.sh" || return 1
-  local script="$HLI2_HERMES_SBIN_DIR/hli2-hermes-egress" unit="$HLI2_SYSTEMD_DIR/hli2-hermes-egress.service"
-  [[ -x "$script" && -f "$unit" ]] || { fail "faltan el script o la unidad de aislamiento"; return 1; }
-  assert_file_contains "$unit" "After=docker.service" || return 1
-  assert_file_contains "$unit" "Type=oneshot" || return 1
-  assert_file_contains "$unit" "RemainAfterExit=yes" || return 1
-  assert_file_contains "$unit" "WantedBy=multi-user.target" || return 1
-  assert_file_contains "$unit" "ExecStart=${script} apply" || return 1
-  assert_file_contains "$STUB_CALL_LOG" $'systemctl\tenable\thli2-hermes-egress.service' "habilitada para el arranque" || return 1
-  assert_file_contains "$STUB_CALL_LOG" $'sudo\t'"$script"$'\tapply' "aplicada de inmediato" || return 1
-  # Las reglas se aplican ANTES del despliegue del contenedor.
-  local l_apply l_deploy
-  l_apply="$(grep -nF $'sudo\t'"$script"$'\tapply' "$STUB_CALL_LOG" | head -1 | cut -d: -f1)"
-  l_deploy="$(grep -n 'compose.deploy' "$STUB_CALL_LOG" | head -1 | cut -d: -f1)"
-  [[ -n "$l_apply" && -n "$l_deploy" && "$l_apply" -lt "$l_deploy" ]] || { fail "las reglas deben aplicarse antes del deploy"; return 1; }
-}
-
-test_hermes_egress_script_rules() {
-  _hm_setup
-  _hm_first_run_queues
-  bash "$REPO_ROOT/modules/hermes.sh" || return 1
-  local script="$HLI2_HERMES_SBIN_DIR/hli2-hermes-egress" ipt
-  : > "$STUB_CALL_LOG"
-  bash "$script" apply || return 1
-  ipt="$(grep -F $'iptables\t' "$STUB_CALL_LOG")"
-  # Cadenas y saltos: FORWARD (DOCKER-USER) e INPUT, solo desde la subred.
-  assert_contains "$ipt" $'-I\tDOCKER-USER\t1\t-s\t'"${_HM_SUBNET}"$'\t-j\tHLI2-HERMES-FWD' || return 1
-  assert_contains "$ipt" $'-I\tINPUT\t1\t-s\t'"${_HM_SUBNET}"$'\t-j\tHLI2-HERMES-IN' || return 1
-  # ESTABLISHED,RELATED primero (las respuestas a 8642/9119 siguen funcionando).
-  assert_contains "$ipt" $'-A\tHLI2-HERMES-FWD\t-m\tconntrack\t--ctstate\tESTABLISHED,RELATED\t-j\tACCEPT' || return 1
-  assert_contains "$ipt" $'-A\tHLI2-HERMES-IN\t-m\tconntrack\t--ctstate\tESTABLISHED,RELATED\t-j\tACCEPT' || return 1
-  # DROP hacia todas las redes privadas, CGNAT de Tailscale y link-local.
-  local r
-  for r in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16; do
-    assert_contains "$ipt" $'-A\tHLI2-HERMES-FWD\t-d\t'"$r"$'\t-j\tDROP' "DROP hacia $r" || return 1
-  done
-  # Internet: la cadena FWD termina en RETURN; INPUT termina en DROP.
-  assert_contains "$ipt" $'-A\tHLI2-HERMES-FWD\t-j\tRETURN' || return 1
-  assert_contains "$ipt" $'-A\tHLI2-HERMES-IN\t-j\tDROP' || return 1
-  # Hook para destinos locales futuros (v2.6c), antes de los DROP.
-  assert_contains "$ipt" $'-A\tHLI2-HERMES-FWD\t-j\tHLI2-HERMES-ALLOW' || return 1
-  # Sin AdGuard: DNS públicos, así que no hay reglas especiales de DNS hacia el host... salvo las de los propios resolvers.
-  assert_contains "$ipt" $'-d\t1.1.1.1\t-p\tudp\t--dport\t53\t-j\tACCEPT' || return 1
-}
-
-test_hermes_egress_allows_dns_to_lan_ip_when_adguard_installed() {
-  _hm_setup
-  echo "adguard" >> "$STATE_FILE"
-  _hm_first_run_queues
-  bash "$REPO_ROOT/modules/hermes.sh" || return 1
-  : > "$STUB_CALL_LOG"
-  bash "$HLI2_HERMES_SBIN_DIR/hli2-hermes-egress" apply || return 1
-  local ipt; ipt="$(grep -F $'iptables\t' "$STUB_CALL_LOG")"
-  assert_contains "$ipt" $'-A\tHLI2-HERMES-IN\t-d\t'"${_HM_LAN}"$'\t-p\tudp\t--dport\t53\t-j\tACCEPT' || return 1
-  assert_contains "$ipt" $'-A\tHLI2-HERMES-IN\t-d\t'"${_HM_LAN}"$'\t-p\ttcp\t--dport\t53\t-j\tACCEPT' || return 1
-  # El compose apunta el DNS del contenedor a la IP de la LAN.
-  assert_file_contains "$STUB_HTTP_BODIES_LOG" "- ${_HM_LAN}" || return 1
-}
-
-test_hermes_egress_script_is_idempotent() {
-  _hm_setup
-  _hm_first_run_queues
-  bash "$REPO_ROOT/modules/hermes.sh" || return 1
-  : > "$STUB_CALL_LOG"
-  STUB_IPTABLES_HAVE=1 bash "$HLI2_HERMES_SBIN_DIR/hli2-hermes-egress" apply || return 1
-  # Con los saltos ya presentes ('-C' tiene éxito) no se vuelven a insertar.
-  if grep -F $'iptables\t' "$STUB_CALL_LOG" | grep -qF $'\t-I\t'; then fail "insertó saltos duplicados"; return 1; fi
-  # Pero las cadenas sí se reconstruyen (vaciar y rearmar).
-  assert_file_contains "$STUB_CALL_LOG" $'-F\tHLI2-HERMES-FWD' || return 1
-  # Quitar: borra los saltos y las cadenas.
-  : > "$STUB_CALL_LOG"
-  bash "$HLI2_HERMES_SBIN_DIR/hli2-hermes-egress" remove || return 1
-  assert_file_contains "$STUB_CALL_LOG" $'-X\tHLI2-HERMES-FWD' || return 1
-  assert_file_contains "$STUB_CALL_LOG" $'-X\tHLI2-HERMES-IN' || return 1
-}
 
 test_hermes_deploy_aborts_if_egress_rules_cannot_be_applied() {
   _hm_setup
@@ -716,4 +602,262 @@ test_hermes_compose_uses_own_network_dns_and_no_wide_binds() {
   _hm_first_run_queues
   if bash "$REPO_ROOT/modules/hermes.sh"; then fail "aceptó una subred igual a la LAN"; return 1; fi
   assert_contains "$(_hm_dialog_text)" "HLI2_HERMES_SUBNET" || return 1
+}
+
+# Ejecuta el script de aislamiento instalado contra el 'iptables' falso.
+_hm_run_egress() {
+  local action="$1"
+  HLI2_IPTABLES="$STUBS_DIR/iptables" bash "$HLI2_HERMES_SBIN_DIR/hli2-hermes-egress" "$action"
+}
+
+# Líneas de iptables (sin "-w") registradas, una por llamada, en orden.
+_hm_ipt_calls() {
+  grep -F $'iptables\t' "$STUB_CALL_LOG" | sed 's/^iptables\t-w\t//; s/^iptables\t//' || true
+}
+
+# --- Arranque con Tailscale: sin esperas (W5) ---------------------------------------------
+
+test_hermes_tailscale_boot_support_has_no_waits_and_sets_nonlocal_bind() {
+  _hm_setup
+  _hm_tailscale_up
+  export STUB_TAILSCALED_UNIT=1
+  _hm_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  local f="$HLI2_DOCKER_DROPIN_DIR/hli2-tailscale.conf" sc="$HLI2_TEST_SCRATCH/sysctl/90-hli2-hermes.conf"
+  [[ -f "$f" ]] || { fail "no se instaló el drop-in"; return 1; }
+  assert_file_contains "$f" "After=tailscaled.service" || return 1
+  local c; c="$(grep -v '^[[:space:]]*#' "$f")"
+  assert_not_contains "$c" "Wants=" "sin Wants" || return 1
+  assert_not_contains "$c" "network-online" "sin network-online" || return 1
+  assert_not_contains "$c" "ExecStartPre" "sin espera previa" || return 1
+  assert_not_contains "$c" "sleep" || return 1
+  [[ -f "$sc" ]] || { fail "no se instaló el sysctl"; return 1; }
+  assert_file_contains "$sc" "net.ipv4.ip_nonlocal_bind = 1" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'sysctl\t-w\tnet.ipv4.ip_nonlocal_bind=1' "aplicado en vivo" || return 1
+  # Segunda corrida: contenido idéntico, no se reescribe ni se vuelve a aplicar.
+  : > "$STUB_CALL_LOG"
+  printf 'no\nno\nno\n' > "$DIALOG_YESNO_QUEUE"
+  : > "$DIALOG_PASSWORDBOX_QUEUE"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  if grep -P "^sudo\t(install|tee)\t" "$STUB_CALL_LOG" | grep -qE "hli2-tailscale.conf|90-hli2-hermes.conf"; then fail "reescribió archivos sin cambios"; return 1; fi
+  if grep -qF $'sysctl\t-w' "$STUB_CALL_LOG"; then fail "volvió a aplicar el sysctl"; return 1; fi
+}
+
+test_hermes_no_tailscale_boot_support_without_tailscale_ip() {
+  _hm_setup
+  export STUB_TAILSCALED_UNIT=1
+  _hm_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  [[ ! -e "$HLI2_DOCKER_DROPIN_DIR/hli2-tailscale.conf" ]] || { fail "drop-in sin IP de Tailscale"; return 1; }
+  [[ ! -e "$HLI2_TEST_SCRATCH/sysctl/90-hli2-hermes.conf" ]] || { fail "sysctl sin IP de Tailscale"; return 1; }
+  # IP de Tailscale presente pero sin servicio tailscaled: sin drop-in, con sysctl.
+  rm -f "$SECRETS_DIR/hermes.env" 2>/dev/null || { chmod u+rwx "$SECRETS_DIR"; rm -f "$SECRETS_DIR/hermes.env"; chmod 000 "$SECRETS_DIR"; }
+  rm -f "$APPDATA_ROOT/hermes/config.yaml"
+  unset STUB_TAILSCALED_UNIT
+  _hm_tailscale_up
+  _hm_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  [[ ! -e "$HLI2_DOCKER_DROPIN_DIR/hli2-tailscale.conf" ]] || { fail "drop-in sin tailscaled"; return 1; }
+}
+
+# --- Aislamiento de salida (iptables) ----------------------------------------------------
+
+test_hermes_egress_unit_dropin_and_start_before_deploy() {
+  _hm_setup
+  _hm_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  local script="$HLI2_HERMES_SBIN_DIR/hli2-hermes-egress" unit="$HLI2_SYSTEMD_DIR/hli2-hermes-egress.service"
+  local dropin="$HLI2_DOCKER_DROPIN_DIR/hli2-hermes-egress.conf"
+  [[ -x "$script" && -f "$unit" && -f "$dropin" ]] || { fail "faltan el script, la unidad o el drop-in"; return 1; }
+  local u; u="$(< "$unit")"
+  assert_contains "$u" "Before=docker.service" "antes de Docker" || return 1
+  assert_not_contains "$u" "After=docker.service" || return 1
+  assert_not_contains "$u" "PartOf=" "sin PartOf" || return 1
+  assert_contains "$u" "Type=oneshot" || return 1
+  assert_contains "$u" "RemainAfterExit=yes" || return 1
+  assert_contains "$u" "WantedBy=multi-user.target docker.service" "Docker la arrastra al arrancar" || return 1
+  assert_contains "$u" "ExecStart=${script} apply" || return 1
+  # Reaplicación tras 'systemctl restart docker': rápida, sin esperas, tolerante a fallos.
+  assert_file_contains "$dropin" "ExecStartPost=-${script} apply" || return 1
+  assert_file_not_contains "$dropin" "sleep" || return 1
+  # Habilitada y arrancada, y las reglas aplicadas ANTES del despliegue.
+  assert_file_contains "$STUB_CALL_LOG" $'systemctl\tenable\t--now\thli2-hermes-egress.service' || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'sudo\t'"$script"$'\tapply' "aplicada de inmediato" || return 1
+  local l_apply l_deploy
+  l_apply="$(grep -nF $'sudo\t'"$script"$'\tapply' "$STUB_CALL_LOG" | head -1 | cut -d: -f1)"
+  l_deploy="$(grep -n 'compose.deploy' "$STUB_CALL_LOG" | head -1 | cut -d: -f1)"
+  [[ -n "$l_apply" && -n "$l_deploy" && "$l_apply" -lt "$l_deploy" ]] || { fail "las reglas deben aplicarse antes del deploy"; return 1; }
+}
+
+test_hermes_egress_script_rule_contents() {
+  _hm_setup
+  _hm_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  : > "$STUB_CALL_LOG"
+  _hm_run_egress apply || return 1
+  local ipt; ipt="$(_hm_ipt_calls)"
+  assert_contains "$ipt" $'-I\tDOCKER-USER\t1\t-s\t'"${_HM_SUBNET}"$'\t-j\tHLI2-HERMES-FWD-new' || return 1
+  assert_contains "$ipt" $'-I\tINPUT\t1\t-s\t'"${_HM_SUBNET}"$'\t-j\tHLI2-HERMES-IN-new' || return 1
+  assert_contains "$ipt" $'-E\tHLI2-HERMES-FWD-new\tHLI2-HERMES-FWD' || return 1
+  assert_contains "$ipt" $'-E\tHLI2-HERMES-IN-new\tHLI2-HERMES-IN' || return 1
+  assert_contains "$ipt" $'-A\tHLI2-HERMES-FWD-new\t-m\tconntrack\t--ctstate\tESTABLISHED,RELATED\t-j\tACCEPT' || return 1
+  assert_contains "$ipt" $'-A\tHLI2-HERMES-IN-new\t-m\tconntrack\t--ctstate\tESTABLISHED,RELATED\t-j\tACCEPT' || return 1
+  local r
+  for r in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4; do
+    assert_contains "$ipt" $'-A\tHLI2-HERMES-FWD-new\t-d\t'"$r"$'\t-j\tDROP' "DROP hacia $r" || return 1
+  done
+  assert_not_contains "$ipt" $'-d\t8.8.8.8' "Internet permitida" || return 1
+  assert_contains "$ipt" $'-A\tHLI2-HERMES-FWD-new\t-j\tRETURN' || return 1
+  assert_contains "$ipt" $'-A\tHLI2-HERMES-IN-new\t-j\tDROP' || return 1
+  assert_contains "$ipt" $'-A\tHLI2-HERMES-FWD-new\t-j\tHLI2-HERMES-ALLOW' || return 1
+  assert_contains "$ipt" $'-d\t1.1.1.1\t-p\tudp\t--dport\t53\t-j\tACCEPT' || return 1
+  # Backend registrado y ruta absoluta por defecto en el script.
+  assert_file_contains "$HLI2_HERMES_SBIN_DIR/hli2-hermes-egress" '${HLI2_IPTABLES:-/usr/sbin/iptables}' || return 1
+  assert_file_contains "$HLI2_HERMES_SBIN_DIR/hli2-hermes-egress" 'backend $("$IPT" -V)' || return 1
+  assert_contains "$ipt" "-V" "se consultó el backend" || return 1
+}
+
+test_hermes_egress_allows_dns_to_lan_ip_when_adguard_installed() {
+  _hm_setup
+  echo "adguard" >> "$STATE_FILE"
+  _hm_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  : > "$STUB_CALL_LOG"
+  _hm_run_egress apply || return 1
+  local ipt; ipt="$(_hm_ipt_calls)"
+  assert_contains "$ipt" $'-A\tHLI2-HERMES-IN-new\t-d\t'"${_HM_LAN}"$'\t-p\tudp\t--dport\t53\t-j\tACCEPT' || return 1
+  assert_contains "$ipt" $'-A\tHLI2-HERMES-IN-new\t-d\t'"${_HM_LAN}"$'\t-p\ttcp\t--dport\t53\t-j\tACCEPT' || return 1
+  assert_file_contains "$STUB_HTTP_BODIES_LOG" "- ${_HM_LAN}" || return 1
+}
+
+# Orden de operaciones de la aplicación atómica: la cadena nueva se arma por
+# completo y recibe su salto ANTES de que se toque la anterior.
+test_hermes_egress_apply_is_atomic_in_order() {
+  _hm_setup
+  _hm_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  : > "$STUB_CALL_LOG"
+  _hm_run_egress apply || return 1
+  local calls n_new n_fill_last n_jump_new n_flush_old n_del_old n_rename
+  calls="$(_hm_ipt_calls | grep -nF 'HLI2-HERMES-FWD' )"
+  n_new="$(_hm_ipt_calls | grep -nF -- $'-N\tHLI2-HERMES-FWD-new' | head -1 | cut -d: -f1)"
+  n_fill_last="$(_hm_ipt_calls | grep -nF -- $'-A\tHLI2-HERMES-FWD-new' | tail -1 | cut -d: -f1)"
+  n_jump_new="$(_hm_ipt_calls | grep -nF -- $'-I\tDOCKER-USER\t1\t-s\t'"${_HM_SUBNET}"$'\t-j\tHLI2-HERMES-FWD-new' | head -1 | cut -d: -f1)"
+  n_flush_old="$(_hm_ipt_calls | grep -nxF -- $'-F\tHLI2-HERMES-FWD' | head -1 | cut -d: -f1)"
+  n_del_old="$(_hm_ipt_calls | grep -nxF -- $'-X\tHLI2-HERMES-FWD' | head -1 | cut -d: -f1)"
+  n_rename="$(_hm_ipt_calls | grep -nF -- $'-E\tHLI2-HERMES-FWD-new\tHLI2-HERMES-FWD' | head -1 | cut -d: -f1)"
+  local v
+  for v in n_new n_fill_last n_jump_new n_flush_old n_del_old n_rename; do
+    [[ -n "${!v}" ]] || { fail "falta la operación $v: $calls"; return 1; }
+  done
+  (( n_new < n_fill_last && n_fill_last < n_jump_new )) || { fail "el salto a la cadena nueva debe ir DESPUÉS de armarla por completo"; return 1; }
+  (( n_jump_new < n_flush_old && n_flush_old < n_del_old && n_del_old < n_rename )) || { fail "la cadena anterior solo se toca después de enganchar la nueva, y el renombrado va al final"; return 1; }
+}
+
+test_hermes_egress_removes_stale_jumps_of_any_subnet() {
+  _hm_setup
+  _hm_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  export STUB_IPTABLES_S_INPUT="-P INPUT ACCEPT
+-A INPUT -s 10.99.1.0/24 -j HLI2-HERMES-IN
+-A INPUT -s ${_HM_SUBNET} -j HLI2-HERMES-IN
+-A INPUT -s 10.99.2.0/24 -j HLI2-HERMES-IN-new
+-A INPUT -p tcp --dport 22 -j ACCEPT"
+  export STUB_IPTABLES_S_DOCKER_USER="-N DOCKER-USER
+-A DOCKER-USER -s 10.99.1.0/24 -j HLI2-HERMES-FWD
+-A DOCKER-USER -j RETURN"
+  : > "$STUB_CALL_LOG"
+  _hm_run_egress apply || return 1
+  local ipt; ipt="$(_hm_ipt_calls)"
+  assert_contains "$ipt" $'-D\tINPUT\t-s\t10.99.1.0/24\t-j\tHLI2-HERMES-IN' "salto viejo de otra subred" || return 1
+  assert_contains "$ipt" $'-D\tINPUT\t-s\t'"${_HM_SUBNET}"$'\t-j\tHLI2-HERMES-IN' || return 1
+  assert_contains "$ipt" $'-D\tINPUT\t-s\t10.99.2.0/24\t-j\tHLI2-HERMES-IN-new' "resto de una aplicación interrumpida" || return 1
+  assert_contains "$ipt" $'-D\tDOCKER-USER\t-s\t10.99.1.0/24\t-j\tHLI2-HERMES-FWD' || return 1
+  assert_not_contains "$ipt" $'-D\tINPUT\t-p\ttcp' "no toca reglas ajenas" || return 1
+  assert_not_contains "$ipt" $'-D\tDOCKER-USER\t-j\tRETURN' || return 1
+  # 'remove' hace lo mismo y borra las cadenas, incluido el hook ALLOW.
+  : > "$STUB_CALL_LOG"
+  _hm_run_egress remove || return 1
+  ipt="$(_hm_ipt_calls)"
+  assert_contains "$ipt" $'-D\tINPUT\t-s\t10.99.1.0/24\t-j\tHLI2-HERMES-IN' || return 1
+  assert_contains "$ipt" $'-D\tDOCKER-USER\t-s\t10.99.1.0/24\t-j\tHLI2-HERMES-FWD' || return 1
+  local c
+  for c in HLI2-HERMES-FWD HLI2-HERMES-IN HLI2-HERMES-ALLOW HLI2-HERMES-FWD-new HLI2-HERMES-IN-new; do
+    assert_contains "$ipt" $'-F\t'"$c" || return 1
+    assert_contains "$ipt" $'-X\t'"$c" || return 1
+  done
+  # ALLOW se borra después de las cadenas que la referencian.
+  local n_allow n_fwd
+  n_allow="$(_hm_ipt_calls | grep -nxF -- $'-X\tHLI2-HERMES-ALLOW' | head -1 | cut -d: -f1)"
+  n_fwd="$(_hm_ipt_calls | grep -nxF -- $'-X\tHLI2-HERMES-FWD' | head -1 | cut -d: -f1)"
+  (( n_fwd < n_allow )) || { fail "ALLOW debe borrarse después de FWD"; return 1; }
+}
+
+# --- Validación de la subred (W1) ---------------------------------------------------------
+
+test_hermes_invalid_subnets_install_nothing() {
+  _hm_setup
+  local bad
+  for bad in "127.0.0.0/24" "100.64.1.0/24" "8.8.8.0/24" "169.254.1.0/24" "10.1.2.0/16" "10.300.1.0/24" "abc" "172.32.0.0/24" "10.1.2.3/24"; do
+    : > "$STUB_CALL_LOG"; : > "$STUB_HTTP_BODIES_LOG"
+    export HLI2_HERMES_SUBNET="$bad"
+    : > "$DIALOG_PASSWORDBOX_QUEUE"
+    if bash "$REPO_ROOT/modules/hermes.sh"; then fail "aceptó la subred [$bad]"; return 1; fi
+    assert_contains "$(_hm_dialog_text)" "HLI2_HERMES_SUBNET" "mensaje para [$bad]" || return 1
+    # Nada instalado ni preguntado: ni script, ni unidad, ni secretos, ni compose, ni iptables.
+    [[ ! -e "$HLI2_HERMES_SBIN_DIR/hli2-hermes-egress" && ! -e "$HLI2_SYSTEMD_DIR/hli2-hermes-egress.service" ]] || { fail "instaló el aislamiento con [$bad]"; return 1; }
+    ( source "$REPO_ROOT/lib/core.sh"; secret_file_exists hermes ) && { fail "guardó secretos con [$bad]"; return 1; }
+    assert_file_not_contains "$STUB_HTTP_BODIES_LOG" "compose" || return 1
+    if grep -qF $'iptables\t' "$STUB_CALL_LOG"; then fail "tocó iptables con [$bad]"; return 1; fi
+    if grep -qF -- '--passwordbox' "$STUB_CALL_LOG"; then fail "preguntó algo antes de validar [$bad]"; return 1; fi
+  done
+}
+
+test_hermes_subnet_overlapping_a_route_or_docker_network_is_rejected() {
+  _hm_setup
+  export HLI2_HERMES_SUBNET="192.168.5.0/24"
+  export STUB_ROUTES="default via 192.168.99.1 dev eth0
+192.168.0.0/16 dev wlan0 proto kernel scope link src 192.168.1.4"
+  : > "$DIALOG_PASSWORDBOX_QUEUE"
+  if bash "$REPO_ROOT/modules/hermes.sh"; then fail "aceptó una subred dentro de una ruta /16"; return 1; fi
+  assert_contains "$(_hm_dialog_text)" "ruta 192.168.0.0/16" || return 1
+  [[ ! -e "$HLI2_HERMES_SBIN_DIR/hli2-hermes-egress" ]] || { fail "instaló algo"; return 1; }
+  # Ruta más pequeña que contiene a la subred, y ruta de host dentro de ella.
+  unset STUB_ROUTES
+  export HLI2_HERMES_SUBNET="10.213.144.0/24"
+  export STUB_ROUTES="10.213.0.0/16 dev eth1"
+  if bash "$REPO_ROOT/modules/hermes.sh"; then fail "aceptó una subred dentro de una ruta /16"; return 1; fi
+  export STUB_ROUTES="10.213.144.9 dev eth1"
+  if bash "$REPO_ROOT/modules/hermes.sh"; then fail "aceptó una subred con una ruta de host dentro"; return 1; fi
+  # Redes de Docker existentes.
+  unset STUB_ROUTES
+  export STUB_DOCKER_NETWORKS="bridge 172.17.0.0/16
+dokploy-network 10.213.144.0/24"
+  if bash "$REPO_ROOT/modules/hermes.sh"; then fail "aceptó una subred igual a una red de Docker"; return 1; fi
+  assert_contains "$(_hm_dialog_text)" "red de Docker dokploy-network" || return 1
+}
+
+test_hermes_own_existing_network_and_route_do_not_count_as_conflict() {
+  _hm_setup
+  _hm_first_run_queues
+  export STUB_DOCKER_NETWORKS="hermes_hermes-net 10.213.144.0/24"
+  export STUB_ROUTES="10.213.144.0/24 dev br-abc proto kernel scope link src 10.213.144.1"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+}
+
+# --- Redes del contenedor (W7) ------------------------------------------------------------
+
+test_hermes_warns_if_container_has_other_networks() {
+  _hm_setup
+  _hm_first_run_queues
+  export STUB_DOCKER_INSPECT_NETWORKS="hermes_hermes-net dokploy-network"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_contains "$(_hm_dialog_text)" "ATENCIÓN: el contenedor 'hermes' está conectado a estas redes: hermes_hermes-net dokploy-network" || return 1
+}
+
+test_hermes_no_warning_when_only_own_network() {
+  _hm_setup
+  _hm_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_not_contains "$(_hm_dialog_text)" "ATENCIÓN" || return 1
 }

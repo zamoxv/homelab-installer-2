@@ -7,6 +7,13 @@ source "$(dirname "$0")/_stublib.sh"
 log_call iptables "$@"
 # STUB_IPTABLES_MISSING=1: 'iptables' no está instalado (código 127).
 [[ -n "${STUB_IPTABLES_MISSING:-}" ]] && exit 127
+# STUB_IPTABLES_S_INPUT / STUB_IPTABLES_S_DOCKER_USER: salida de '-S <cadena>'
+# (reglas existentes, una por línea) para probar el borrado de saltos viejos.
+# STUB_IPTABLES_VERSION: salida de '-V'.
+if [[ "${1:-}" == "-w" ]]; then shift; fi
+if [[ "${1:-}" == "-V" ]]; then echo "${STUB_IPTABLES_VERSION:-iptables v1.8.10 (nf_tables)}"; exit 0; fi
+if [[ "${1:-}" == "-S" && "${2:-}" == "INPUT" ]]; then printf '%s\n' "${STUB_IPTABLES_S_INPUT:--P INPUT ACCEPT}"; exit 0; fi
+if [[ "${1:-}" == "-S" && "${2:-}" == "DOCKER-USER" ]]; then printf '%s\n' "${STUB_IPTABLES_S_DOCKER_USER:--N DOCKER-USER}"; exit 0; fi
 for a in "$@"; do
   if [[ "$a" == "-C" ]]; then
     [[ -n "${STUB_IPTABLES_HAVE:-}" ]] && exit 0 || exit 1
