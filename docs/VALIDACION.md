@@ -362,6 +362,13 @@ API y la contraseña del dashboard en Vaultwarden.
 | 116 | Re-ejecutar `hermes`, rotar la clave de API y cambiar los modelos | Muestra la clave nueva (una vez); la app deja de conectar hasta cargarla; los modelos nuevos figuran en el panel de OpenRouter |
 | 117 | Con Tailscale caído en el servidor al desplegar, y luego levantarlo y re-ejecutar el módulo | La primera vez solo publica en la LAN y lo avisa; al re-ejecutar publica también en la IP de Tailscale |
 | 118 | Reiniciar el servidor | `hermes` vuelve solo (`restart: unless-stopped`); si arranca antes que Tailscale y no logra publicar en su IP, reaparece al reiniciar el contenedor o re-ejecutar el módulo (anotar si pasa) |
+| 119 | Si el contenedor no arranca tras el despliegue (`docker logs hermes`, estado `Restarting`): sospechar de `no-new-privileges` o `pids_limit` | Plan de contingencia: quitar `security_opt` (y, si hace falta, `pids_limit`) de `compose/hermes/docker-compose.yml`, volver a correr el módulo y anotar el error del log para ajustar la plantilla |
+| 120 | `docker exec hermes curl -s -m 5 -o /dev/null -w '%{http_code}' http://<IP LAN>:3000` (panel de Dokploy); lo mismo contra AdGuard (`:3053`) y Home Assistant (`:8123`) | Todos fallan (tiempo agotado / sin respuesta): el agente no alcanza la LAN ni el propio servidor |
+| 121 | `docker exec hermes curl -s -m 5 -o /dev/null -w '%{http_code}' https://openrouter.ai` y `docker exec hermes getent hosts openrouter.ai` | Responde (200/30x) y resuelve: Internet y DNS funcionan |
+| 122 | `docker exec hermes curl -s -m 5 http://<IP Tailscale del servidor>:8642/health` y a otro equipo de la tailnet | Falla: el agente tampoco alcanza Tailscale. Desde el teléfono con Tailscale, `http://<IP Tailscale>:8642` sigue funcionando (prueba 108) |
+| 123 | `sudo iptables -S DOCKER-USER`, `sudo iptables -S INPUT \| head`, `sudo iptables -S HLI2-HERMES-FWD` y `systemctl is-enabled hli2-hermes-egress` | Saltos por origen `10.213.144.0/24` hacia `HLI2-HERMES-FWD` y `HLI2-HERMES-IN`; reglas ESTABLISHED/RELATED primero y DROP hacia las redes privadas; unidad `enabled` |
+| 124 | Reiniciar el servidor y repetir 120, 121 y 123 | Las reglas están de nuevo (la unidad las reaplica) y `docker ps` muestra `hermes`; con Tailscale, el drop-in `/etc/systemd/system/docker.service.d/hli2-tailscale.conf` existe y `hermes` publica en la IP de Tailscale |
+| 125 | Re-ejecutar `hermes` dos veces seguidas respondiendo "No" a todo | No se duplican reglas (`sudo iptables -S DOCKER-USER \| grep -c HLI2-HERMES-FWD` → `1`) y el drop-in no se reescribe |
 
 ### Energía (correr primero)
 

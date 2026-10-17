@@ -808,13 +808,63 @@ Dokploy `dokploy.com/templates/hermes`, Docker Hub, código v0.22.2 de
   proveedor; si no queda ninguno, OpenRouter responde error y se usa el
   respaldo); que `hermes config set` acepte rutas `auxiliary.<tarea>.model`
   (se usa solo al cambiar modelos en una re-ejecución).
+- Digest: además de la etiqueta, la imagen se fija por digest
+  (`@sha256:36099926…`, lista de manifiestos amd64+arm64 de `v0.22.2` según
+  la API de Docker Hub, verificada el 2026-10-16). Al actualizar se cambian
+  etiqueta y digest juntos.
+- Endurecimiento: `security_opt: no-new-privileges` y `pids_limit: 512`. El
+  arranque de la imagen baja de root al uid del agente con `s6-setuidgid`
+  (llamadas `setuid`/`setgid`, no binarios setuid; `docker/main-wrapper.sh` y
+  `stage2-hook.sh` de v0.22.2) y la imagen no trae `sudo`, así que
+  `no-new-privileges` no debería interferir; no se probó en el servidor
+  (plan de contingencia: prueba 119 de `docs/VALIDACION.md`). `cap_drop` no se
+  fija (el entrypoint hace `chown`/`usermod`).
+- **Aislamiento de salida (egress).** La terminal del agente podría alcanzar
+  el panel de Dokploy (:3000), AdGuard, Home Assistant, el router. El módulo
+  pone al contenedor en su propia red (`hermes-net`, subred /24 fija
+  `10.213.144.0/24`, configurable con `HLI2_HERMES_SUBNET`; fuera del pool de
+  Swarm 172.20–31 y de las redes por defecto de Docker) e instala el servicio
+  `hli2-hermes-egress` (script `/usr/local/sbin/hli2-hermes-egress`, unidad
+  `After=docker.service`, `PartOf=docker.service`, se reaplica en cada
+  arranque; idempotente) con reglas en dos cadenas propias:
+  `HLI2-HERMES-FWD` (enganchada en `DOCKER-USER`, tráfico hacia otras
+  máquinas): ESTABLISHED/RELATED aceptado, DROP de conexiones nuevas hacia
+  10/8, 172.16/12, 192.168/16, 100.64/10 (Tailscale) y 169.254/16, el resto
+  (Internet) sigue; y `HLI2-HERMES-IN` (enganchada en `INPUT`, tráfico hacia
+  la propia máquina: AdGuard y Home Assistant usan la red del host y NO pasan
+  por `DOCKER-USER`): ESTABLISHED/RELATED y DNS, todo lo demás DROP.
+  Razonamiento de las entradas publicadas (8642/9119): la conexión entrante
+  LAN/Tailscale → contenedor tiene origen en la LAN, no en la subred, así que
+  no se filtra, y las respuestas (origen = subred) son ESTABLISHED y las
+  acepta la primera regla. DNS: el contenedor usa `dns:` explícito (la IP de
+  la LAN del servidor solo si el módulo `adguard` está hecho; si no,
+  1.1.1.1/9.9.9.9) y se permite solo ese destino en el puerto 53. Hook para
+  permitir un destino local concreto (v2.6c Ollama): reglas ACCEPT en la
+  cadena `HLI2-HERMES-ALLOW`, que el script no reconstruye. Para quitarlo:
+  `systemctl disable --now hli2-hermes-egress`, `hli2-hermes-egress remove` y
+  borrar el script y la unidad. Limitación: entre el arranque de Docker y la
+  aplicación de la unidad puede haber unos segundos sin reglas (se descartó
+  `Before=docker.service` porque no se verificó que Docker conserve una
+  cadena `DOCKER-USER` creada antes de iniciar). IPv6 no está habilitado en
+  la red.
+- IPs: la IP de la LAN se toma de la interfaz de la ruta por defecto
+  (`ip -4 route get 1.1.1.1`, campo `src`; `get_ip` toma la primera de
+  `hostname -I`, que puede ser un puente de Docker) y debe ser privada
+  (RFC 1918); la de Tailscale debe estar en 100.64.0.0/10; si coinciden se
+  publica una sola vez.
+- Orden de arranque: si hay IP de Tailscale y existe `tailscaled.service`, el
+  módulo instala `docker.service.d/hli2-tailscale.conf` (`After=`/`Wants=`
+  `tailscaled.service` y `network-online.target`, más una espera de hasta 30 s
+  a que Tailscale tenga IPv4 que nunca hace fallar a Docker).
+- Backup: se mantiene `sqlite` (parada de unos segundos a las 04:00; costo
+  aceptado a cambio de una copia consistente de `state.db`). Alternativa
+  descartada: `files` sin parada, con riesgo de copiar la base a medio escribir.
 - Diseño: puertos publicados solo en la IP de LAN y la de Tailscale (compose
   "docker-compose", no "stack"); conviene una reserva DHCP para la IP de la
   LAN, y si cambia alguna IP basta volver a correr el módulo. Si el servidor
   arranca antes que Tailscale, Docker no puede publicar en esa IP hasta que
-  exista (se reintenta por `restart: unless-stopped`). `no-new-privileges` y
-  `cap_drop` no se fijan: el entrypoint necesita ajustar permisos de
-  `/opt/data` al arrancar y no se probó (candidato a endurecimiento en el M70q).
+  exista (el módulo instala el drop-in de Docker descrito arriba; además se
+  reintenta por `restart: unless-stopped`).
 
 #### v2.6b — Modelos y costo
 - [ ] OpenRouter: clave propia **con límite de gasto mensual en la clave**
