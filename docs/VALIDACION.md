@@ -330,6 +330,39 @@ nombre `miapp-db-1`) y una carpeta de datos con algún archivo en
    figura en el dashboard y sus datos están en `/srv/appdata/miapp/db`; el aviso
    final indica que debe volver a desplegar su contenedor.
 
+### v2.6a — Hermes Agent (base)
+
+Requisitos: Dokploy y su API configurados, `tailscale` activo en el servidor y
+en el teléfono Android (misma cuenta), y una clave de OpenRouter **creada con
+límite de gasto** (openrouter.ai → Keys → Create key → límite de crédito de
+5 USD; si el panel ofrece reinicio mensual, elegirlo). Recomendado: reservar en
+el router (DHCP) la IP de LAN del servidor. Al terminar, guardar la clave de
+API y la contraseña del dashboard en Vaultwarden.
+
+| # | Prueba | Resultado esperado |
+|---|---|---|
+| 98 | Módulo `hermes`: leer el aviso previo, pegar la clave, aceptar los dos modelos propuestos | Aviso sobre el límite de gasto antes de pedir la clave; si se pega un texto que no empieza con `sk-or-` rechaza y no crea `/etc/hli2/hermes.env` |
+| 99 | `sudo ls -l /etc/hli2/hermes.env /srv/appdata/hermes` | `hermes.env` con `-rw------- root`; carpeta `hermes` 0750 con el dueño y grupo del usuario del servidor; `config.yaml` creado ahí dentro |
+| 100 | `docker ps --filter name=hermes --format '{{.Names}} {{.Ports}}'` | Contenedor `hermes` activo; los puertos 8642 y 9119 figuran solo con `<IP LAN>:` y `<IP Tailscale>:` delante, nunca `0.0.0.0` |
+| 101 | `sudo ss -ltn \| grep -E ':(8642\|9119)'` | Solo direcciones de la LAN y de Tailscale; ninguna `0.0.0.0` ni `[::]` |
+| 102 | `curl -s http://<IP LAN>:8642/health` y luego `curl -s -H "Authorization: Bearer <clave>" http://<IP LAN>:8642/v1/models` | La primera responde `{"status":"ok"}`; la segunda lista el modelo del agente. Sin el encabezado, `/v1/models` da 401 |
+| 103 | Cuadro final de credenciales | Muestra UNA vez la clave de API y la contraseña del dashboard sin capturar el mouse (se puede seleccionar el texto); si se responde "No" a "¿Guardó…?" vuelve a mostrarse |
+| 104 | `docker inspect hermes --format '{{.HostConfig.Binds}} {{.HostConfig.NetworkMode}} {{.HostConfig.Privileged}}'` | Un único montaje `/srv/appdata/hermes:/opt/data`, red que no es `host`, `false`; sin `docker.sock` en ningún montaje |
+| 105 | `docker exec hermes id` y `ls -ln /srv/appdata/hermes` | El agente corre como el uid/gid del usuario del servidor (no 0) y los archivos de datos tienen ese mismo dueño |
+| 106 | Dashboard: `http://<IP Tailscale>:9119` desde el teléfono o la PC | Redirige a `/login`; con usuario `admin` y la contraseña guardada entra; con una contraseña incorrecta da "Invalid credentials" |
+| 107 | `curl -s http://<IP LAN>:9119/api/status` | Informa que se requiere autenticación (`auth_required` verdadero); ninguna página del dashboard se sirve sin login |
+| 108 | hermes-android: instalar el APK arm64 de github.com/rusty4444/hermes-android/releases, agregar conexión `http://<IP Tailscale>` puerto `8642` con la clave de API; con **datos móviles** y Tailscale encendido | Conecta; el chat responde con streaming (y la voz, si se prueba) |
+| 109 | Apagar Tailscale en el teléfono (datos móviles) y reintentar | No conecta (tiempo agotado): 8642 no es alcanzable desde Internet |
+| 110 | Desde otra máquina de la LAN: `curl -s http://<IP LAN>:8642/health`; desde Internet (datos móviles sin Tailscale) a la IP pública del router | LAN responde; Internet no (el router no tiene puertos abiertos) |
+| 111 | Pedirle a Hermes un comando de terminal peligroso (por ejemplo, borrar un archivo de `/opt/data`) desde el dashboard | `approvals.mode: manual`: pide aprobación antes de ejecutar. Por la API (hermes-android) la documentación oficial indica que las plataformas sin canal de aprobación (`api_server`) bloquean el comando en vez de preguntar (`unattended_mode: deny`); anotar cuál de los dos comportamientos ocurre |
+| 112 | Pedirle que abra un sitio de la lista bloqueada (`*.local`, `*.lan`) y uno de la red privada | Los rechaza (lista de sitios bloqueados y protección SSRF) |
+| 113 | Panel de actividad de OpenRouter (openrouter.ai/activity) tras unas conversaciones | El modelo principal figura como `deepseek/deepseek-v4.1-flash` (o el elegido); las llamadas auxiliares (títulos, compresión) figuran con `qwen/qwen3.7-flash` (o el elegido); ninguna llamada a un modelo que no se haya elegido |
+| 114 | Backup: `sudo hli2-backup run` (o "Hacer backup ahora") y `restic ls latest --tag full \| grep hermes` | El contenedor `hermes` se detiene unos segundos y vuelve a iniciar; `/srv/appdata/hermes` figura en la foto |
+| 115 | Re-ejecutar `hermes` respondiendo "No" a todo | No pide la clave de OpenRouter, no cambia `config.yaml` ni las claves, no vuelve a mostrar credenciales y re-despliega |
+| 116 | Re-ejecutar `hermes`, rotar la clave de API y cambiar los modelos | Muestra la clave nueva (una vez); la app deja de conectar hasta cargarla; los modelos nuevos figuran en el panel de OpenRouter |
+| 117 | Con Tailscale caído en el servidor al desplegar, y luego levantarlo y re-ejecutar el módulo | La primera vez solo publica en la LAN y lo avisa; al re-ejecutar publica también en la IP de Tailscale |
+| 118 | Reiniciar el servidor | `hermes` vuelve solo (`restart: unless-stopped`); si arranca antes que Tailscale y no logra publicar en su IP, reaparece al reiniciar el contenedor o re-ejecutar el módulo (anotar si pasa) |
+
 ### Energía (correr primero)
 
 | # | Prueba | Resultado esperado |

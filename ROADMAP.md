@@ -758,6 +758,64 @@ si una tarea lo amerita, Hermes avisa y el usuario la abre en Claude Code.
       GitHub Releases. Verificar: chat con streaming y voz fuera de casa con
       Tailscale encendido; con Tailscale apagado no responde.
 
+**Implementación (módulo `hermes`, pendiente de validar en el M70q) y hechos
+verificados el 2026-10-16** (fuentes: documentación oficial de Hermes —
+`user-guide/docker`, `configuration`, `security`, `features/api-server`,
+`features/web-dashboard`, `features/fallback-providers` —, plantilla de
+Dokploy `dokploy.com/templates/hermes`, Docker Hub, código v0.22.2 de
+`github.com/NousResearch/hermes-agent` y `openrouter.ai`):
+- Imagen **fijada a `nousresearch/hermes-agent:v0.22.2`** (publicada el
+  2026-10-15; `latest` y `stable` apuntan a la misma, pasó la compuerta de
+  versión estable; reemplaza a v0.22.1, "construida desde el commit
+  equivocado"). La plantilla de Dokploy usa `v2026.6.19` (más vieja). Se
+  actualiza cambiando la línea de `compose/hermes/docker-compose.yml`.
+- Variables: `API_SERVER_ENABLED/HOST/PORT/KEY` (clave obligatoria, mínimo 8
+  caracteres; da acceso a todas las herramientas, incluida la terminal),
+  `HERMES_DASHBOARD=1`, `HERMES_DASHBOARD_BASIC_AUTH_USERNAME/PASSWORD/SECRET`
+  (con bind no-loopback el dashboard se niega a arrancar sin autenticación;
+  el proveedor basic es solo para redes de confianza o VPN),
+  `HERMES_UID/HERMES_GID`, `OPENROUTER_API_KEY`. La imagen arranca con
+  s6-overlay y baja a ese uid; `gateway run` como root se rechaza.
+- Valores por defecto que **no** son los deseados y por eso se fijan en el
+  `config.yaml` sembrado: `approvals.mode` es `smart` (se fija `manual`);
+  `security.website_blocklist.enabled` es `false` (se activa); la protección
+  SSRF (`security.allow_private_urls: false`) ya viene activa y bloquea
+  también el rango CGNAT de Tailscale.
+- Tareas auxiliares que usan un LLM en v0.22.2 (`DEFAULT_CONFIG["auxiliary"]`):
+  `vision`, `compression`, `skills_hub`, `approval`, `review`, `mcp`,
+  `title_generation`, `memory_query_rewrite`, `tts_audio_tags`, `voice_chat`,
+  `triage_specifier`, `kanban_decomposer`, `profile_describer`, `goal_judge`,
+  `curator`, `monitor`, `background_review`, `moa_reference`,
+  `moa_aggregator` (`web_extract` y `session_search` ya no usan un LLM). El
+  módulo fija las 19 a `provider: openrouter` + el modelo auxiliar barato.
+  Esta lista debe revisarse al actualizar la imagen.
+- Modelos propuestos por defecto (precios de OpenRouter al 2026-10-16, por
+  millón de tokens): principal `deepseek/deepseek-v4.1-flash` (0,032 USD de
+  entrada / 0,144 de salida, contexto 1M, herramientas, texto+imagen);
+  auxiliar y respaldo `qwen/qwen3.7-flash` (0,03 / 0,13; 0,10 / 0,40 sobre 32k
+  de prompt; herramientas, texto+imagen+video). Ambos editables en el cuadro
+  de entrada; el módulo valida solo la forma `autor/modelo`.
+- Las plataformas sin canal de aprobación (`api_server`, webhook) usan
+  `approvals.unattended_mode` (por defecto `deny`): con hermes-android y
+  `manual` un comando peligroso se **bloquea** en vez de preguntar, salvo que
+  la app use el canal `POST /v1/runs/{id}/approval` (el README de
+  hermes-android menciona aprobaciones nativas). A confirmar en la prueba
+  111 de `docs/VALIDACION.md`.
+- Sin verificar: que `openrouter.ai` permita reinicio **mensual** del límite de
+  una clave (la documentación solo describe `limit` y `limit_reset` sin listar
+  valores); que `data_collection: deny` deje al menos un proveedor disponible
+  para cada modelo elegido (la API pública no expone la política de datos por
+  proveedor; si no queda ninguno, OpenRouter responde error y se usa el
+  respaldo); que `hermes config set` acepte rutas `auxiliary.<tarea>.model`
+  (se usa solo al cambiar modelos en una re-ejecución).
+- Diseño: puertos publicados solo en la IP de LAN y la de Tailscale (compose
+  "docker-compose", no "stack"); conviene una reserva DHCP para la IP de la
+  LAN, y si cambia alguna IP basta volver a correr el módulo. Si el servidor
+  arranca antes que Tailscale, Docker no puede publicar en esa IP hasta que
+  exista (se reintenta por `restart: unless-stopped`). `no-new-privileges` y
+  `cap_drop` no se fijan: el entrypoint necesita ajustar permisos de
+  `/opt/data` al arrancar y no se probó (candidato a endurecimiento en el M70q).
+
 #### v2.6b — Modelos y costo
 - [ ] OpenRouter: clave propia **con límite de gasto mensual en la clave**
       (monto pendiente de decidir por el usuario) y `data_collection: deny`.
