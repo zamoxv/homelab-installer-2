@@ -70,6 +70,11 @@ HERMES_SYSTEMD_DIR="${HLI2_SYSTEMD_DIR:-/etc/systemd/system}"
 HERMES_DOCKER_DROPIN_DIR="${HLI2_DOCKER_DROPIN_DIR:-/etc/systemd/system/docker.service.d}"
 HERMES_SYSCTL_DIR="${HLI2_SYSCTL_DIR:-/etc/sysctl.d}"
 HERMES_DEFAULT_AUX_MODEL="qwen/qwen3.7-flash"
+# Lista de excepciones del aislamiento de salida (v2.6c): líneas 'ip:puerto/proto'
+# (root-only, junto a los secretos). La lee hli2-hermes-egress en cada 'apply'
+# y las incorpora a la construcción atómica de las cadenas. Solo se aceptan
+# destinos dentro de la propia subred del contenedor (nunca la LAN).
+HERMES_EGRESS_ALLOW_FILE="${SECRETS_DIR}/hermes-egress-allow.conf"
 
 # Tareas auxiliares de Hermes v0.22.2 que usan un LLM
 # (DEFAULT_CONFIG["auxiliary"]); web_extract y session_search ya no lo usan.
@@ -552,11 +557,20 @@ _hermes_validate_subnet() {
 #   del código dice que el demonio "does not delete or modify any pre-existing
 #   rules from the DOCKER-USER filter chain". La documentación publicada de
 #   Docker no lo afirma de forma explícita (no verificado en la doc).
-# - Hook para permitir un destino local concreto (por ejemplo Ollama en
-#   v2.6c): agregar reglas ACCEPT a la cadena HLI2-HERMES-ALLOW, que 'apply' no
-#   reconstruye (pero 'remove' SÍ la vacía y la borra), p. ej.
-#   iptables -A HLI2-HERMES-ALLOW -d <ip> -p tcp --dport 11434 -j ACCEPT
-#   (persistir con un script propio After= de esta unidad).
+# - Excepciones (v2.6c, Ollama): el archivo $HERMES_EGRESS_ALLOW_FILE
+#   (root-only) lista destinos 'ip:puerto/proto'. 'apply' los valida UNO POR
+#   UNO (IPv4 de la propia subred del contenedor, ni .0, .1 ni .255; puerto
+#   1-65535; tcp o udp) y agrega un ACCEPT por cada uno DENTRO de la
+#   construcción atómica de cada cadena (antes del hook), así que sobreviven a
+#   reinicios y a cada 'apply'. Una línea inválida se ignora con un aviso (nunca
+#   se abre una excepción por una línea dudosa). Además queda el hook
+#   HLI2-HERMES-ALLOW para reglas manuales: 'apply' no la reconstruye y
+#   'remove' SÍ la vacía y la borra.
+#   Razonamiento sobre el tráfico dentro del mismo puente: pasa por FORWARD (y
+#   por DOCKER-USER) solo si br_netfilter está activo (bridge-nf-call-iptables=1).
+#   Si lo está, el DROP hacia 10.0.0.0/8 bloquearía a Hermes -> Ollama (están en
+#   10.x), así que la excepción es necesaria; si no lo está, la regla es
+#   inocua. No se verificó en el servidor cuál es el caso.
 # - DNS: el contenedor usa los servidores de 'dns:' del compose (el DNS de la
 #   LAN solo si AdGuard está instalado, o resolvers públicos); el DNS interno
 #   de Docker (127.0.0.11) vive dentro del contenedor y reenvía a esos.
@@ -574,6 +588,7 @@ set -euo pipefail
 IPT="\${HLI2_IPTABLES:-/usr/sbin/iptables}"
 SUBNET="${subnet}"
 DNS_HOSTS="${dns_hosts}"
+ALLOW_FILE="${HERMES_EGRESS_ALLOW_FILE}"
 BLOCKED="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4"
 
 ipt() { "\$IPT" -w "\$@"; }
@@ -590,10 +605,35 @@ delete_jumps() {
   done < <(ipt -S "\$1" 2>/dev/null || true)
 }
 
+# Excepciones válidas de \$ALLOW_FILE, una por línea: "ip puerto proto". Solo
+# destinos dentro de la subred del contenedor (nunca la LAN), host entre .2 y
+# .254; lo demás se ignora con un aviso.
+allow_rules() {
+  local line a b c d port proto
+  [[ -r "\$ALLOW_FILE" ]] || return 0
+  while IFS= read -r line || [[ -n "\$line" ]]; do
+    line="\${line%%#*}"
+    line="\${line//[[:space:]]/}"
+    [[ -n "\$line" ]] || continue
+    if [[ "\$line" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3}):([0-9]{1,5})/(tcp|udp)\$ ]]; then
+      a=\$((10#\${BASH_REMATCH[1]})); b=\$((10#\${BASH_REMATCH[2]})); c=\$((10#\${BASH_REMATCH[3]})); d=\$((10#\${BASH_REMATCH[4]}))
+      port=\$((10#\${BASH_REMATCH[5]})); proto="\${BASH_REMATCH[6]}"
+      if (( a <= 255 && b <= 255 && c <= 255 && d >= 2 && d <= 254 && port >= 1 && port <= 65535 )) && [[ "\$a.\$b.\$c" == "\${SUBNET%.*}" ]]; then
+        printf '%s %s %s\\n' "\$a.\$b.\$c.\$d" "\$port" "\$proto"
+        continue
+      fi
+    fi
+    echo "hli2-hermes-egress: excepción ignorada en \$ALLOW_FILE: \$line" >&2
+  done < "\$ALLOW_FILE"
+}
+
 fill_chain() {
-  local chain="\$1" kind="\$2" d r
+  local chain="\$1" kind="\$2" d r ip port proto
   ipt -N "\$chain"
   ipt -A "\$chain" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  while read -r ip port proto; do
+    ipt -A "\$chain" -d "\$ip" -p "\$proto" --dport "\$port" -j ACCEPT
+  done < <(allow_rules)
   ipt -A "\$chain" -j HLI2-HERMES-ALLOW
   for d in \$DNS_HOSTS; do
     ipt -A "\$chain" -d "\$d" -p udp --dport 53 -j ACCEPT
@@ -724,6 +764,49 @@ _hermes_install_egress() {
     return 1
   fi
   log "Aislamiento de salida de Hermes aplicado (subred $subnet)."
+}
+
+# --- Lista de excepciones del aislamiento (v2.6c) -------------------------------------
+
+# ¿$1 es una excepción válida 'ip:puerto/proto' dentro de la subred $2
+# (a.b.c.0/24)? Mismas reglas que aplica hli2-hermes-egress al leer el
+# archivo: IPv4 canónica (sin ceros a la izquierda) de la propia subred, host
+# entre .2 y .254 (.1 es la puerta de enlace = el propio servidor), puerto
+# 1-65535, tcp o udp. Nunca una IP de la LAN.
+_hermes_valid_allow_entry() {
+  local entry="$1" subnet="$2" ip port
+  [[ "$entry" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3}):([0-9]{1,5})/(tcp|udp)$ ]] || return 1
+  local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}" c="${BASH_REMATCH[3]}" d="${BASH_REMATCH[4]}" p="${BASH_REMATCH[5]}"
+  [[ "$a" != 0?* && "$b" != 0?* && "$c" != 0?* && "$d" != 0?* && "$p" != 0* ]] || return 1
+  (( a <= 255 && b <= 255 && c <= 255 && d >= 2 && d <= 254 && p >= 1 && p <= 65535 )) || return 1
+  ip="${a}.${b}.${c}"
+  [[ "$subnet" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})\.0/24$ ]] || return 1
+  [[ "$ip" == "${BASH_REMATCH[1]}" ]]
+}
+
+# Agrega la excepción $1 al archivo (root-only 0600 en $SECRETS_DIR) si no
+# estaba. Valida contra la subred $2. No toca el resto del archivo. Deja
+# H_ALLOW_CHANGED en 1/0.
+H_ALLOW_CHANGED=0
+_hermes_allow_add() {
+  local entry="$1" subnet="$2" f content="" line
+  H_ALLOW_CHANGED=0
+  _hermes_valid_allow_entry "$entry" "$subnet" || { echo "ERROR: excepción no válida o fuera de la subred de Hermes: '$entry'." >&2; return 1; }
+  f="$HERMES_EGRESS_ALLOW_FILE"
+  if priv_file_exists "$f"; then
+    content="$(priv_file_read "$f")" || return 1
+    while IFS= read -r line; do
+      [[ "$line" == "$entry" ]] && return 0
+    done <<<"$content"
+  else
+    content="# Excepciones del aislamiento de salida de Hermes (HLI 2).
+# Una por línea: ip:puerto/proto. Solo destinos dentro de la subred de Hermes.
+# La lee hli2-hermes-egress en cada 'apply'."
+  fi
+  sudo install -d -m 0700 -o root -g root "$SECRETS_DIR" || return 1
+  sudo install -m 0600 -o root -g root /dev/null "$f" || return 1
+  printf '%s\n%s\n' "$content" "$entry" | sudo tee "$f" >/dev/null || return 1
+  H_ALLOW_CHANGED=1
 }
 
 # --- Publicación en la IP de Tailscale tras un reinicio ---------------------------------
