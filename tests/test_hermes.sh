@@ -868,3 +868,37 @@ test_hermes_no_warning_when_only_own_network() {
   bash "$REPO_ROOT/modules/hermes.sh" || return 1
   assert_not_contains "$(_hm_dialog_text)" "ATENCIÓN" || return 1
 }
+
+# AdGuard con "Allowed clients" que no incluye la red de Hermes: el módulo
+# avisa (sin esto Hermes no resuelve nombres; visto en el M70q).
+_hm_adguard_with_clients() {
+  echo "adguard" >> "$STATE_FILE"
+  mkdir -p "$APPDATA_ROOT/adguard/conf"
+  {
+    echo "dns:"
+    echo "  bind_hosts:"
+    echo "    - 0.0.0.0"
+    echo "  allowed_clients:"
+    local c; for c in "$@"; do echo "    - $c"; done
+    echo "  disallowed_clients: []"
+  } > "$APPDATA_ROOT/adguard/conf/AdGuardHome.yaml"
+}
+
+test_hermes_warns_when_adguard_acl_excludes_subnet() {
+  _hm_setup
+  _hm_first_run_queues
+  _hm_adguard_with_clients 192.168.99.0/24 100.64.0.0/10
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_contains "$(_hm_dialog_text)" "Allowed clients" "aviso de la lista de AdGuard" || return 1
+  assert_contains "$(_hm_dialog_text)" "$_HM_SUBNET" || return 1
+}
+
+test_hermes_no_acl_warning_when_subnet_allowed() {
+  _hm_setup
+  _hm_first_run_queues
+  _hm_adguard_with_clients 192.168.99.0/24 "$_HM_SUBNET"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  if _hm_dialog_text | grep -qF "Allowed clients"; then
+    fail "no debe avisar si la red de Hermes ya está permitida"; return 1
+  fi
+}

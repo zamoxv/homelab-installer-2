@@ -439,6 +439,25 @@ _hermes_prefix_overlap() {
   (( s1 <= e2 && s2 <= e1 ))
 }
 
+# AdGuard con "Allowed clients" (dns.allowed_clients no vacío) rechaza a todo
+# cliente fuera de la lista, y las consultas de Hermes salen de su propia
+# subred $1: sin agregarla, el contenedor no resuelve nombres y no llega a
+# OpenRouter (pasó en el M70q, 2026-10-18). Solo avisa: tocar AdGuardHome.yaml
+# exige reiniciar AdGuard (corte de DNS para toda la casa).
+_hermes_adguard_acl_check() {
+  local subnet="$1" yaml="$APPDATA_ROOT/adguard/conf/AdGuardHome.yaml" content clients
+  content="$(priv_file_read "$yaml" 2>/dev/null)" || return 0
+  clients="$(printf '%s\n' "$content" | awk '
+    /^[[:space:]]*allowed_clients:/ { inlist=1; if ($0 ~ /\[\]/) inlist=0; next }
+    inlist && /^[[:space:]]*-[[:space:]]/ { sub(/^[[:space:]]*-[[:space:]]*/, ""); gsub(/["'\'']/, ""); print; next }
+    inlist && /^[[:space:]]*[^[:space:]-]/ { inlist=0 }
+  ')"
+  [[ -n "$clients" ]] || return 0
+  if ! printf '%s\n' "$clients" | grep -qxF "$subnet"; then
+    msg "AdGuard Home tiene una lista de 'Allowed clients' y no incluye la red de Hermes ($subnet).\n\nSin agregarla, Hermes no puede resolver nombres ni llegar a OpenRouter (responde 'Your request was not processed').\n\nEn AdGuard: Settings -> DNS settings -> Access settings -> Allowed clients, agregue una línea:\n\n$subnet\n\ny guarde."
+  fi
+}
+
 # Valida la subred $1 de la red del contenedor ANTES de instalar nada:
 # a.b.c.0/24 con octetos numéricos, solo RFC 1918 (queda fuera 127/8,
 # 100.64/10, 169.254/16 y todo lo público), sin contener la IP de la LAN $2 y
@@ -878,6 +897,7 @@ _hermes_main() {
   local dns_csv
   if is_done adguard; then
     dns_csv="$lan_ip"
+    _hermes_adguard_acl_check "$HERMES_SUBNET"
   else
     dns_csv="1.1.1.1,9.9.9.9"
   fi
