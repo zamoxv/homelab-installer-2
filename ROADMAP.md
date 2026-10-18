@@ -924,16 +924,50 @@ Dokploy `dokploy.com/templates/hermes`, Docker Hub, código v0.22.2 de
 - [ ] Medición: una semana de uso real y revisión del gasto por modelo en
       OpenRouter antes de ajustar niveles o el tope.
 
-#### v2.6c — IA local
-- [ ] Ollama (o llama.cpp) como contenedor en Dokploy. Primero **medir** en el
-      M70q (i5-12400T, 32 GB, sin GPU dedicada) modelos de 3–4 mil millones
-      de parámetros con soporte de herramientas (p. ej. Gemma 4 E4B, Qwen3.5
-      4B, Granite 4.1 3B, Phi-4-mini): tokens/s de generación y de lectura
-      del contexto.
-- [ ] Uso previsto: tareas auxiliares y de fondo (clasificar, resumir,
-      recordatorios), no como cerebro principal (en CPU, el contexto grande de
-      un agente haría cada respuesta muy lenta). BitNet descartado como
-      cerebro: no hay evidencia de soporte de herramientas.
+#### v2.6c — IA local (Ollama) como cerebro privado opcional
+
+**Medición en el M70q (2026-10-18, Ollama en CPU, i5-12400T, 32 GB):**
+
+| Modelo | Lectura (contexto de 2.419 tokens) | Escritura |
+|---|---|---|
+| `gemma4:e4b` | 54 tokens/s (45 s) | 12–16 tokens/s |
+| `gemma4:e2b` | 103 tokens/s (23 s) | 26 tokens/s |
+
+Con el "pensamiento" del modelo activado, 5 frases tardaron 45 s (85 % en
+razonamiento): para tareas de fondo se apaga (`think: false`).
+
+**Decisión del usuario:** el modelo local también puede ser **cerebro de
+Hermes** (no solo trabajador de fondo): la espera no le importa y gana
+privacidad total y costo cero. Se elige el cerebro **por conversación**
+(hermes-android permite elegir modelo por chat): local para lo privado o sin
+apuro, OpenRouter para lo urgente o difícil. Ollama guarda en caché el
+contexto ya leído, así que la espera larga es sobre todo el primer mensaje
+de cada conversación (a medir).
+
+- [x] Medición de velocidad (tabla de arriba).
+- [ ] Módulo `ollama` (Dokploy, imagen fijada por versión/digest), modelos
+      en `/srv/appdata/ollama` (excluidos del backup: se vuelven a descargar),
+      sin puertos publicados en el host (solo alcanzable desde Hermes).
+- [ ] Límite de CPU/RAM del contenedor (y `num_thread`) para que, mientras
+      piensa, no deje sin recursos a AdGuard (DNS de la casa), Home Assistant
+      y el resto.
+- [ ] Ventana de contexto explícita (`num_ctx` amplio, p. ej. 32k): por
+      defecto Ollama usa una ventana chica y **corta el contexto sin avisar**,
+      fatal para un agente.
+- [ ] Hermes: Ollama como proveedor compatible con OpenAI (modelo local
+      seleccionable por chat), tiempos de espera largos para que una
+      respuesta lenta no se trate como error, y sin respaldo automático a
+      OpenRouter en los chats locales (si no, se pierde la privacidad sin
+      que el usuario lo note).
+- [ ] Firewall de Hermes: una única excepción en `HLI2-HERMES-ALLOW` hacia la
+      IP/puerto de Ollama (el resto de la LAN sigue bloqueado).
+- [ ] Modelos: `gemma4:e4b` como cerebro local (mejor calidad para
+      herramientas) y `gemma4:e2b` para tareas de fondo rápidas.
+- [ ] **Prueba que decide:** tareas reales con herramientas desde un chat
+      local (buscar en la web, crear un recordatorio, leer el informe del
+      servidor de v2.6d). Si las hace bien, queda como cerebro opcional; si
+      no, solo trabajador de fondo. BitNet sigue descartado (sin evidencia de
+      soporte de herramientas).
 
 #### v2.6d — Diagnóstico del servidor (solo lectura)
 - [ ] Timer del HLI (cada 5 min) que genera un **informe filtrado**: estado de
