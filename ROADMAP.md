@@ -730,29 +730,29 @@ Hermes no invoca a Claude Code (sería usar la suscripción desde un tercero);
 si una tarea lo amerita, Hermes avisa y el usuario la abre en Claude Code.
 
 #### v2.6a — Hermes base
-- [ ] Compose en Dokploy (proyecto propio) partiendo de la plantilla oficial de
+- [x] Compose en Dokploy (proyecto propio) partiendo de la plantilla oficial de
       Dokploy: imagen `nousresearch/hermes-agent` **fijada a una versión**
       (`X.Y.Z` o digest), `command: gateway run`, datos en
       `/srv/appdata/hermes` → `/opt/data` (bind, ext4), `HERMES_UID/GID`
       coherentes con el dueño de la carpeta, `restart: unless-stopped`,
       `shm_size: 1g` (navegador), límites 4 GB / 2 CPU.
-- [ ] Aislamiento: **sin** socket de Docker (descarta el backend de terminal
+- [x] Aislamiento: **sin** socket de Docker (descarta el backend de terminal
       `docker`: equivale a root en el host), sin montar `/srv` ni el home, sin
       red del host, nunca como root. La frontera es el contenedor
       (`terminal.backend: local`).
-- [ ] API (8642, `API_SERVER_ENABLED`, `API_SERVER_HOST=0.0.0.0` dentro del
+- [x] API (8642, `API_SERVER_ENABLED`, `API_SERVER_HOST=0.0.0.0` dentro del
       contenedor, `API_SERVER_KEY` de 64 hex): la clave equivale a control total
       del agente → secreto root-only en `/etc/hli2`, publicada en el host solo
       en las IPs de LAN y Tailscale (nunca `0.0.0.0` del host, nunca por el
       túnel ni el router).
-- [ ] Dashboard (9119) con autenticación obligatoria (basic auth con
+- [x] Dashboard (9119) con autenticación obligatoria (basic auth con
       `HERMES_DASHBOARD_BASIC_AUTH_SECRET`), mismo criterio de exposición.
-- [ ] Aprobaciones: arrancar con `approvals.mode: manual`; pasar a `smart`
+- [x] Aprobaciones: arrancar con `approvals.mode: manual`; pasar a `smart`
       cuando haya confianza. `security.website_blocklist` y protección SSRF
       activas.
-- [ ] Backup: registrar `hermes` en `/etc/hli2.d/services` (tipo con parada:
+- [x] Backup: registrar `hermes` en `/etc/hli2.d/services` (tipo con parada:
       usa SQLite) para que entre en el backup nocturno.
-- [ ] Canal principal **[hermes-android](https://github.com/rusty4444/hermes-android)**
+- [x] Canal principal **[hermes-android](https://github.com/rusty4444/hermes-android)**
       (Android; Hermex es solo iOS): habla con la API 8642 y opcionalmente con
       el dashboard. Solo por Tailscale/LAN (el propio README lo exige). APK de
       GitHub Releases. Verificar: chat con streaming y voz fuera de casa con
@@ -900,6 +900,14 @@ Dokploy `dokploy.com/templates/hermes`, Docker Hub, código v0.22.2 de
   arranca antes que Tailscale, Docker no puede publicar en esa IP hasta que
   exista (el módulo instala el drop-in de Docker descrito arriba; además se
   reintenta por `restart: unless-stopped`).
+- [x] **Validado en el M70q (2026-10-18)**: hermes-android responde por
+      Tailscale (con Tailscale apagado no conecta), aislamiento de salida
+      verificado (`curl` del contenedor a `<IP LAN>:3000` → timeout), reinicio
+      del servidor sin intervención (Hermes y el resto vuelven solos).
+      Errores reales corregidos en la validación: `pids_limit` duplicado que
+      Compose v2 rechaza, clave de API cortada en el textbox y AdGuard
+      rechazando la red de Hermes por su lista de "Allowed clients" (el
+      módulo ahora avisa).
 
 #### v2.6b — Modelos y costo
 - [ ] OpenRouter: clave propia **con límite de gasto mensual en la clave**
