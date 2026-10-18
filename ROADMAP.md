@@ -945,29 +945,137 @@ contexto ya leído, así que la espera larga es sobre todo el primer mensaje
 de cada conversación (a medir).
 
 - [x] Medición de velocidad (tabla de arriba).
-- [ ] Módulo `ollama` (Dokploy, imagen fijada por versión/digest), modelos
-      en `/srv/appdata/ollama` (excluidos del backup: se vuelven a descargar),
-      sin puertos publicados en el host (solo alcanzable desde Hermes).
-- [ ] Límite de CPU/RAM del contenedor (y `num_thread`) para que, mientras
-      piensa, no deje sin recursos a AdGuard (DNS de la casa), Home Assistant
-      y el resto.
-- [ ] Ventana de contexto explícita (`num_ctx` amplio, p. ej. 32k): por
-      defecto Ollama usa una ventana chica y **corta el contexto sin avisar**,
-      fatal para un agente.
-- [ ] Hermes: Ollama como proveedor compatible con OpenAI (modelo local
-      seleccionable por chat), tiempos de espera largos para que una
-      respuesta lenta no se trate como error, y sin respaldo automático a
-      OpenRouter en los chats locales (si no, se pierde la privacidad sin
-      que el usuario lo note).
-- [ ] Firewall de Hermes: una única excepción en `HLI2-HERMES-ALLOW` hacia la
-      IP/puerto de Ollama (el resto de la LAN sigue bloqueado).
-- [ ] Modelos: `gemma4:e4b` como cerebro local (mejor calidad para
+- [x] Módulo `ollama` (Dokploy, imagen fijada por versión y digest), modelos en
+      `/srv/appdata/ollama` (excluidos del backup: se vuelven a descargar), sin
+      puertos publicados en el host (solo alcanzable desde Hermes).
+- [x] Límite de CPU/RAM del contenedor (8 CPU, 20 GB) para que, mientras
+      piensa, no deje sin recursos a AdGuard (DNS de la casa), Home Assistant y
+      el resto. `num_thread` no se fija: no existe variable de entorno para
+      ello; el límite del contenedor es el que protege.
+- [x] Ventana de contexto explícita: `OLLAMA_CONTEXT_LENGTH=65536` en el
+      servidor (**64k, no 32k**: Hermes exige al menos 64.000 tokens y rechaza
+      ventanas menores). Por defecto Ollama usa una ventana chica y **corta el
+      contexto sin avisar**, fatal para un agente.
+- [x] Hermes: Ollama como proveedor compatible con OpenAI (modelo local
+      seleccionable por chat), tiempos de espera largos (1 h) y, ofrecido por
+      el módulo, sin respaldo automático a OpenRouter (ver el hallazgo de
+      privacidad abajo).
+- [x] Firewall de Hermes: una única excepción hacia la IP/puerto de Ollama
+      (el resto de la LAN sigue bloqueado), persistida en una lista root-only
+      que lee `hli2-hermes-egress`.
+- [x] Modelos: `gemma4:e4b` como cerebro local (mejor calidad para
       herramientas) y `gemma4:e2b` para tareas de fondo rápidas.
+- [ ] **Validar en el M70q** (pruebas 130-151 de `docs/VALIDACION.md`).
 - [ ] **Prueba que decide:** tareas reales con herramientas desde un chat
       local (buscar en la web, crear un recordatorio, leer el informe del
       servidor de v2.6d). Si las hace bien, queda como cerebro opcional; si
       no, solo trabajador de fondo. BitNet sigue descartado (sin evidencia de
       soporte de herramientas).
+
+**Implementación (módulo `ollama`, pendiente de validar en el M70q) y hechos
+verificados el 2026-10-18** (fuentes: Docker Hub y GitHub de `ollama/ollama`,
+`docs.ollama.com` — `faq`, `api/openai-compatibility` —, `ollama.com/library/gemma4/tags`,
+código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
+`integrations/providers`, `user-guide/configuration`,
+`user-guide/features/api-server`, `.../fallback-providers`):
+- Imagen **`ollama/ollama:0.40.6`** (publicada el 2026-10-17 en Docker Hub; el
+  release de GitHub `v0.40.6` es del 2026-10-16 y no es prerelease; existe una
+  `0.40.7-rc0` que se descarta), fijada también por digest de la lista de
+  manifiestos (amd64+arm64): `sha256:265409e1…`. Se actualiza cambiando
+  etiqueta y digest juntos en `compose/ollama/docker-compose.yml`.
+- Variables (código `envconfig/config.go` v0.40.6 y FAQ): `OLLAMA_HOST`,
+  `OLLAMA_KEEP_ALIVE` (30m), `OLLAMA_NUM_PARALLEL` (1), `OLLAMA_MAX_LOADED_MODELS`
+  (1: Hermes solo usa `e4b`; las tareas auxiliares siguen en OpenRouter; con dos
+  modelos alternándose se recargaría uno desde el disco y se perdería su caché de
+  contexto) y `OLLAMA_CONTEXT_LENGTH`. La documentación dice que la API
+  compatible con OpenAI **no puede fijar `num_ctx` por petición**, pero
+  `api.DefaultOptions` toma `OLLAMA_CONTEXT_LENGTH` (código `api/types.go`), así
+  que el valor del servidor rige también en `/v1/chat/completions` y **no hace
+  falta un modelo derivado con Modelfile**.
+- Etiquetas `gemma4:e4b` (6,6 GB) y `gemma4:e2b` (4,6 GB) confirmadas en
+  `ollama.com/library/gemma4/tags`; contexto máximo del modelo 128K.
+- "Pensamiento" (`think`): por la API compatible con OpenAI se apaga con
+  `reasoning_effort: "none"` (`openai/openai.go`: `ThinkingFromReasoningEffort`
+  lo mapea a `think=false`). Hermes envía `reasoning_effort` a los endpoints
+  locales (por defecto `medium`) y permite fijarlo por modelo con
+  `agent.reasoning_overrides`; el módulo lo fija en **desactivado** para `e4b` y
+  `e2b` (medido: con pensamiento, 85 % del tiempo era razonamiento). Ojo:
+  `hermes config set … none` guarda `null` (`_SCALAR_WORDS`), por eso se escribe
+  `false`. A probar (prueba 145): si la calidad con herramientas mejora con
+  `medium`.
+- Hermes: proveedor nombrado `providers.ollama-local` (clave `api`,
+  `models.<modelo>.context_length`, `request_timeout_seconds` y
+  `stale_timeout_seconds` = 3600 s: por defecto un flujo sin eventos se corta a
+  los 180 s). Los modelos locales se ofrecen por **dos vías** (la app
+  hermes-android documenta la selección por chat sobre el puerto 8642 sin
+  precisar el endpoint): `platforms.api_server.model_routes` (alias
+  `gemma4-e4b-local` y `gemma4-e2b-local`; `/v1/models` los lista, verificado en
+  `_handle_models` de v0.22.2) y `providers:` (`/api/model/options` los lista,
+  `hermes_cli/inventory.py`). Cada ruta lleva `api_key` ficticia: sin ella el
+  cliente usaría la clave de OpenRouter contra Ollama. El modelo por defecto no
+  se toca.
+- **Hallazgo de privacidad (respaldo automático).** `fallback_providers` es
+  **global**: `GatewayRunner._load_fallback_model()` se pasa a todo agente de la
+  API de Hermes, incluidos los de rutas y proveedores locales, y la documentación
+  no ofrece un modo de excluir un proveedor. Se desactiva solo en una petición
+  con `require_model_lock: true` (el código la trata como "bloqueo confirmado":
+  `fallback_model=None`), que depende de la app cliente — no verificado si
+  hermes-android lo envía. Según la documentación se dispara con 429, 5xx, 401/403/404 y respuestas
+  vacías o inválidas repetidas (no verificado si un error de conexión, como
+  Ollama apagado, también lo dispara: se asume que sí). Consecuencia: **un chat
+  local que falle se reintentaría contra OpenRouter y la conversación saldría
+  de la casa**. Opción segura elegida: el módulo detecta si hay respaldo
+  configurado y **ofrece quitarlo** (`hermes fallback clear`, por defecto "Sí");
+  costo: el chat con el modelo por defecto da error si OpenRouter falla, en vez de
+  probar otro (se restituye con `hermes fallback add`). Si el usuario lo
+  rechaza, el mensaje final lo advierte. Las tareas auxiliares no pasan por
+  Ollama (siguen en OpenRouter): títulos o compresión de una charla local
+  llegan a OpenRouter (prueba 142). Si eso no es aceptable, apuntar esas tareas
+  a `ollama-local` con `hermes config set auxiliary.<tarea>.provider …`.
+- Red y firewall. Hermes vive en `hermes-net` (10.213.144.0/24, definida por el
+  compose de Hermes con solo la subred). El compose de Ollama la usa como red
+  **externa**; su nombre real lo toma el módulo de Docker (Dokploy le antepone el
+  proyecto; mismo criterio que `*hermes-net` de la verificación de redes de
+  Hermes). IP fija `.250` (configurable con `HLI2_OLLAMA_IP`, validada: dentro de
+  la subred, entre .2 y .254, y no usada por otro contenedor): el DHCP de Docker
+  asigna desde `.2` hacia arriba, así que con pocos contenedores nunca llega a
+  `.250`; no se cambió la red de Hermes (agregar `ip_range` obligaría a
+  recrearla). Sin Hermes, Ollama usa su propia red `ollama-net` y no hay
+  integración ni reglas (al instalar Hermes después, se vuelve a correr el módulo).
+- Excepción de firewall: `/etc/hli2/hermes-egress-allow.conf` (root 0600, líneas
+  `ip:puerto/proto`). `hli2-hermes-egress apply` valida cada línea (IPv4
+  canónica dentro de la subred de Hermes, host .2-.254, puerto 1-65535, tcp/udp;
+  una línea inválida se ignora con un aviso, nunca se abre por duda) y agrega un
+  ACCEPT por cada una **dentro de la construcción atómica** de las dos cadenas,
+  después de ESTABLISHED,RELATED y antes de los DROP. Al re-ejecutar `hermes` el
+  script se regenera, pero la lista persiste; el módulo `ollama` regenera
+  además el script con la versión nueva (una versión anterior no leía la lista).
+  El tráfico Hermes -> Ollama dentro del mismo puente pasa por FORWARD (y
+  `DOCKER-USER`) solo si `br_netfilter` está activo; si lo está, el DROP hacia
+  10/8 lo bloquearía, y si no, la regla es inocua. **No verificado** cuál es el
+  caso en el servidor (prueba 135). El archivo no se restaura con el restore
+  genérico (solo acepta `*.env`): tras un desastre basta volver a correr
+  `ollama`.
+- Endurecimiento: `no-new-privileges`, un único montaje, sin puertos, límite de
+  procesos (`pids: 512` en `deploy.resources.limits`, una sola vez; Compose v2
+  rechaza duplicados con `pids_limit`). Ollama corre como root dentro de su
+  imagen y los modelos ya descargados son de root, así que no se baja de root
+  (ni se usa `cap_drop`, para no arriesgar el arranque sin poder probarlo). Los
+  compose renderizados se validaron con `docker compose config`.
+- Registro: `services/ollama.conf` (contenedor, sin puerto, `BACKUP_KIND=none`,
+  **sin `SERVICE_DATA`**): el backup no incluye los modelos ni detiene el
+  contenedor. Se probó declarar la carpeta como dato con
+  `SERVICE_BACKUP_EXCLUDE`: el backup la omite, pero "restaurar todo" detenía y
+  reiniciaba el contenedor sin restaurar nada (falló `tests/test_restore.sh`),
+  así que se descartó.
+- Sin verificar: que la selección por chat de hermes-android use `/v1/models` o
+  `/api/model/options` (el módulo cubre las dos); que `hermes config set`
+  acepte todas las rutas anidadas (`providers.…models.gemma4:e4b.context_length`,
+  `platforms.api_server.model_routes.…`; el módulo verifica `/v1/models` y avisa
+  si faltan los alias); que el proveedor `ollama-local` se resuelva por nombre al
+  elegirlo en la app; el consumo real de memoria con 64k de contexto (límite de
+  20 GB); el binario `python` en `/opt/hermes/.venv/bin` usado para la prueba de
+  alcance (si falta, el módulo avisa pero no falla).
 
 #### v2.6d — Diagnóstico del servidor (solo lectura)
 - [ ] Timer del HLI (cada 5 min) que genera un **informe filtrado**: estado de

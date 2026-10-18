@@ -113,7 +113,10 @@ case "$url" in
     if [[ -n "${STUB_HERMES_MODELS_CODE:-}" ]]; then
       http_code="$STUB_HERMES_MODELS_CODE"
     elif grep -qF 'Authorization: Bearer ' <<<"${stdin_config:-}"; then
-      resp='{"data":[{"id":"hermes-agent"}]}'
+      resp='{"data":[{"id":"hermes-agent"}'
+      # STUB_HERMES_ALIASES: alias de model_routes que /v1/models también lista.
+      for a in ${STUB_HERMES_ALIASES:-}; do resp+=",{\"id\":\"$a\"}"; done
+      resp+=']}'
     else
       http_code=401
     fi

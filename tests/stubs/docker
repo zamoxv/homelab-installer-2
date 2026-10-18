@@ -84,6 +84,35 @@ fi
 
 # Redes de Docker para validar la subred de Hermes (modules/hermes.sh):
 # STUB_DOCKER_NETWORKS = líneas "<nombre> <subred> [<subred>...]".
+# 'network ls --format {{.Name}}' (módulo ollama): los nombres de esa lista.
+if [[ "${1:-}" == "network" && "${2:-}" == "ls" && "$*" == *"--format"* ]]; then
+  [[ -z "${STUB_DOCKER_NETWORKS:-}" ]] || awk '{print $1}' <<<"$STUB_DOCKER_NETWORKS"
+  exit 0
+fi
+# STUB_DOCKER_NET_CONTAINERS: líneas "<contenedor> <ip/prefijo>" de una red.
+if [[ "${1:-}" == "network" && "${2:-}" == "inspect" && "$*" == *"Containers"* ]]; then
+  [[ -z "${STUB_DOCKER_NET_CONTAINERS:-}" ]] || printf '%s\n' "$STUB_DOCKER_NET_CONTAINERS"
+  exit 0
+fi
+# Módulo ollama: 'docker exec' dentro de los contenedores ollama/hermes.
+# STUB_OLLAMA_MODELS: etiquetas ya descargadas; STUB_OLLAMA_PULL_FAIL=1: la
+# descarga falla; STUB_OLLAMA_REACH: código HTTP que "ve" Hermes al sondear a
+# Ollama (200 por defecto).
+if [[ "${1:-}" == "exec" ]]; then
+  case "$*" in
+    *"ollama ollama list"*)
+      printf 'NAME ID SIZE MODIFIED\n'
+      for m in ${STUB_OLLAMA_MODELS:-}; do printf '%s abc123 9.6 GB 2 days ago\n' "$m"; done
+      exit 0 ;;
+    *"ollama ollama pull"*)
+      [[ -n "${STUB_OLLAMA_PULL_FAIL:-}" ]] && exit 1
+      exit 0 ;;
+    *"/opt/hermes/.venv/bin/python"*)
+      echo "${STUB_OLLAMA_REACH:-200}"; exit 0 ;;
+    *"fallback clear"*)
+      cat >/dev/null 2>&1 || true; exit 0 ;;
+  esac
+fi
 if [[ "${1:-}" == "network" && "${2:-}" == "ls" ]]; then
   [[ -z "${STUB_DOCKER_NETWORKS:-}" ]] || echo "net1"
   exit 0

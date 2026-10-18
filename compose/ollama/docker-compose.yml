@@ -1,0 +1,77 @@
+# Plantilla renderizada por lib/compose.sh (compose_render_ollama).
+# Ollama (IA local), v2.6c: cerebro privado opcional de Hermes y trabajador
+# de fondo. Sin GPU: inferencia en CPU (medida en el M70q, ver ROADMAP v2.6c).
+#
+# Imagen FIJADA a 0.40.6 (publicada el 2026-10-16, última versión estable de
+# github.com/ollama/ollama/releases; la 0.40.7-rc0 es prerelease) Y por digest:
+# sha256:2654... es el digest de la lista de manifiestos (amd64 + arm64) de esa
+# etiqueta según la API de Docker Hub, verificado el 2026-10-18. Nunca
+# ':latest'. Para actualizar se cambian etiqueta y digest juntos y se vuelve a
+# correr el módulo.
+#
+# Variables de entorno (docs.ollama.com/faq y envconfig/config.go v0.40.6):
+# - OLLAMA_HOST: dirección de escucha DENTRO del contenedor (por defecto es
+#   127.0.0.1, inalcanzable desde otro contenedor). No hay puertos publicados
+#   en el host: solo se llega por la red compartida con Hermes.
+# - OLLAMA_CONTEXT_LENGTH: ventana de contexto por defecto del servidor. La API
+#   compatible con OpenAI NO permite fijar num_ctx por petición (la doc de
+#   Ollama lo dice), pero api.DefaultOptions toma este valor, así que sirve
+#   para /v1/chat/completions. Sin esto Ollama usa 4k/32k/256k según la VRAM y
+#   CORTA el contexto sin avisar. 65536: Hermes exige al menos 64.000 tokens
+#   de contexto para trabajar con herramientas y rechaza ventanas menores
+#   (MINIMUM_CONTEXT_LENGTH = 64_000 en agent/model_metadata.py v0.22.2).
+# - OLLAMA_NUM_PARALLEL=1: una petición a la vez (cada petición paralela
+#   multiplica el contexto en memoria).
+# - OLLAMA_MAX_LOADED_MODELS=1: un solo modelo cargado. Hermes solo usa
+#   gemma4:e4b (las tareas auxiliares siguen en OpenRouter); gemma4:e2b queda
+#   descargado para tareas de fondo, y alternar dos modelos recargaría uno desde
+#   el disco y perdería la caché de contexto del otro.
+# - OLLAMA_KEEP_ALIVE=30m: el modelo sigue cargado 30 minutos tras la última
+#   petición (por defecto 5): evita recargarlo entre mensajes.
+# No existe una variable de entorno para los hilos (num_thread): el límite de
+# CPU del contenedor (cpus) es el que protege a AdGuard y al resto.
+#
+# Red: UNA sola, según el módulo (ver compose_render_ollama):
+# - Con Hermes instalado: la red de Hermes ('hermes-net', externa, creada por el
+#   despliegue de Hermes; el nombre real lo resuelve el módulo) con IP fija
+#   dentro de su subred. Solo Hermes y Ollama están ahí.
+# - Sin Hermes: una red propia 'ollama-net', sin nadie más conectado.
+# Sin puertos, sin docker.sock, sin otros montajes: solo el directorio de modelos.
+# Ollama corre como root DENTRO de su imagen (así es la imagen oficial y los
+# modelos ya descargados pertenecen a root); se endurece con no-new-privileges.
+#
+# Límites (cada uno en UN solo lugar: Compose v2 rechaza valores duplicados
+# entre 'pids_limit' y deploy.resources.limits.pids): 8 CPU de 12 hilos y 20 GB
+# de RAM, para que mientras genera no deje sin recursos a AdGuard (DNS de la
+# casa), Home Assistant y el resto.
+services:
+  ollama:
+    image: ollama/ollama:0.40.6@sha256:265409e1d931028a8f7d5a32bcbafddd7bffbc6cc629d77efe9560adf692a5e7
+    container_name: ollama
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+__DNS_BLOCK__
+__SERVICE_NETWORKS__
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_CONTEXT_LENGTH=65536
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_KEEP_ALIVE=30m
+    volumes:
+      - __APPDATA__/ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 20G
+          cpus: "8"
+          pids: 512
+
+__NETWORK_DEFS__

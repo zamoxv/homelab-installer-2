@@ -374,6 +374,39 @@ API y la contraseña del dashboard en Vaultwarden.
 | 128 | `systemctl restart docker` y luego `sudo iptables -S INPUT \| head -3; sudo iptables -S DOCKER-USER` | Siguen los saltos a `HLI2-HERMES-IN` y `HLI2-HERMES-FWD` (los reaplica el drop-in `docker.service.d/hli2-hermes-egress.conf`); un solo salto de cada tipo |
 | 129 | Cambiar `HLI2_HERMES_SUBNET` a otra /24 y re-ejecutar `hermes` | No quedan saltos de la subred vieja (`sudo iptables -S INPUT \| grep HLI2` muestra solo la nueva); el aislamiento sigue (repetir 120 y 121) |
 
+### v2.6c — Ollama (IA local) como cerebro privado opcional
+
+Requisitos: `hermes` desplegado y validado (v2.6a), Dokploy y su API
+configurados, unos 11 GB libres en `/srv/appdata`. La carpeta
+`/srv/appdata/ollama` ya puede tener `gemma4:e4b` y `gemma4:e2b` (descargados a
+mano con un contenedor temporal): el módulo los reconoce y no los vuelve a
+bajar. `<IP Ollama>` es `10.213.144.250` (o la de `HLI2_OLLAMA_IP`).
+
+| # | Prueba | Resultado esperado |
+|---|---|---|
+| 130 | Módulo `ollama` (con Hermes ya instalado); responder "Sí" a quitar el respaldo automático | Despliega, muestra el progreso de las descargas en la terminal (no dentro del cuadro) solo de los modelos que falten y termina con el mensaje de cómo usarlo |
+| 131 | `sudo docker exec ollama ollama list` y `sudo docker exec ollama ollama ps` (tras un mensaje) | Ambos modelos listados; `ps` muestra `gemma4:e4b` cargado y la columna `CONTEXT` en `65536`; tras 30 minutos sin uso se descarga |
+| 132 | `docker inspect ollama --format '{{.HostConfig.Binds}} {{json .NetworkSettings.Networks}} {{json .HostConfig.PortBindings}} {{.HostConfig.SecurityOpt}}'` | Un único montaje `/srv/appdata/ollama:/root/.ollama`; una sola red (`…hermes-net`) con la IP fija; `PortBindings` vacío (`{}`); `no-new-privileges:true` |
+| 133 | `sudo ss -ltn \| grep 11434` y, desde otro equipo de la LAN, `curl -m 5 http://<IP LAN>:11434` | Nada escucha en el host; la conexión falla: Ollama no está publicado |
+| 134 | `sudo cat /etc/hli2/hermes-egress-allow.conf` y `sudo iptables -S HLI2-HERMES-FWD \| head` | El archivo tiene la línea `<IP Ollama>:11434/tcp`; la cadena tiene el ACCEPT `-d <IP Ollama> -p tcp --dport 11434` justo después de ESTABLISHED,RELATED y antes de los DROP |
+| 135 | Desde Hermes: `docker exec hermes curl -s -m 8 http://<IP Ollama>:11434/api/tags` (si la imagen no trae `curl`, usar `docker exec hermes /opt/hermes/.venv/bin/python -c "import urllib.request as u; print(u.urlopen('http://<IP Ollama>:11434/api/tags', timeout=8).status)"`) | Responde con los modelos. **Anotar** si funcionó también sin la excepción (`sudo iptables -D HLI2-HERMES-FWD …` y repetir, luego volver a aplicar con `sudo systemctl restart hli2-hermes-egress`): indica si `br_netfilter` aplica las reglas al tráfico dentro del puente |
+| 136 | Seguir con el aislamiento: `docker exec hermes curl -s -m 5 -o /dev/null -w '%{http_code}' http://<IP LAN>:3000` y `:3053`, `:8123` | Siguen fallando (la LAN continúa bloqueada) y `curl -m 5 https://openrouter.ai` desde Hermes sigue respondiendo |
+| 137 | `curl -s -H "Authorization: Bearer <clave>" http://<IP LAN>:8642/v1/models` | Lista `hermes-agent` y los alias `gemma4-e4b-local` y `gemma4-e2b-local` junto al modelo por defecto |
+| 138 | `curl -s -H "Authorization: Bearer <clave>" http://<IP LAN>:8642/api/model/options \| jq '.providers[] \| {slug, models}'` | Aparece el proveedor `ollama-local` con `gemma4:e4b` y `gemma4:e2b` junto a los de OpenRouter. **Anotar** si el selector de modelo de hermes-android usa esta lista o la de `/v1/models` |
+| 139 | `sudo bat /srv/appdata/hermes/config.yaml` (o `cat`) | Conserva todo lo que ya había (modelo por defecto de OpenRouter sin cambios) y agrega `providers.ollama-local` (con `request_timeout_seconds: 3600`), `platforms.api_server.model_routes` y `agent.reasoning_overrides` (`false`); si se aceptó, `fallback_providers: []` |
+| 140 | hermes-android: abrir un chat nuevo y elegir el modelo local (`gemma4:e4b`); enviar "hola" y **medir el tiempo hasta la primera respuesta**; luego un segundo mensaje y medirlo | El primer mensaje tarda (puede ser de varios minutos: Hermes envía instrucciones y herramientas, y la lectura va a ~54 tokens/s); el segundo es bastante más rápido (caché de contexto). Anotar ambos tiempos y que la app no corte por tiempo agotado |
+| 141 | Durante el chat anterior: `sudo docker exec ollama ollama ps` y `sudo docker logs --tail 30 ollama` | El modelo corre con `CONTEXT 65536`; sin mensajes de contexto recortado; el chat de OpenRouter (otro chat nuevo con el modelo por defecto) sigue funcionando |
+| 142 | **Privacidad**: en el panel de OpenRouter (openrouter.ai/activity) comparar el consumo antes y después de una conversación local entera | Ninguna llamada nueva por la conversación local (ni siquiera de títulos o compresión: están en OpenRouter, anotar si aparecen tareas auxiliares con contenido de la charla) |
+| 143 | **Respaldo**: con `fallback_providers: []`, parar Ollama (`sudo docker stop ollama`) y escribir en un chat local | La app muestra un error; OpenRouter no recibe nada. Volver a iniciar (`sudo docker start ollama`) |
+| 144 | Pruebas con herramientas desde un chat local: "busca en la web el clima de hoy en <ciudad>", "creame un recordatorio para mañana a las 9", "leé el archivo <ruta de /opt/data>" | Anotar por cada una: ¿usó la herramienta correcta? ¿el resultado es correcto? ¿cuánto tardó? Decide si queda como cerebro opcional o solo como trabajador de fondo |
+| 145 | Probar con y sin pensamiento: `docker exec -u $(id -u):$(id -g) hermes /opt/hermes/.venv/bin/hermes config set agent.reasoning_overrides.gemma4:e4b medium` y repetir 144 (volver a `false` después) | Anotar si la calidad con herramientas mejora y cuánto crece la latencia |
+| 146 | Límite de CPU: iniciar una generación larga ("escribí un cuento de 2000 palabras") y, mientras tanto, `dig @<IP LAN> example.com` varias veces y abrir Home Assistant | AdGuard sigue respondiendo el DNS sin demora notable; `docker stats --no-stream ollama` no pasa de ~800 % de CPU y 20 GB de memoria |
+| 147 | Reiniciar el servidor | `ollama` vuelve solo (`restart: unless-stopped`); la regla ACCEPT sigue en `HLI2-HERMES-FWD` (`sudo iptables -S HLI2-HERMES-FWD \| grep 11434`); el chat local funciona sin intervención |
+| 148 | Re-ejecutar `ollama` | No vuelve a descargar modelos; no pisa los tiempos de espera editados en `config.yaml` (solo actualiza las URL); no duplica la línea de `hermes-egress-allow.conf` |
+| 149 | Re-ejecutar `hermes` (sin cambiar nada) y luego `sudo iptables -S HLI2-HERMES-FWD \| grep 11434` | La excepción de Ollama sobrevive (el script se regenera pero lee el mismo archivo de excepciones) |
+| 150 | `sudo hli2-backup run` y `restic ls latest --tag full \| grep -c ollama` | `/srv/appdata/ollama` NO figura en la foto (ni local ni R2); el contenedor `ollama` no se detiene durante el backup |
+| 151 | Módulo `ollama` en un equipo sin Hermes | Despliega en su propia red `…ollama-net`, descarga los modelos, no toca iptables ni `config.yaml`, y avisa que falta Hermes |
+
 ### Energía (correr primero)
 
 | # | Prueba | Resultado esperado |

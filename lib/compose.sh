@@ -250,3 +250,54 @@ compose_render_hermes() {
     | _compose_subst "__DNS_LINES__" "$dns_lines" \
     | _compose_subst "__PORT_LINES__" "$port_lines"
 }
+
+# --- Ollama (IA local) -----------------------------------------------------------
+
+# Uso:
+#   compose_render_ollama standalone
+#   compose_render_ollama hermes <nombre real de la red de Hermes> <IP fija> <DNS: IPs separadas por comas>
+# 'standalone': red propia 'ollama-net' (sin nadie más conectado). 'hermes': se
+# une a la red externa de Hermes (creada por su despliegue; Dokploy le antepone
+# el nombre del proyecto, por eso el módulo pasa el nombre real) con una IP fija
+# de esa red y los mismos DNS que usa Hermes (el aislamiento de salida solo
+# permite DNS hacia ellos). Nada pasa por 'ports': Ollama nunca se publica.
+compose_render_ollama() {
+  local template="$SCRIPT_DIR/compose/ollama/docker-compose.yml" mode="${1:-}"
+  [[ -f "$template" ]] || { echo "ERROR: falta $template" >&2; return 1; }
+
+  local dns_block="" nets_block="" defs_block="" d
+  case "$mode" in
+    standalone)
+      nets_block=$'    networks:\n      - ollama-net'
+      defs_block=$'networks:\n  ollama-net:\n    driver: bridge'
+      ;;
+    hermes)
+      [[ $# -eq 4 ]] || { echo "ERROR: compose_render_ollama hermes necesita red, IP y DNS." >&2; return 1; }
+      local net="$2" ip="$3" dns_csv="$4"
+      if [[ ! "$net" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
+        echo "ERROR: nombre de red no válido: '$net'." >&2; return 1
+      fi
+      _compose_valid_ipv4 "$ip" || { echo "ERROR: IP no válida para Ollama: '$ip'." >&2; return 1; }
+      local -a dns_list
+      IFS=',' read -r -a dns_list <<<"$dns_csv"
+      [[ ${#dns_list[@]} -ge 1 ]] || { echo "ERROR: falta al menos un servidor DNS." >&2; return 1; }
+      dns_block="    dns:"
+      for d in "${dns_list[@]}"; do
+        _compose_valid_ipv4 "$d" || { echo "ERROR: servidor DNS no válido: '$d'." >&2; return 1; }
+        dns_block+=$'\n'"      - ${d}"
+      done
+      nets_block=$'    networks:\n      hermes-net:\n        ipv4_address: '"${ip}"
+      defs_block=$'networks:\n  hermes-net:\n    external: true\n    name: '"${net}"
+      ;;
+    *)
+      echo "ERROR: compose_render_ollama: modo '$mode' desconocido (standalone|hermes)." >&2
+      return 1
+      ;;
+  esac
+
+  cat "$template" \
+    | _compose_subst "__APPDATA__" "$APPDATA_ROOT" \
+    | _compose_subst "__DNS_BLOCK__" "$dns_block" \
+    | _compose_subst "__SERVICE_NETWORKS__" "$nets_block" \
+    | _compose_subst "__NETWORK_DEFS__" "$defs_block"
+}
