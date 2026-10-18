@@ -809,7 +809,10 @@ _hermes_show_credentials() {
     printf 'CREDENCIALES DE HERMES (se muestran UNA sola vez)\n\n'
     printf 'API (hermes-android)\n'
     printf '  Servidor: http://%s:8642\n' "${ts_ip:-<IP de Tailscale>}"
-    printf '  Clave de API: %s\n\n' "$H_API_KEY"
+    # La clave (64 caracteres) va sola en su línea: con el rótulo delante la
+    # línea superaba el ancho visible del textbox (76 - bordes) y dialog la
+    # cortaba sin avisar (en el M70q se copiaron ~10 caracteres de menos).
+    printf '  Clave de API:\n  %s\n\n' "$H_API_KEY"
     printf 'Dashboard\n'
     printf '  URL: http://%s:9119\n' "${ts_ip:-$lan_ip}"
     printf '  Usuario: admin\n'

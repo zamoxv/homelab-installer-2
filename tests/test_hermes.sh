@@ -129,6 +129,12 @@ test_hermes_deploy_ok() {
   assert_contains "$shown" "$api" "clave de API mostrada" || return 1
   assert_contains "$shown" "$pass" "contraseña del dashboard mostrada" || return 1
   assert_contains "$shown" "Usuario: admin" || return 1
+  # Ninguna línea puede superar el ancho visible del textbox (76 - bordes):
+  # dialog no la parte, la corta, y el usuario copia una clave incompleta.
+  local line
+  while IFS= read -r line; do
+    if (( ${#line} > 70 )); then fail "línea de credenciales demasiado larga (${#line}): se cortaría en el textbox"; return 1; fi
+  done <<< "$shown"
 
   # Mensaje final: APK, LAN/Tailscale únicamente.
   local texts; texts="$(_hm_dialog_text)"
