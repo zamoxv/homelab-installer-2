@@ -1120,38 +1120,77 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
   fallback add`. Costo: el chat con el modelo por defecto da error si OpenRouter
   falla, en vez de probar otro. Si el usuario lo conserva, el mensaje final dice
   que un chat local que falle puede reenviarse a OpenRouter y filtrarse.
-- **Tareas auxiliares (decisión del usuario, 2026-10-19; reemplaza a la del
-  2026-10-18 "todas a `gemma4:e2b` local"):** ninguna se fija. Todas quedan en
-  `provider: auto` / `model: ""` y siguen al modelo del chat: en un chat local
-  usan el modelo local; en un chat de OpenRouter, ese mismo modelo. El módulo
-  `ollama` ya **no escribe nada en `auxiliary`**; llama a la migración
-  compartida de `modules/hermes.sh` (ver "Diseño corregido de las tareas
-  auxiliares" en v2.6a), que convierte las fijaciones de versiones anteriores
-  (las `custom` + URL de Ollama + `gemma4:e2b` de este módulo y las de OpenRouter
-  de v2.6a), respeta las que el usuario puso a propósito y las lista, guarda el
-  bloque previo en `/etc/hli2/hermes-aux-previous.conf` y es reanudable ("migración
-  incompleta: X de N tareas…", reinicio de Hermes, sin marcador y sin marcar
-  `ollama` como hecho). Marcadores: `/etc/hli2/hermes-aux-auto` (tareas en
-  `auto`) y `/etc/hli2/hermes-ollama-integrated` (proveedor/rutas completos; con
-  él solo se refrescan las URL).
-  - **Qué se conserva:** proveedor `ollama-local`, alias de `model_routes`,
-    tiempos largos del proveedor (`request_timeout_seconds`/`stale_timeout_seconds`
-    3600) y `agent.reasoning_overrides` (pensamiento apagado) para el chat.
-    Compresión y títulos llevan tiempos amplios (1800/900 y 120 s).
-  - **Razonamiento:** `reasoning_overrides` no alcanza a las tareas auxiliares; por
-    eso compresión y títulos llevan `reasoning_effort: none` (ver v2.6a).
-  - **Privacidad, con precisión:** en un chat local el cerebro y sus tareas
-    auxiliares quedan en casa. Si Ollama falla, las auxiliares **no saltan solas a
-    OpenRouter**: con un proveedor principal elegido Hermes no adivina otro
-    (`_discovery_chain_allowed`, `auxiliary_client.py` línea 4637) y solo usa
-    `fallback_providers` (`_try_main_fallback_chain`, línea 4486) si está
-    configurado, razón por la que el módulo ofrece quitarlo. Excepciones que
-    quedan (el mensaje final las lista): los chats con el modelo por defecto van a
-    OpenRouter (y sus auxiliares también), las herramientas web envían consultas a
-    Internet, y el estado del respaldo automático tal como esté configurado.
-    No se hacen afirmaciones absolutas.
-  - `vision` usa el modelo del chat; **no verificado** que `gemma4:e4b` describa
-    imágenes a través de Hermes (prueba 153).
+- **Tareas auxiliares (decisión del usuario, 2026-10-19; ajustada tras la
+  revisión de privacidad del mismo día):** reemplaza a la del 2026-10-18 "todas a
+  `gemma4:e2b` local". Las tareas interactivas siguen al modelo del chat
+  (`provider: auto` / `model: ""`; ver "Diseño corregido de las tareas
+  auxiliares" en v2.6a). Con Ollama integrado, **siete tareas se fijan al modelo
+  local en todos los chats** (`provider: custom` + `base_url` + clave ficticia +
+  `timeout: 3600` + `reasoning_effort: none`), por dos fugas encontradas en el
+  código de Hermes v0.22.2:
+  - **Visión (`vision`, `gemma4:e4b`).** El camino `auto`
+    (`_vision_auto_route`, `agent/auxiliary_client.py` líneas 5657-5683) usa el
+    proveedor del chat solo si su cliente sirve para imágenes; si no, recorre
+    OpenRouter -> Nous -> DeepInfra: una imagen de un chat local podía salir. Con
+    `base_url` fijada, `resolve_vision_provider_client` (líneas 5712-5719) usa
+    únicamente ese endpoint. (`gemma4:e4b` admite imágenes según la biblioteca de
+    Ollama; no verificado a través de Hermes.)
+  - **Tareas sin chat en vivo (`gemma4:e2b`):** `monitor`
+    (`cron/scripts/classify_items.py:135`, script de cron), `curator`
+    (`agent/curator.py`, mantenimiento en segundo plano; con proveedor y modelo
+    fijos usa esos, líneas 1038-1042), `kanban_decomposer`
+    (`hermes_cli/kanban_decompose.py:318`), `triage_specifier`
+    (`hermes_cli/kanban_specify.py:204`), `profile_describer`
+    (`hermes_cli/profile_describer.py:154`) y `mcp`
+    (`tools/mcp_tool_sampling.py:214-224`, muestreo en el hilo del bucle de MCP).
+    Sin `main_runtime`, `_main_route_target` (línea 4563) resuelve al
+    `model.provider` de `config.yaml` (OpenRouter), no al chat: el runtime vive en
+    un ContextVar publicado por turno (`turn_context.py` línea 527;
+    `_normalize_main_runtime`, líneas 3109-3119; la copia de compatibilidad solo
+    vale en el hilo principal, línea 2743). Fijarlas al modelo local evita que el
+    contenido de un chat local salga por trabajos de fondo. Efecto colateral: en
+    chats de OpenRouter estas tareas también usan el modelo local (más lentas).
+  - **Siguen en `auto`** (corren dentro del turno y heredan el runtime):
+    `compression` (runtime explícito, `conversation_compression.py` línea 2041),
+    `title_generation` (`title_generator.py` líneas 475-522), `background_review`
+    (runtime del padre, `background_review.py` línea 250), `approval`,
+    `goal_judge`, `memory_query_rewrite`, `tts_audio_tags`, `voice_chat`, `review`,
+    `skills_hub` y `moa_*`. **No verificado** que `approval`, `goal_judge`,
+    `memory_query_rewrite` y las de voz hereden el contexto en todos los hilos
+    (no pasan `main_runtime`); si alguna no lo hiciera, resolvería a OpenRouter.
+  - **Si una tarea fijada falla, NO "da error" por sí sola.** Con proveedor
+    explícito, ante errores de capacidad (conexión caída, tiempo agotado, 429
+    agotado, 402) `_ladder_provider_fallback` (líneas 7840-7845) prueba su
+    `fallback_chain` y, si no hay, `_try_main_agent_model_fallback` (líneas
+    4304-4345), que lee el modelo principal **de `config.yaml`** (OpenRouter), no el
+    del chat: sin más, el contenido saldría. Por eso cada tarea fijada lleva una
+    `fallback_chain` con **el otro modelo local**; si esa cadena entrega un
+    cliente, la rama del modelo principal no se ejecuta, y si también falla,
+    `_try_payment_fallback` (líneas 4245-4256) queda bloqueada por
+    `_discovery_chain_allowed` (línea 4637) mientras haya un proveedor principal
+    elegido. **Basado en la lectura del código; no probado en vivo** (prueba 154).
+  - **Migración:** compartida con `hermes` (modos `none`/`keep`/`full`/`refresh`
+    en `modules/hermes.sh`). Estas fijaciones locales se tratan como propias (no
+    como del usuario) y se conservan en las re-ejecuciones: `hermes` solo (con
+    Ollama integrado) las respeta; `ollama` las completa (`full`, aunque el
+    marcador `hermes-aux-auto` ya exista) y, con la integración hecha, solo
+    refresca la URL y su respaldo (`refresh`). Las que el usuario fijó a otro
+    servidor/proveedor no se tocan y se listan. El registro previo
+    (`hermes-aux-previous.conf`) anota el modelo auxiliar de OpenRouter detectado
+    (`# or-model:`) y recibe un bloque con fecha en cada revisión que cambia
+    fijaciones.
+  - **Privacidad, con precisión (mensaje final):** chats locales **interactivos**:
+    cerebro y tareas 'auto' en casa; visión y las seis tareas de fondo, locales
+    en todos los chats; si Ollama falla, las 'auto' no saltan solas a OpenRouter
+    (solo `fallback_providers`, `_try_main_fallback_chain` línea 4486); las fijadas
+    tienen su respaldo local. Excepciones: los chats con el modelo por defecto
+    van a OpenRouter (también sus auxiliares), las herramientas web, el estado del
+    respaldo automático y la herencia no verificada de las tareas del punto
+    anterior. No hay afirmaciones absolutas.
+  - **Qué se conserva:** proveedor `ollama-local`, alias de `model_routes`, tiempos
+    largos del proveedor (3600) y `agent.reasoning_overrides` (pensamiento apagado)
+    para el chat. Compresión y títulos: tiempos amplios (1800/900 y 120 s) y
+    `reasoning_effort: none` solo si la clave está vacía.
 - Red y firewall. Hermes vive en `hermes-net` (10.213.144.0/24, definida por el
   compose de Hermes con solo la subred). El compose de Ollama la usa como red
   **externa**; su nombre real lo toma el módulo de Docker (Dokploy le antepone el
@@ -1253,7 +1292,9 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
   cambiarlo o quitarlo. Explica antes cómo obtener el token (`@BotFather`,
   `/newbot`) y el ID (`@userinfobot`); pide el token con cuadro de contraseña
   (forma `^[0-9]{6,12}:[A-Za-z0-9_-]{30,}$`) y el ID numérico (`^[0-9]{5,15}$`).
-  Ambos se guardan en `/etc/hli2/hermes.env` (root 0600; sin las líneas
+  Un solo usuario autorizado (el módulo guarda un único ID en
+  `TELEGRAM_ALLOWED_USERS`, aunque Hermes admite una lista; ese mismo ID es
+  `TELEGRAM_HOME_CHANNEL`). Ambos se guardan en `/etc/hli2/hermes.env` (root 0600; sin las líneas
   `TELEGRAM_*` si no está configurado), viajan a Dokploy por el canal `env` entre
   comillas simples y el compose solo lleva referencias `${...}`; **si Telegram no
   está configurado el compose no incluye ninguna variable `TELEGRAM_*`**
