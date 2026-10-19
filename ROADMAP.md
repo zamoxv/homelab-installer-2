@@ -879,14 +879,18 @@ Dokploy `dokploy.com/templates/hermes`, Docker Hub, código v0.22.2 de
     (al sembrar). Si el servidor está en UTC (o no se pudo leer) pregunta,
     proponiendo `America/Santiago` o la zona ya guardada; una respuesta inválida
     cancela antes de instalar nada.
-  - **Límite conocido (verificado en el código, no corregido):** el apagado del
-    "pensamiento" por modelo (`agent.reasoning_overrides`) lo lee el agente
-    principal; las tareas auxiliares solo toman `auxiliary.<tarea>.reasoning_effort`
-    (`auxiliary_client.py` `_get_task_extra_body`, línea 6405). Con `auto` sin ese
-    valor, una compresión con `gemma4` local no envía `reasoning_effort` y
-    Ollama aplica su comportamiento por defecto (puede ser más lenta). Si molesta,
-    fijar `auxiliary.compression.reasoning_effort none` a mano (afecta a todos los
-    chats) — decisión pendiente del usuario.
+  - **Razonamiento de compresión y títulos (decisión del usuario, 2026-10-19):**
+    las tareas auxiliares NO heredan `agent.reasoning_overrides` (lo lee el agente
+    principal, `hermes_constants.py` línea 1128); solo toman
+    `auxiliary.<tarea>.reasoning_effort` (`auxiliary_client.py`
+    `_get_task_extra_body`, línea 6405). Por eso se fija `reasoning_effort: none`
+    SOLO en `compression` y `title_generation` (resumir y titular no necesitan
+    razonar: más rápido en `gemma4` local y más barato en DeepSeek). Se siembra en
+    instalaciones nuevas y la migración lo agrega (también a las tareas ya en
+    `auto`); en esas dos tareas `none` es lo esperado y no se trata como fijación a
+    quitar. Las demás tareas no llevan `reasoning_effort`. El marcador
+    `hermes-aux-auto` lleva la etiqueta `aux-version: 2`; uno sin ella (versión
+    anterior) se revisa otra vez, sin tocar lo que el usuario fijó.
 - Digest: además de la etiqueta, la imagen se fija por digest
   (`@sha256:36099926…`, lista de manifiestos amd64+arm64 de `v0.22.2` según
   la API de Docker Hub, verificada el 2026-10-16). Al actualizar se cambian
@@ -1134,9 +1138,8 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
     tiempos largos del proveedor (`request_timeout_seconds`/`stale_timeout_seconds`
     3600) y `agent.reasoning_overrides` (pensamiento apagado) para el chat.
     Compresión y títulos llevan tiempos amplios (1800/900 y 120 s).
-  - **Límite del razonamiento (verificado):** `reasoning_overrides` no alcanza a las
-    tareas auxiliares (ver v2.6a): con `auto` la compresión local no apaga el
-    pensamiento de `gemma4` salvo que se fije `auxiliary.<tarea>.reasoning_effort`.
+  - **Razonamiento:** `reasoning_overrides` no alcanza a las tareas auxiliares; por
+    eso compresión y títulos llevan `reasoning_effort: none` (ver v2.6a).
   - **Privacidad, con precisión:** en un chat local el cerebro y sus tareas
     auxiliares quedan en casa. Si Ollama falla, las auxiliares **no saltan solas a
     OpenRouter**: con un proveedor principal elegido Hermes no adivina otro

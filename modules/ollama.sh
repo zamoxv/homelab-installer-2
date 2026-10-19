@@ -68,12 +68,11 @@
 #   (_discovery_chain_allowed, línea 4637). Solo con 'fallback_providers'
 #   configurado hacia OpenRouter puede salir el contenido (por eso la pregunta
 #   de más abajo).
-# - OJO (verificado en el código, no corregido): el apagado del "pensamiento"
-#   por modelo ('agent.reasoning_overrides', hermes_constants.py línea 1128) lo
-#   lee el agente principal, NO las tareas auxiliares: auxiliary_client.py solo
-#   toma 'auxiliary.<tarea>.reasoning_effort' (_get_task_extra_body, línea 6405).
-#   Con aux en 'auto' sin ese valor, una compresión/título con gemma4 local no
-#   envía reasoning_effort y Ollama aplica su comportamiento por defecto.
+# - El apagado del "pensamiento" por modelo ('agent.reasoning_overrides',
+#   hermes_constants.py línea 1128) lo lee el agente principal, NO las tareas
+#   auxiliares (auxiliary_client.py solo toma 'auxiliary.<tarea>.reasoning_effort',
+#   _get_task_extra_body, línea 6405). Por eso modules/hermes.sh fija
+#   'reasoning_effort: none' en compression y title_generation.
 #
 # Red: con Hermes instalado se une a la red de Hermes (nombre real tomado de
 # Docker: Dokploy le antepone el proyecto) con IP fija .250 de su subred

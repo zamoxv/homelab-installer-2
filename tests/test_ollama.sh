@@ -64,7 +64,7 @@ _ol_seed_hermes() {
 # (hermes-aux-auto) e integración con Ollama completa (hermes-ollama-integrated).
 _ol_marker_set() {
   _ol_secret_unlock
-  printf '# listo\n' > "$SECRETS_DIR/hermes-aux-auto"
+  printf '# listo\n# aux-version: 2 (reasoning_effort none en compression y title_generation)\n' > "$SECRETS_DIR/hermes-aux-auto"
   printf '# listo\n' > "$SECRETS_DIR/hermes-ollama-integrated"
   chmod 0600 "$SECRETS_DIR/hermes-aux-auto" "$SECRETS_DIR/hermes-ollama-integrated"
   _ol_secret_lock
@@ -833,8 +833,10 @@ test_ollama_never_pins_aux_tasks_and_leaves_them_on_auto() {
   _ol_seed_hermes
   echo "yes" > "$DIALOG_YESNO_QUEUE"
   bash "$REPO_ROOT/modules/ollama.sh" || return 1
-  # Instalación sin 'auxiliary' (siembra nueva: todo en auto): el módulo no escribe nada ahí.
-  assert_file_not_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary' "ninguna tarea se fija" || return 1
+  # Instalación sin 'auxiliary': solo se agrega el razonamiento apagado de compresión y títulos; ninguna tarea se fija.
+  assert_eq "2" "$(grep -cP '^docker\t.*config\tset\tauxiliary' "$STUB_CALL_LOG")" "solo los dos reasoning_effort" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.compression.reasoning_effort\tnone' || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" $'.provider\tauto' "ninguna tarea se fija" || return 1
   assert_file_not_contains "$STUB_CALL_LOG" $'config\tunset' || return 1
   assert_eq "19" "${#_OL_TASKS[@]}" "las 19 tareas de v0.22.2" || return 1
   assert_file_not_contains "$STUB_CALL_LOG" $'config\tset\tmodel' "el modelo por defecto no se toca" || return 1
@@ -889,7 +891,7 @@ test_ollama_with_aux_marker_present_does_not_touch_auxiliary() {
   _ol_setup
   _ol_seed_hermes empty
   # El módulo 'hermes' ya dejó el marcador; el usuario fijó 'vision' a mano después.
-  _ol_secret_unlock; printf '# listo\n' > "$SECRETS_DIR/hermes-aux-auto"; chmod 0600 "$SECRETS_DIR/hermes-aux-auto"; _ol_secret_lock
+  _ol_secret_unlock; printf '# listo\n# aux-version: 2 (reasoning_effort none en compression y title_generation)\n' > "$SECRETS_DIR/hermes-aux-auto"; chmod 0600 "$SECRETS_DIR/hermes-aux-auto"; _ol_secret_lock
   { printf 'auxiliary:\n  vision:\n    provider: openrouter\n    model: qwen/qwen3.7-flash\n'; } >> "$APPDATA_ROOT/hermes/config.yaml"
   : > "$DIALOG_YESNO_QUEUE"
   bash "$REPO_ROOT/modules/ollama.sh" || return 1
@@ -1073,7 +1075,7 @@ test_ollama_aux_migration_aborts_if_previous_values_cannot_be_saved() {
   assert_file_not_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.' "no toca las auxiliares sin registro previo" || return 1
   assert_file_contains "$STUB_CALL_LOG" $'config\tset\tproviders.ollama-local.api' "el proveedor sí se configura" || return 1
   assert_contains "$(_ol_dialog_text)" "no se pudo guardar el registro de sus valores previos" || return 1
-  assert_contains "$(_ol_dialog_text)" "migración incompleta: 1 de 1" || return 1
+  assert_contains "$(_ol_dialog_text)" "migración incompleta: 3 de 3" || return 1
   _ol_marker_exists && { fail "marcador sin migrar"; return 1; }
   assert_file_not_contains "$STATE_FILE" "ollama" || return 1
   assert_file_contains "$STUB_CALL_LOG" $'docker\trestart\thermes' "Hermes se reinicia igual" || return 1

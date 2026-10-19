@@ -188,10 +188,12 @@ test_hermes_config_seeded_contents() {
   assert_eq "2" "$(grep -c 'provider: openrouter' "$cfg")" "principal + respaldo" || return 1
   assert_file_not_contains "$cfg" "base_url" || return 1
   assert_file_not_contains "$cfg" "api_key" || return 1
-  assert_file_not_contains "$cfg" "reasoning_effort" || return 1
+  # Solo compresión y títulos llevan razonamiento apagado (las auxiliares no heredan reasoning_overrides).
+  assert_eq "2" "$(grep -c 'reasoning_effort: none' "$cfg")" || return 1
+  assert_eq "2" "$(grep -c 'reasoning_effort' "$cfg")" "solo dos tareas con reasoning_effort" || return 1
   # Tiempos amplios para modelos locales (compresión y títulos).
-  assert_contains "$body" $'  compression:\n    provider: auto\n    model: ""\n    timeout: 1800\n    no_progress_timeout: 900\n' || return 1
-  assert_contains "$body" $'  title_generation:\n    provider: auto\n    model: ""\n    timeout: 120\n' || return 1
+  assert_contains "$body" $'  compression:\n    provider: auto\n    model: ""\n    timeout: 1800\n    no_progress_timeout: 900\n    reasoning_effort: none\n' || return 1
+  assert_contains "$body" $'  title_generation:\n    provider: auto\n    model: ""\n    timeout: 120\n    reasoning_effort: none\n' || return 1
   # Zona horaria sembrada.
   assert_contains "$body" $'\ntimezone: America/Santiago\n' || return 1
   # YAML válido, si hay PyYAML disponible.
@@ -1060,6 +1062,9 @@ test_hermes_aux_plan_converts_openrouter_pins_and_adds_local_timeouts() {
   assert_contains "$out" $'auxiliary.compression.timeout\t1800' "compresión con tiempo amplio" || return 1
   assert_contains "$out" $'auxiliary.compression.no_progress_timeout\t900' || return 1
   assert_contains "$out" $'auxiliary.title_generation.timeout\t120' || return 1
+  assert_contains "$out" "aux:compression"$'\tset\tauxiliary.compression.reasoning_effort\tnone' "compresión sin razonamiento" || return 1
+  assert_contains "$out" "aux:title_generation"$'\tset\tauxiliary.title_generation.reasoning_effort\tnone' || return 1
+  assert_not_contains "$out" "auxiliary.vision.reasoning_effort" "las demás tareas no llevan razonamiento" || return 1
   assert_not_contains "$out" "auxiliary.vision.timeout" "solo compresión y títulos llevan tiempos" || return 1
   assert_contains "$out" "CUSTOM:" || return 1
   assert_contains "$out" "PLANNED:${_HM_TASKS[*]}" || return 1
@@ -1083,6 +1088,9 @@ test_hermes_aux_plan_removes_only_local_pins_it_wrote() {
   # Compresión: el 3600 pasa a 1800 (set, no unset); el no_progress_timeout ya es 900.
   assert_contains "$out" "aux:compression"$'\tset\tauxiliary.compression.timeout\t1800' || return 1
   assert_not_contains "$out" "auxiliary.compression.no_progress_timeout" "ya está en 900" || return 1
+  # reasoning_effort none en compression/title_generation es lo esperado: no se quita.
+  assert_not_contains "$out" "auxiliary.compression.reasoning_effort" "ya está en none" || return 1
+  assert_not_contains "$out" "auxiliary.title_generation.reasoning_effort" || return 1
   assert_contains "$out" "aux:title_generation"$'\tset\tauxiliary.title_generation.timeout\t120' || return 1
   # Orden: el proveedor es lo ÚLTIMO de cada tarea (una interrupción deja la tarea reconocible).
   local last
@@ -1107,7 +1115,7 @@ test_hermes_aux_plan_leaves_user_custom_pins_alone_and_reports_them() {
   # Un puerto distinto de 11434 o una clave real nunca cuentan como "propios del HLI".
   yaml="$(printf 'auxiliary:\n  vision:\n    provider: custom\n    model: gemma4:e2b\n    base_url: http://10.0.0.5:11434/v1\n    api_key: clave-real\n  mcp:\n    provider: custom\n    model: gemma4:e2b\n    base_url: http://10.0.0.5:8080/v1\n    api_key: no-key-required\n')"
   out="$(_hm_aux_plan "$yaml")"
-  assert_eq "PLANNED:" "$(grep '^PLANNED:' <<<"$out")" "ninguna tarea del HLI" || return 1
+  assert_eq "PLANNED:compression title_generation" "$(grep '^PLANNED:' <<<"$out")" "solo falta el razonamiento de compresión/títulos" || return 1
   assert_not_contains "$out" "auxiliary.vision." || return 1
   assert_not_contains "$out" "auxiliary.mcp." || return 1
 }
@@ -1121,7 +1129,7 @@ test_hermes_aux_plan_recognizes_the_users_aux_model_when_shared_by_most_tasks() 
   # Pocas tareas con un modelo ajeno: no es del HLI.
   yaml="$(printf 'auxiliary:\n'; _hm_aux_block_or foo/aux-model vision mcp)"
   out="$(_hm_aux_plan "$yaml")"
-  assert_eq "PLANNED:" "$(grep '^PLANNED:' <<<"$out")" "un modelo ajeno en pocas tareas no es del HLI" || return 1
+  assert_eq "PLANNED:compression title_generation" "$(grep '^PLANNED:' <<<"$out")" "un modelo ajeno en pocas tareas no es del HLI" || return 1
   assert_not_contains "$out" "auxiliary.vision." || return 1
 }
 
@@ -1129,9 +1137,9 @@ test_hermes_aux_plan_is_empty_for_clean_config_and_resumes_partial_states() {
   _hm_setup
   local out yaml
   out="$(_hm_aux_plan $'model:\n  default: x/y\n')"
-  assert_contains "$out" "PLANNED:" || return 1
-  assert_not_contains "$out" "aux:" "sin bloque auxiliary no hay nada que migrar" || return 1
-  yaml="$(printf 'auxiliary:\n'; for t in "${_HM_TASKS[@]}"; do printf '  %s:\n    provider: auto\n    model: ""\n' "$t"; done)"
+  assert_eq "PLANNED:compression title_generation" "$(grep '^PLANNED:' <<<"$out")" "sin bloque auxiliary solo falta el razonamiento" || return 1
+  assert_not_contains "$out" "aux:vision" || return 1
+  yaml="$(printf 'auxiliary:\n'; for t in "${_HM_TASKS[@]}"; do printf '  %s:\n    provider: auto\n    model: ""\n' "$t"; case "$t" in compression|title_generation) printf '    reasoning_effort: none\n' ;; esac; done)"
   out="$(_hm_aux_plan "$yaml")"
   assert_not_contains "$out" "aux:" "todo en auto: nada que hacer" || return 1
   # Interrumpida: proveedor ya en auto pero el modelo anterior sigue; o ya sin base_url pero con provider custom.
@@ -1271,10 +1279,23 @@ test_hermes_aux_migration_interrupt_prints_incomplete_note_and_exits() {
   chmod u+rwx "$SECRETS_DIR"; [[ ! -e "$SECRETS_DIR/hermes-aux-auto" ]] || { chmod 000 "$SECRETS_DIR"; fail "marcador tras interrupción"; return 1; }; chmod 000 "$SECRETS_DIR"
 }
 
-test_hermes_rerun_with_existing_config_without_auxiliary_block_only_leaves_marker() {
+test_hermes_rerun_with_existing_config_without_auxiliary_block_only_adds_reasoning_and_marker() {
   _hm_setup
   _hm_seed_existing_with_aux ""
   bash "$REPO_ROOT/modules/hermes.sh" || return 1
-  assert_file_not_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary' || return 1
+  # Solo se agrega el razonamiento apagado de compresión y títulos.
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.compression.reasoning_effort\tnone' || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.title_generation.reasoning_effort\tnone' || return 1
+  assert_eq "2" "$(grep -cP '^docker\t.*config\tset\tauxiliary' "$STUB_CALL_LOG")" "nada más" || return 1
   chmod u+rwx "$SECRETS_DIR"; [[ -f "$SECRETS_DIR/hermes-aux-auto" ]] || { chmod 000 "$SECRETS_DIR"; fail "falta el marcador"; return 1; }; chmod 000 "$SECRETS_DIR"
+}
+
+test_hermes_old_aux_marker_without_version_tag_is_reviewed_again_for_reasoning() {
+  _hm_setup
+  _hm_seed_existing_with_aux "$(printf 'auxiliary:\n'; for t in "${_HM_TASKS[@]}"; do printf '  %s:\n    provider: auto\n    model: ""\n' "$t"; done)"
+  chmod u+rwx "$SECRETS_DIR"; printf '# marcador de la versión anterior\n' > "$SECRETS_DIR/hermes-aux-auto"; chmod 0600 "$SECRETS_DIR/hermes-aux-auto"; chmod 000 "$SECRETS_DIR"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.compression.reasoning_effort\tnone' || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" $'auxiliary.vision' "el resto ya está en auto" || return 1
+  chmod u+rwx "$SECRETS_DIR"; assert_file_contains "$SECRETS_DIR/hermes-aux-auto" "aux-version: 2" "marcador actualizado" || { chmod 000 "$SECRETS_DIR"; return 1; }; chmod 000 "$SECRETS_DIR"
 }

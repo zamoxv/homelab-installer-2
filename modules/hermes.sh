@@ -141,6 +141,13 @@ HERMES_AUX_TASKS=(
 HERMES_AUX_COMPRESSION_TIMEOUT=1800
 HERMES_AUX_COMPRESSION_NO_PROGRESS=900
 HERMES_AUX_TITLE_TIMEOUT=120
+# Compresión y títulos no necesitan razonamiento (más rápido en un modelo local,
+# más barato en uno de pago). Solo estas dos tareas llevan reasoning_effort: las
+# demás no. Las auxiliares NO heredan agent.reasoning_overrides (solo leen
+# auxiliary.<tarea>.reasoning_effort: agent/auxiliary_client.py
+# _get_task_extra_body, línea 6405), por eso se fija aquí.
+HERMES_AUX_REASONING_TASKS=(compression title_generation)
+HERMES_AUX_REASONING_EFFORT="none"
 
 HERMES_CREDS_TMP=""
 _hermes_creds_cleanup() {
@@ -362,8 +369,8 @@ EOF
   for task in "${HERMES_AUX_TASKS[@]}"; do
     printf '  %s:\n    provider: auto\n    model: ""\n' "$task"
     case "$task" in
-      compression) printf '    timeout: %s\n    no_progress_timeout: %s\n' "$HERMES_AUX_COMPRESSION_TIMEOUT" "$HERMES_AUX_COMPRESSION_NO_PROGRESS" ;;
-      title_generation) printf '    timeout: %s\n' "$HERMES_AUX_TITLE_TIMEOUT" ;;
+      compression) printf '    timeout: %s\n    no_progress_timeout: %s\n    reasoning_effort: %s\n' "$HERMES_AUX_COMPRESSION_TIMEOUT" "$HERMES_AUX_COMPRESSION_NO_PROGRESS" "$HERMES_AUX_REASONING_EFFORT" ;;
+      title_generation) printf '    timeout: %s\n    reasoning_effort: %s\n' "$HERMES_AUX_TITLE_TIMEOUT" "$HERMES_AUX_REASONING_EFFORT" ;;
     esac
   done
   cat <<'EOF'
@@ -999,6 +1006,7 @@ _hermes_allow_add() {
 # interrumpida deja siempre una tarea todavía reconocible como propia, así que
 # la re-ejecución la completa.
 HERMES_AUX_MARKER="${SECRETS_DIR}/hermes-aux-auto"
+HERMES_AUX_MARKER_TAG="# aux-version: 2 (reasoning_effort none en compression y title_generation)"
 HERMES_AUX_LEGACY_MARKER="${SECRETS_DIR}/hermes-aux-migrated"
 HERMES_AUX_PREV_FILE="${SECRETS_DIR}/hermes-aux-previous.conf"
 # Valores que escribió la versión (L); un solo lugar.
@@ -1058,7 +1066,7 @@ _hermes_aux_summary() {
 # Calcula, a partir del YAML $1, qué tareas hay que pasar a 'auto' y con qué
 # operaciones. Llena H_AUX_PLANNED, H_AUX_OPS y H_AUX_CUSTOM (sin tocar nada).
 _hermes_aux_plan() {
-  local content="$1" t task key val p m b k to re np state ormodel best=0 n
+  local content="$1" t task key val p m b k to re np state ormodel best=0 n want_re
   local -A cfg=() mcount=()
   H_AUX_OPS=() H_AUX_PLANNED=() H_AUX_CUSTOM=()
   while IFS=$'\t' read -r task key val; do
@@ -1095,8 +1103,16 @@ _hermes_aux_plan() {
          && ( "$m" == "$HERMES_FALLBACK_MODEL" || "$m" == "$ormodel" ) ]]; then
       state=openrouter
     fi
+    want_re=""
+    case "$t" in compression|title_generation) want_re="$HERMES_AUX_REASONING_EFFORT" ;; esac
     case "$state" in
-      clean) continue ;;
+      clean)
+        # Ya en auto: solo falta el razonamiento de compresión/títulos.
+        if [[ -n "$want_re" && "$re" != "$want_re" ]]; then
+          H_AUX_PLANNED+=("$t")
+          H_AUX_OPS+=("aux:${t}"$'\t'"set"$'\t'"auxiliary.${t}.reasoning_effort"$'\t'"${want_re}")
+        fi
+        continue ;;
       custom)
         H_AUX_CUSTOM+=("${t} (${p:-auto}/${m:-modelo principal}${b:+, ${b}})")
         continue ;;
@@ -1108,13 +1124,14 @@ _hermes_aux_plan() {
         [[ "$np" == "$HERMES_AUX_COMPRESSION_NO_PROGRESS" ]] || H_AUX_OPS+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.no_progress_timeout"$'\t'"${HERMES_AUX_COMPRESSION_NO_PROGRESS}") ;;
       title_generation) want_to="$HERMES_AUX_TITLE_TIMEOUT" ;;
     esac
+    [[ -z "$want_re" || "$re" == "$want_re" ]] || H_AUX_OPS+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.reasoning_effort"$'\t'"${want_re}")
     if [[ -n "$want_to" ]]; then
       [[ "$to" == "$want_to" ]] || H_AUX_OPS+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.timeout"$'\t'"${want_to}")
     elif [[ "$state" == local && "$to" == "$HERMES_LEGACY_LOCAL_AUX_TIMEOUT" ]]; then
       H_AUX_OPS+=("${unit}"$'\t'"unset"$'\t'"auxiliary.${t}.timeout"$'\t')
     fi
     if [[ "$state" == local ]]; then
-      [[ "$re" != "none" ]] || H_AUX_OPS+=("${unit}"$'\t'"unset"$'\t'"auxiliary.${t}.reasoning_effort"$'\t')
+      [[ -n "$want_re" || "$re" != "none" ]] || H_AUX_OPS+=("${unit}"$'\t'"unset"$'\t'"auxiliary.${t}.reasoning_effort"$'\t')
       [[ -z "$k" ]] || H_AUX_OPS+=("${unit}"$'\t'"unset"$'\t'"auxiliary.${t}.api_key"$'\t')
       [[ -z "$b" ]] || H_AUX_OPS+=("${unit}"$'\t'"unset"$'\t'"auxiliary.${t}.base_url"$'\t')
       # Para (L) primero el modelo y al final el proveedor; para (O) al revés.
@@ -1162,7 +1179,9 @@ _hermes_aux_prepare() {
   local content="$1" line custom
   H_AUX_OPS=() H_AUX_PLANNED=() H_AUX_CUSTOM=() H_AUX_PREV_PROV=()
   H_AUX_SKIP=0 H_AUX_PREV_FAIL=0 H_AUX_INCOMPLETE=0 AUX_PREV_NOTE="" AUX_CUSTOM_NOTE=""
-  if sudo -n test -f "$HERMES_AUX_MARKER" 2>/dev/null; then
+  # Un marcador sin la etiqueta de razonamiento es de la versión anterior: se
+  # revisa otra vez (el plan va por valores y no toca lo que el usuario fijó).
+  if sudo -n cat -- "$HERMES_AUX_MARKER" 2>/dev/null | grep -qF "$HERMES_AUX_MARKER_TAG"; then
     H_AUX_SKIP=1
     return 0
   fi
@@ -1259,7 +1278,8 @@ _hermes_aux_finish() {
   [[ "$H_AUX_SKIP" -eq 0 ]] || return 0
   if ! _hermes_root_write "$HERMES_AUX_MARKER" "# Las tareas auxiliares de Hermes siguen al modelo del chat (provider auto, model vacío), HLI 2, $(date +%F).
 # Mientras exista, los módulos 'hermes' y 'ollama' no revisan ni tocan el bloque 'auxiliary'
-# (respetan lo que usted fije después). Bórrelo para repetir la revisión."; then
+# (respetan lo que usted fije después). Bórrelo para repetir la revisión.
+${HERMES_AUX_MARKER_TAG}"; then
     H_AUX_INCOMPLETE=1
   fi
 }
