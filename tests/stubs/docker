@@ -104,7 +104,8 @@ fi
 # 'hermes config set' numerados (módulo ollama): STUB_HERMES_CONFIG_SET_FAIL_N="3 7"
 # hace fallar esos números de llamada; STUB_HERMES_CONFIG_SET_INT_N=N manda SIGINT
 # la señal STUB_HERMES_CONFIG_SET_SIGNAL (INT por defecto) al proceso 'modules/ollama.sh' en la llamada N, que sí termina bien.
-if [[ "${1:-}" == "exec" && "$*" == *"config set"* ]]; then
+# ('config unset' comparte el contador: es una escritura de configuración más.)
+if [[ "${1:-}" == "exec" && ( "$*" == *"config set"* || "$*" == *"config unset"* ) ]]; then
   _cnt_file="${STUB_CALL_LOG:-/dev/null}.cfgset"
   _n=$(( $(cat "$_cnt_file" 2>/dev/null || echo 0) + 1 ))
   echo "$_n" > "$_cnt_file"

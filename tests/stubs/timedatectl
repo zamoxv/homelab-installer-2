@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Stub de 'timedatectl' (modules/hermes.sh, zona horaria del servidor):
+# 'show -p Timezone --value' imprime STUB_TIMEZONE (por defecto
+# America/Santiago; definida pero vacía = vacío). STUB_TIMEDATECTL_FAIL=1 hace
+# que falle, como en un equipo sin systemd.
+set -uo pipefail
+[[ -z "${STUB_TIMEDATECTL_FAIL:-}" ]] || exit 1
+if [[ "${1:-}" == "show" ]]; then
+  printf '%s\n' "${STUB_TIMEZONE-America/Santiago}"
+  exit 0
+fi
+exit 1

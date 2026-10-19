@@ -2,7 +2,7 @@
 # Test end-to-end de modules/hermes.sh (todo lo privilegiado/de red
 # stubbeado). Comprueba: los secretos nunca viajan por argv, logs ni compose
 # versionado; config.yaml se siembra solo si falta (aprobación manual,
-# data_collection deny, todas las tareas auxiliares fijadas); los puertos se
+# data_collection deny, todas las tareas auxiliares en 'auto'); los puertos se
 # publican solo en la IP de la LAN y en la de Tailscale; el compose no tiene
 # docker.sock, red del host ni imagen ':latest'; una re-ejecución conserva
 # los secretos; claves de OpenRouter inválidas se rechazan; un /health caído
@@ -28,6 +28,13 @@ _hm_setup() {
   export HLI2_SYSCTL_DIR="$HLI2_TEST_SCRATCH/sysctl"
   export STUB_TEXTBOX_LOG="$HLI2_TEST_SCRATCH/textbox.log"
   : > "$STUB_TEXTBOX_LOG"
+  # Zonas horarias: base de zonas de prueba y servidor en America/Santiago.
+  export HLI2_ZONEINFO_DIR="$HLI2_TEST_SCRATCH/zoneinfo"
+  mkdir -p "$HLI2_ZONEINFO_DIR/America" "$HLI2_ZONEINFO_DIR/Europe" "$HLI2_ZONEINFO_DIR/Etc"
+  : > "$HLI2_ZONEINFO_DIR/America/Santiago"; : > "$HLI2_ZONEINFO_DIR/America/Bogota"
+  : > "$HLI2_ZONEINFO_DIR/Europe/Madrid"; : > "$HLI2_ZONEINFO_DIR/UTC"; : > "$HLI2_ZONEINFO_DIR/Etc/UTC"
+  export STUB_TIMEZONE="America/Santiago"
+  export HLI2_TZ_FILE="$HLI2_TEST_SCRATCH/etc-timezone"
   # Hermético: sin sesión de Tailscale aunque el equipo que corre los tests
   # tenga el 'tailscale' real instalado.
   local off="$HLI2_TEST_SCRATCH/tsoff"
@@ -57,11 +64,11 @@ _hm_tailscale_up() {
 
 _hm_dialog_text() { grep -F $'dialog\t' "$STUB_CALL_LOG" || true; }
 
-# Primera ejecución: clave de OpenRouter, dos modelos, y "sí" a "guardé las
+# Primera ejecución: clave de OpenRouter, el modelo principal, y "sí" a "guardé las
 # credenciales".
 _hm_first_run_queues() {
   echo "$_HM_OR_KEY" > "$DIALOG_PASSWORDBOX_QUEUE"
-  printf '%s\n%s\n' "deepseek/deepseek-v4.1-flash" "qwen/qwen3.7-flash" > "$DIALOG_INPUTBOX_QUEUE"
+  echo "deepseek/deepseek-v4.1-flash" > "$DIALOG_INPUTBOX_QUEUE"
   echo "yes" > "$DIALOG_YESNO_QUEUE"
 }
 
@@ -168,16 +175,25 @@ test_hermes_config_seeded_contents() {
   assert_file_contains "$cfg" "default: deepseek/deepseek-v4.1-flash" || return 1
   assert_file_contains "$cfg" "fallback_providers:" || return 1
   assert_file_contains "$cfg" "website_blocklist:" || return 1
-  assert_file_not_contains "$cfg" "provider: auto" "nada en auto" || return 1
   assert_file_not_contains "$cfg" "sk-or-" "sin secretos en config.yaml" || return 1
   local body; body="$(< "$cfg")"
   assert_contains "$body" $'  website_blocklist:\n    enabled: true' || return 1
-  # Cada tarea auxiliar fijada a OpenRouter + el modelo barato.
+  # Cada tarea auxiliar en 'auto' con modelo vacío: sigue al modelo del chat.
   for t in "${_HM_TASKS[@]}"; do
-    assert_contains "$body" $'\n  '"${t}"$':\n    provider: openrouter\n    model: qwen/qwen3.7-flash\n' "tarea auxiliar $t" || return 1
+    assert_contains "$body" $'\n  '"${t}"$':\n    provider: auto\n    model: ""\n' "tarea auxiliar $t" || return 1
   done
-  # 1 principal + 1 respaldo + N auxiliares.
-  assert_eq "$(( ${#_HM_TASKS[@]} + 2 ))" "$(grep -c 'provider: openrouter' "$cfg")" "cantidad de proveedores fijados" || return 1
+  assert_eq "19" "${#_HM_TASKS[@]}" "las 19 tareas de v0.22.2" || return 1
+  assert_eq "${#_HM_TASKS[@]}" "$(grep -c 'provider: auto' "$cfg")" "todas las tareas en auto" || return 1
+  # Solo el principal y el respaldo van a OpenRouter; ninguna tarea fija base_url/api_key.
+  assert_eq "2" "$(grep -c 'provider: openrouter' "$cfg")" "principal + respaldo" || return 1
+  assert_file_not_contains "$cfg" "base_url" || return 1
+  assert_file_not_contains "$cfg" "api_key" || return 1
+  assert_file_not_contains "$cfg" "reasoning_effort" || return 1
+  # Tiempos amplios para modelos locales (compresión y títulos).
+  assert_contains "$body" $'  compression:\n    provider: auto\n    model: ""\n    timeout: 1800\n    no_progress_timeout: 900\n' || return 1
+  assert_contains "$body" $'  title_generation:\n    provider: auto\n    model: ""\n    timeout: 120\n' || return 1
+  # Zona horaria sembrada.
+  assert_contains "$body" $'\ntimezone: America/Santiago\n' || return 1
   # YAML válido, si hay PyYAML disponible.
   if python3 -I -c 'import yaml' 2>/dev/null; then
     python3 -I -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$cfg" || { fail "config.yaml no es YAML válido"; return 1; }
@@ -202,14 +218,14 @@ test_hermes_config_not_overwritten_and_secrets_kept_on_rerun() {
   assert_eq "" "$(< "$STUB_TEXTBOX_LOG")" "no se vuelven a mostrar credenciales ya confirmadas" || return 1
 }
 
-test_hermes_rerun_can_rotate_api_key_and_change_models() {
+test_hermes_rerun_can_rotate_api_key_and_change_main_model() {
   _hm_setup
   _hm_seed_previous 0
   mkdir -p "$APPDATA_ROOT/hermes"
   printf '# mio\nmodel:\n  default: x/y\n' > "$APPDATA_ROOT/hermes/config.yaml"
-  # rotar API: sí; reemplazar OpenRouter: no; cambiar modelos: sí; guardé creds: sí
+  # rotar API: sí; reemplazar OpenRouter: no; cambiar modelo: sí; guardé creds: sí
   printf 'yes\nno\nyes\nyes\n' > "$DIALOG_YESNO_QUEUE"
-  printf '%s\n%s\n' "foo/bar-model" "foo/aux-model" > "$DIALOG_INPUTBOX_QUEUE"
+  echo "foo/bar-model" > "$DIALOG_INPUTBOX_QUEUE"
   : > "$DIALOG_PASSWORDBOX_QUEUE"
 
   bash "$REPO_ROOT/modules/hermes.sh" || return 1
@@ -223,15 +239,16 @@ test_hermes_rerun_can_rotate_api_key_and_change_models() {
   assert_eq $'# mio\nmodel:\n  default: x/y' "$(< "$APPDATA_ROOT/hermes/config.yaml")" || return 1
   assert_file_contains "$STUB_CALL_LOG" $'exec\t-u\t'"$(id -u):$(id -g)"$'\thermes\t/opt/hermes/.venv/bin/hermes\tconfig\tset\tmodel.default\tfoo/bar-model' "docker exec con el uid/gid del agente" || return 1
   if grep -F $'docker\texec\t' "$STUB_CALL_LOG" | grep -vF $'exec\t-u\t' | grep -q .; then fail "un docker exec corrió sin -u"; return 1; fi
-  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.vision.model\tfoo/aux-model' || return 1
-  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.moa_aggregator.model\tfoo/aux-model' || return 1
+  # Ya no hay modelo auxiliar aparte: ninguna tarea se fija a un modelo.
+  assert_file_not_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.vision.model\tfoo' || return 1
+  assert_not_contains "$(_hm_dialog_text)" "Hermes — modelo auxiliar" "sin cuadro de modelo auxiliar" || return 1
   assert_file_contains "$STUB_CALL_LOG" $'docker\trestart\thermes' || return 1
 }
 
 test_hermes_ports_only_on_lan_and_tailscale_ips() {
   _hm_setup
   local out
-  out="$( ( source "$REPO_ROOT/lib/core.sh"; compose_render_hermes "$_HM_SUBNET" "1.1.1.1,9.9.9.9" "$_HM_LAN" "$_HM_TS" ) )" || return 1
+  out="$( ( source "$REPO_ROOT/lib/core.sh"; compose_render_hermes "$_HM_SUBNET" "1.1.1.1,9.9.9.9" America/Santiago "$_HM_LAN" "$_HM_TS" ) )" || return 1
   assert_contains "$out" "- \"${_HM_LAN}:8642:8642\"" || return 1
   assert_contains "$out" "- \"${_HM_LAN}:9119:9119\"" || return 1
   assert_contains "$out" "- \"${_HM_TS}:8642:8642\"" || return 1
@@ -248,19 +265,19 @@ test_hermes_ports_only_on_lan_and_tailscale_ips() {
   # Entradas inválidas.
   local bad
   for bad in "0.0.0.0" "" "300.1.1.1" "abc" "1.2.3"; do
-    if ( source "$REPO_ROOT/lib/core.sh"; compose_render_hermes "$_HM_SUBNET" "1.1.1.1" "$bad" ) >/dev/null 2>&1; then
+    if ( source "$REPO_ROOT/lib/core.sh"; compose_render_hermes "$_HM_SUBNET" "1.1.1.1" America/Santiago "$bad" ) >/dev/null 2>&1; then
       fail "aceptó la IP inválida [$bad]"; return 1
     fi
   done
-  if ( source "$REPO_ROOT/lib/core.sh"; compose_render_hermes "$_HM_SUBNET" "1.1.1.1" ) >/dev/null 2>&1; then
+  if ( source "$REPO_ROOT/lib/core.sh"; compose_render_hermes "$_HM_SUBNET" "1.1.1.1" America/Santiago ) >/dev/null 2>&1; then
     fail "aceptó cero IPs"; return 1
   fi
   for bad in "8.8.8.0/24" "10.1.2.0/16" "10.1.2.3/24" "abc"; do
-    if ( source "$REPO_ROOT/lib/core.sh"; compose_render_hermes "$bad" "1.1.1.1" "$_HM_LAN" ) >/dev/null 2>&1; then
+    if ( source "$REPO_ROOT/lib/core.sh"; compose_render_hermes "$bad" "1.1.1.1" America/Santiago "$_HM_LAN" ) >/dev/null 2>&1; then
       fail "aceptó la subred inválida [$bad]"; return 1
     fi
   done
-  if ( source "$REPO_ROOT/lib/core.sh"; compose_render_hermes "$_HM_SUBNET" "no-ip" "$_HM_LAN" ) >/dev/null 2>&1; then
+  if ( source "$REPO_ROOT/lib/core.sh"; compose_render_hermes "$_HM_SUBNET" "no-ip" America/Santiago "$_HM_LAN" ) >/dev/null 2>&1; then
     fail "aceptó un DNS inválido"; return 1
   fi
 }
@@ -367,7 +384,7 @@ test_hermes_cancel_shows_message() {
 test_hermes_invalid_model_id_rejected() {
   _hm_setup
   echo "$_HM_OR_KEY" > "$DIALOG_PASSWORDBOX_QUEUE"
-  printf '%s\n%s\n' "modelo con espacios" "qwen/qwen3.7-flash" > "$DIALOG_INPUTBOX_QUEUE"
+  echo "modelo con espacios" > "$DIALOG_INPUTBOX_QUEUE"
   if bash "$REPO_ROOT/modules/hermes.sh"; then fail "aceptó un id de modelo inválido"; return 1; fi
   assert_contains "$(_hm_dialog_text)" "no tiene la forma autor/modelo" || return 1
   [[ ! -e "$APPDATA_ROOT/hermes/config.yaml" ]] || { fail "sembró config.yaml con un modelo inválido"; return 1; }
@@ -398,7 +415,7 @@ test_hermes_models_endpoint_rejection_gives_clear_message() {
 test_hermes_credentials_shown_again_until_confirmed() {
   _hm_setup
   echo "$_HM_OR_KEY" > "$DIALOG_PASSWORDBOX_QUEUE"
-  printf '%s\n%s\n' "deepseek/deepseek-v4.1-flash" "qwen/qwen3.7-flash" > "$DIALOG_INPUTBOX_QUEUE"
+  echo "deepseek/deepseek-v4.1-flash" > "$DIALOG_INPUTBOX_QUEUE"
   : > "$DIALOG_YESNO_QUEUE"      # nunca confirma
   if bash "$REPO_ROOT/modules/hermes.sh"; then fail "debió fallar sin confirmar"; return 1; fi
   assert_eq "1" "$(_hm_secret HLI_CREDENTIALS_PENDING)" "queda pendiente" || return 1
@@ -488,7 +505,7 @@ test_hermes_empty_config_is_reseeded() {
   mkdir -p "$APPDATA_ROOT/hermes"
   : > "$APPDATA_ROOT/hermes/config.yaml"
   : > "$DIALOG_YESNO_QUEUE"
-  printf '%s\n%s\n' "deepseek/deepseek-v4.1-flash" "qwen/qwen3.7-flash" > "$DIALOG_INPUTBOX_QUEUE"
+  echo "deepseek/deepseek-v4.1-flash" > "$DIALOG_INPUTBOX_QUEUE"
   bash "$REPO_ROOT/modules/hermes.sh" || return 1
   assert_file_contains "$APPDATA_ROOT/hermes/config.yaml" "mode: manual" "reescrito" || return 1
 }
@@ -499,7 +516,7 @@ test_hermes_invalid_config_is_backed_up_and_reseeded_atomically() {
   mkdir -p "$APPDATA_ROOT/hermes"
   printf 'basura: sin la clave principal\n' > "$APPDATA_ROOT/hermes/config.yaml"
   : > "$DIALOG_YESNO_QUEUE"
-  printf '%s\n%s\n' "deepseek/deepseek-v4.1-flash" "qwen/qwen3.7-flash" > "$DIALOG_INPUTBOX_QUEUE"
+  echo "deepseek/deepseek-v4.1-flash" > "$DIALOG_INPUTBOX_QUEUE"
   bash "$REPO_ROOT/modules/hermes.sh" || return 1
   assert_file_contains "$APPDATA_ROOT/hermes/config.yaml" "default: deepseek/deepseek-v4.1-flash" || return 1
   local bak; bak="$(ls "$APPDATA_ROOT"/hermes/config.yaml.invalido-* 2>/dev/null | head -1)"
@@ -519,7 +536,7 @@ test_hermes_partial_secrets_file_loads_all_and_generates_only_missing() {
   printf 'OPENROUTER_API_KEY=%s\nHERMES_DASHBOARD_BASIC_AUTH_PASSWORD=Custom1234abcd\n' "$_HM_OR_KEY" > "$SECRETS_DIR/hermes.env"
   chmod 0600 "$SECRETS_DIR/hermes.env"; chmod 000 "$SECRETS_DIR"
   : > "$DIALOG_PASSWORDBOX_QUEUE"; : > "$DIALOG_YESNO_QUEUE"
-  printf '%s\n%s\n' "deepseek/deepseek-v4.1-flash" "qwen/qwen3.7-flash" > "$DIALOG_INPUTBOX_QUEUE"
+  echo "deepseek/deepseek-v4.1-flash" > "$DIALOG_INPUTBOX_QUEUE"
   printf 'no\nno\nyes\n' > "$DIALOG_YESNO_QUEUE"   # rotar: no; reemplazar: no; credenciales guardadas: sí
   bash "$REPO_ROOT/modules/hermes.sh" || return 1
   assert_eq "$_HM_OR_KEY" "$(_hm_secret OPENROUTER_API_KEY)" "la clave de OpenRouter no se pierde ni se vuelve a pedir" || return 1
@@ -534,7 +551,7 @@ test_hermes_missing_openrouter_key_in_existing_file_prompts_without_rotating_oth
   printf 'API_SERVER_KEY=%s\nHERMES_DASHBOARD_BASIC_AUTH_PASSWORD=Custom1234abcd\nHERMES_DASHBOARD_BASIC_AUTH_SECRET=%s\nHLI_CREDENTIALS_PENDING=0\n' "$(printf 'ab%.0s' {1..32})" "$(printf 'cd%.0s' {1..32})" > "$SECRETS_DIR/hermes.env"
   chmod 0600 "$SECRETS_DIR/hermes.env"; chmod 000 "$SECRETS_DIR"
   echo "$_HM_OR_KEY" > "$DIALOG_PASSWORDBOX_QUEUE"
-  printf '%s\n%s\n' "deepseek/deepseek-v4.1-flash" "qwen/qwen3.7-flash" > "$DIALOG_INPUTBOX_QUEUE"
+  echo "deepseek/deepseek-v4.1-flash" > "$DIALOG_INPUTBOX_QUEUE"
   printf 'no\n' > "$DIALOG_YESNO_QUEUE"      # rotar API: no
   bash "$REPO_ROOT/modules/hermes.sh" || return 1
   assert_eq "$_HM_OR_KEY" "$(_hm_secret OPENROUTER_API_KEY)" || return 1
@@ -572,7 +589,7 @@ test_hermes_health_failure_after_model_change_is_reported() {
   mkdir -p "$APPDATA_ROOT/hermes"
   printf 'model:\n  default: x/y\n' > "$APPDATA_ROOT/hermes/config.yaml"
   printf 'no\nno\nyes\n' > "$DIALOG_YESNO_QUEUE"
-  printf '%s\n%s\n' "foo/bar-model" "foo/aux-model" > "$DIALOG_INPUTBOX_QUEUE"
+  echo "foo/bar-model" > "$DIALOG_INPUTBOX_QUEUE"
   export STUB_HERMES_HEALTH_FAIL_AFTER_RESTART=1
   if bash "$REPO_ROOT/modules/hermes.sh"; then fail "debió fallar"; return 1; fi
   assert_contains "$(_hm_dialog_text)" "no volvió a responder a tiempo" || return 1
@@ -901,4 +918,363 @@ test_hermes_no_acl_warning_when_subnet_allowed() {
   if _hm_dialog_text | grep -qF "Allowed clients"; then
     fail "no debe avisar si la red de Hermes ya está permitida"; return 1
   fi
+}
+
+# --- Zona horaria (HERMES_TIMEZONE) --------------------------------------------------------------
+
+test_hermes_timezone_detected_from_host_goes_to_compose_and_config() {
+  _hm_setup
+  export STUB_TIMEZONE="Europe/Madrid"
+  _hm_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_file_contains "$STUB_HTTP_BODIES_LOG" "HERMES_TIMEZONE=Europe/Madrid" "compose con la zona del servidor" || return 1
+  assert_file_contains "$APPDATA_ROOT/hermes/config.yaml" "timezone: Europe/Madrid" || return 1
+  if _hm_dialog_text | grep -qF "zona horaria"; then fail "preguntó la zona teniendo una detectada"; return 1; fi
+  # Ningún secreto en esa variable ni en el compose versionado.
+  assert_file_not_contains "$REPO_ROOT/compose/hermes/docker-compose.yml" "Europe/Madrid" || return 1
+}
+
+test_hermes_timezone_utc_host_asks_and_validates() {
+  _hm_setup
+  local utc
+  for utc in UTC Etc/UTC ""; do
+    : > "$STUB_CALL_LOG"; : > "$STUB_HTTP_BODIES_LOG"
+    rm -rf "$APPDATA_ROOT/hermes"; ( source "$REPO_ROOT/lib/core.sh"; chmod u+rwx "$SECRETS_DIR" 2>/dev/null; rm -f "$SECRETS_DIR/hermes.env" ) || true
+    chmod 000 "$SECRETS_DIR" 2>/dev/null || true
+    export STUB_TIMEZONE="$utc"
+    echo "$_HM_OR_KEY" > "$DIALOG_PASSWORDBOX_QUEUE"
+    printf '%s\n%s\n' "deepseek/deepseek-v4.1-flash" "America/Bogota" > "$DIALOG_INPUTBOX_QUEUE"
+    echo "yes" > "$DIALOG_YESNO_QUEUE"
+    bash "$REPO_ROOT/modules/hermes.sh" || { fail "falló con el servidor en [$utc]"; return 1; }
+    assert_contains "$(_hm_dialog_text)" "El servidor está en UTC" "pregunta con [$utc]" || return 1
+    assert_file_contains "$STUB_HTTP_BODIES_LOG" "HERMES_TIMEZONE=America/Bogota" || return 1
+    assert_file_contains "$APPDATA_ROOT/hermes/config.yaml" "timezone: America/Bogota" || return 1
+    sed -i '/^hermes$/d' "$STATE_FILE"
+  done
+}
+
+test_hermes_timezone_falls_back_to_etc_timezone_when_timedatectl_fails() {
+  _hm_setup
+  export STUB_TIMEDATECTL_FAIL=1
+  echo "Europe/Madrid" > "$HLI2_TZ_FILE"
+  _hm_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_file_contains "$STUB_HTTP_BODIES_LOG" "HERMES_TIMEZONE=Europe/Madrid" || return 1
+}
+
+test_hermes_timezone_default_proposal_is_santiago_or_the_saved_one() {
+  _hm_setup
+  export STUB_TIMEZONE="UTC"
+  _hm_first_run_queues
+  printf '%s\n%s\n' "deepseek/deepseek-v4.1-flash" "America/Santiago" > "$DIALOG_INPUTBOX_QUEUE"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  # El valor propuesto (último argumento del cuadro de entrada) es America/Santiago.
+  grep -F $'dialog\t' "$STUB_CALL_LOG" | grep -F "zona horaria" | grep -qP $'\tAmerica/Santiago$' \
+    || { fail "la zona propuesta por defecto debe ser America/Santiago"; return 1; }
+  # Con config.yaml ya sembrado, se propone la guardada.
+  : > "$STUB_CALL_LOG"
+  sed -i '/^hermes$/d' "$STATE_FILE"
+  sed -i 's#^timezone: .*#timezone: Europe/Madrid#' "$APPDATA_ROOT/hermes/config.yaml"
+  printf '%s\n' "Europe/Madrid" > "$DIALOG_INPUTBOX_QUEUE"
+  : > "$DIALOG_PASSWORDBOX_QUEUE"; : > "$DIALOG_YESNO_QUEUE"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  grep -F $'dialog\t' "$STUB_CALL_LOG" | grep -F "zona horaria" | grep -qP $'\tEurope/Madrid$' \
+    || { fail "debe proponer la zona ya guardada en config.yaml"; return 1; }
+}
+
+test_hermes_timezone_invalid_answers_are_rejected_before_installing() {
+  _hm_setup
+  export STUB_TIMEZONE="UTC"
+  local bad
+  for bad in "Mars/Olympus" "../../etc/passwd" "America/Santiago; rm -rf /" "UTC" "Etc/UTC" "America/Santiago extra" "a b"; do
+    : > "$STUB_CALL_LOG"; : > "$STUB_HTTP_BODIES_LOG"
+    echo "$_HM_OR_KEY" > "$DIALOG_PASSWORDBOX_QUEUE"
+    printf '%s\n%s\n' "deepseek/deepseek-v4.1-flash" "$bad" > "$DIALOG_INPUTBOX_QUEUE"
+    if bash "$REPO_ROOT/modules/hermes.sh"; then fail "aceptó la zona [$bad]"; return 1; fi
+    assert_contains "$(_hm_dialog_text)" "no es una zona horaria válida" "mensaje para [$bad]" || return 1
+    assert_file_not_contains "$STUB_HTTP_BODIES_LOG" "compose.create" "no se desplegó con [$bad]" || return 1
+    assert_file_not_contains "$STATE_FILE" "hermes" || return 1
+    [[ ! -e "$APPDATA_ROOT/hermes/config.yaml" ]] || { fail "sembró config.yaml con una zona inválida [$bad]"; return 1; }
+  done
+}
+
+test_hermes_timezone_cancel_stops_cleanly() {
+  _hm_setup
+  export STUB_TIMEZONE="UTC"
+  echo "$_HM_OR_KEY" > "$DIALOG_PASSWORDBOX_QUEUE"
+  echo "deepseek/deepseek-v4.1-flash" > "$DIALOG_INPUTBOX_QUEUE"     # la zona queda sin respuesta: cancelar
+  if bash "$REPO_ROOT/modules/hermes.sh"; then fail "debió cancelar"; return 1; fi
+  assert_contains "$(_hm_dialog_text)" "no se indicó la zona horaria" || return 1
+  assert_file_not_contains "$STATE_FILE" "hermes" || return 1
+}
+
+test_hermes_compose_rejects_invalid_timezone_and_renders_valid_one() {
+  _hm_setup
+  local out bad
+  out="$( ( source "$REPO_ROOT/lib/core.sh"; compose_render_hermes "$_HM_SUBNET" "1.1.1.1" Europe/Madrid "$_HM_LAN" ) )" || return 1
+  assert_contains "$out" "- HERMES_TIMEZONE=Europe/Madrid" || return 1
+  assert_not_contains "$out" "__TIMEZONE__" "sin marcadores sin sustituir" || return 1
+  for bad in "" "UTC; x" "../etc" "a b" 'x"y' "A/B/C/D" "-"; do
+    if ( source "$REPO_ROOT/lib/core.sh"; compose_render_hermes "$_HM_SUBNET" "1.1.1.1" "$bad" "$_HM_LAN" ) >/dev/null 2>&1; then
+      fail "aceptó la zona inválida [$bad]"; return 1
+    fi
+  done
+}
+
+# --- Tareas auxiliares: siguen al modelo del chat (auto) -----------------------------------------
+
+# Líneas "tarea\top\tclave\tvalor" que planificaría la migración para el YAML $1.
+_hm_aux_plan() {
+  bash -c 'source "$1"; _hermes_aux_plan "$2"; printf "%s\n" "${H_AUX_OPS[@]}"; echo "PLANNED:${H_AUX_PLANNED[*]}"; echo "CUSTOM:${H_AUX_CUSTOM[*]}"' \
+    "$REPO_ROOT/modules/_" "$REPO_ROOT/modules/hermes.sh" "$1"
+}
+
+# Bloque 'auxiliary:' de la versión 2.6a: provider openrouter + modelo $1 en las tareas $2...
+_hm_aux_block_or() {
+  local model="$1" t; shift
+  for t in "$@"; do printf '  %s:\n    provider: openrouter\n    model: %s\n' "$t" "$model"; done
+}
+
+# Bloque de la versión 2.6c: gemma4:e2b local con todo lo que escribía.
+_hm_aux_block_local() {
+  local t
+  for t in "$@"; do
+    printf '  %s:\n    provider: custom\n    model: gemma4:e2b\n    base_url: http://10.213.144.250:11434/v1\n    api_key: no-key-required\n' "$t"
+    [[ "$t" == review ]] || printf '    timeout: 3600\n'
+    case "$t" in review|memory_query_rewrite) ;; *) printf '    reasoning_effort: none\n' ;; esac
+    [[ "$t" != compression ]] || printf '    no_progress_timeout: 900\n'
+  done
+}
+
+test_hermes_aux_plan_converts_openrouter_pins_and_adds_local_timeouts() {
+  _hm_setup
+  local yaml out
+  yaml="$(printf 'auxiliary:\n'; _hm_aux_block_or qwen/qwen3.7-flash "${_HM_TASKS[@]}")"
+  out="$(_hm_aux_plan "$yaml")"
+  local t
+  for t in "${_HM_TASKS[@]}"; do
+    assert_contains "$out" "aux:${t}"$'\tset\tauxiliary.'"${t}"$'.provider\tauto' "provider auto en $t" || return 1
+    assert_contains "$out" "aux:${t}"$'\tset\tauxiliary.'"${t}"$'.model\t' "model vacío en $t" || return 1
+    assert_not_contains "$out" "auxiliary.${t}.base_url" || return 1
+  done
+  assert_contains "$out" $'auxiliary.compression.timeout\t1800' "compresión con tiempo amplio" || return 1
+  assert_contains "$out" $'auxiliary.compression.no_progress_timeout\t900' || return 1
+  assert_contains "$out" $'auxiliary.title_generation.timeout\t120' || return 1
+  assert_not_contains "$out" "auxiliary.vision.timeout" "solo compresión y títulos llevan tiempos" || return 1
+  assert_contains "$out" "CUSTOM:" || return 1
+  assert_contains "$out" "PLANNED:${_HM_TASKS[*]}" || return 1
+}
+
+test_hermes_aux_plan_removes_only_local_pins_it_wrote() {
+  _hm_setup
+  local yaml out
+  yaml="$(printf 'auxiliary:\n'; _hm_aux_block_local "${_HM_TASKS[@]}")"
+  out="$(_hm_aux_plan "$yaml")"
+  # Se quitan base_url, api_key, razonamiento y el timeout de 3600 (con 'unset', no con valores inventados).
+  assert_contains "$out" "aux:vision"$'\tunset\tauxiliary.vision.base_url' || return 1
+  assert_contains "$out" "aux:vision"$'\tunset\tauxiliary.vision.api_key' || return 1
+  assert_contains "$out" "aux:vision"$'\tunset\tauxiliary.vision.reasoning_effort' || return 1
+  assert_contains "$out" "aux:vision"$'\tunset\tauxiliary.vision.timeout' || return 1
+  assert_contains "$out" "aux:vision"$'\tset\tauxiliary.vision.provider\tauto' || return 1
+  assert_contains "$out" "aux:vision"$'\tset\tauxiliary.vision.model\t' || return 1
+  # review no tenía timeout ni razonamiento.
+  assert_not_contains "$out" "auxiliary.review.timeout" || return 1
+  assert_not_contains "$out" "auxiliary.review.reasoning_effort" || return 1
+  # Compresión: el 3600 pasa a 1800 (set, no unset); el no_progress_timeout ya es 900.
+  assert_contains "$out" "aux:compression"$'\tset\tauxiliary.compression.timeout\t1800' || return 1
+  assert_not_contains "$out" "auxiliary.compression.no_progress_timeout" "ya está en 900" || return 1
+  assert_contains "$out" "aux:title_generation"$'\tset\tauxiliary.title_generation.timeout\t120' || return 1
+  # Orden: el proveedor es lo ÚLTIMO de cada tarea (una interrupción deja la tarea reconocible).
+  local last
+  last="$(grep -F "aux:vision"$'\t' <<<"$out" | tail -1)"
+  assert_contains "$last" $'auxiliary.vision.provider\tauto' "provider al final" || return 1
+}
+
+test_hermes_aux_plan_leaves_user_custom_pins_alone_and_reports_them() {
+  _hm_setup
+  local yaml out
+  # 17 tareas con el modelo de la versión anterior; 'vision' con otro modelo; 'curator' hacia un servidor propio.
+  yaml="$(printf 'auxiliary:\n'
+    _hm_aux_block_or qwen/qwen3.7-flash $(printf '%s\n' "${_HM_TASKS[@]}" | grep -vxE 'vision|curator')
+    printf '  vision:\n    provider: openrouter\n    model: google/gemini-3-flash\n'
+    printf '  curator:\n    provider: custom\n    model: mi-modelo\n    base_url: http://192.168.1.50:8080/v1\n    api_key: secreto-mio\n')"
+  out="$(_hm_aux_plan "$yaml")"
+  assert_not_contains "$out" "auxiliary.vision." "no toca vision" || return 1
+  assert_not_contains "$out" "auxiliary.curator." "no toca curator" || return 1
+  assert_contains "$out" "auxiliary.mcp.provider" || return 1
+  assert_contains "$out" "CUSTOM:vision (openrouter/google/gemini-3-flash)" || return 1
+  assert_contains "$out" "curator (custom/mi-modelo, http://192.168.1.50:8080/v1)" || return 1
+  # Un puerto distinto de 11434 o una clave real nunca cuentan como "propios del HLI".
+  yaml="$(printf 'auxiliary:\n  vision:\n    provider: custom\n    model: gemma4:e2b\n    base_url: http://10.0.0.5:11434/v1\n    api_key: clave-real\n  mcp:\n    provider: custom\n    model: gemma4:e2b\n    base_url: http://10.0.0.5:8080/v1\n    api_key: no-key-required\n')"
+  out="$(_hm_aux_plan "$yaml")"
+  assert_eq "PLANNED:" "$(grep '^PLANNED:' <<<"$out")" "ninguna tarea del HLI" || return 1
+  assert_not_contains "$out" "auxiliary.vision." || return 1
+  assert_not_contains "$out" "auxiliary.mcp." || return 1
+}
+
+test_hermes_aux_plan_recognizes_the_users_aux_model_when_shared_by_most_tasks() {
+  _hm_setup
+  local yaml out
+  yaml="$(printf 'auxiliary:\n'; _hm_aux_block_or foo/aux-model "${_HM_TASKS[@]}")"
+  out="$(_hm_aux_plan "$yaml")"
+  assert_contains "$out" "PLANNED:${_HM_TASKS[*]}" "el modelo elegido por el usuario en la versión anterior también era del HLI" || return 1
+  # Pocas tareas con un modelo ajeno: no es del HLI.
+  yaml="$(printf 'auxiliary:\n'; _hm_aux_block_or foo/aux-model vision mcp)"
+  out="$(_hm_aux_plan "$yaml")"
+  assert_eq "PLANNED:" "$(grep '^PLANNED:' <<<"$out")" "un modelo ajeno en pocas tareas no es del HLI" || return 1
+  assert_not_contains "$out" "auxiliary.vision." || return 1
+}
+
+test_hermes_aux_plan_is_empty_for_clean_config_and_resumes_partial_states() {
+  _hm_setup
+  local out yaml
+  out="$(_hm_aux_plan $'model:\n  default: x/y\n')"
+  assert_contains "$out" "PLANNED:" || return 1
+  assert_not_contains "$out" "aux:" "sin bloque auxiliary no hay nada que migrar" || return 1
+  yaml="$(printf 'auxiliary:\n'; for t in "${_HM_TASKS[@]}"; do printf '  %s:\n    provider: auto\n    model: ""\n' "$t"; done)"
+  out="$(_hm_aux_plan "$yaml")"
+  assert_not_contains "$out" "aux:" "todo en auto: nada que hacer" || return 1
+  # Interrumpida: proveedor ya en auto pero el modelo anterior sigue; o ya sin base_url pero con provider custom.
+  yaml="$(printf 'auxiliary:\n  vision:\n    provider: auto\n    model: qwen/qwen3.7-flash\n  mcp:\n    provider: custom\n    model: gemma4:e2b\n  approval:\n    provider: auto\n    model: ""\n    api_key: no-key-required\n')"
+  out="$(_hm_aux_plan "$yaml")"
+  assert_contains "$out" "aux:vision"$'\tset\tauxiliary.vision.model\t' "completa vision" || return 1
+  assert_not_contains "$out" "auxiliary.vision.provider" || return 1
+  assert_contains "$out" "aux:mcp"$'\tset\tauxiliary.mcp.model\t' || return 1
+  assert_contains "$out" "aux:mcp"$'\tset\tauxiliary.mcp.provider\tauto' || return 1
+  assert_contains "$out" "aux:approval"$'\tunset\tauxiliary.approval.api_key' || return 1
+}
+
+test_hermes_fresh_install_has_no_aux_prompt_no_cli_calls_and_leaves_marker() {
+  _hm_setup
+  _hm_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_not_contains "$(_hm_dialog_text)" "Hermes — modelo auxiliar" "sin cuadro de modelo auxiliar" || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary' "la siembra ya deja todo en auto" || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" $'config\tunset' || return 1
+  chmod u+rwx "$SECRETS_DIR"
+  [[ -f "$SECRETS_DIR/hermes-aux-auto" ]] || { chmod 000 "$SECRETS_DIR"; fail "falta el marcador hermes-aux-auto"; return 1; }
+  assert_eq "600" "$(stat -c '%a' "$SECRETS_DIR/hermes-aux-auto")" "marcador root-only" || { chmod 000 "$SECRETS_DIR"; return 1; }
+  chmod 000 "$SECRETS_DIR"
+  # Ni el registro previo: no había nada que guardar.
+  chmod u+rwx "$SECRETS_DIR"; [[ ! -e "$SECRETS_DIR/hermes-aux-previous.conf" ]] || { chmod 000 "$SECRETS_DIR"; fail "registro previo innecesario"; return 1; }; chmod 000 "$SECRETS_DIR"
+  assert_contains "$(_hm_dialog_text)" "siguen al modelo de cada chat" || return 1
+}
+
+# Instalación previa con config.yaml que trae el bloque $1 (texto YAML de 'auxiliary:').
+_hm_seed_existing_with_aux() {
+  _hm_seed_previous 0
+  mkdir -p "$APPDATA_ROOT/hermes"
+  printf 'model:\n  provider: openrouter\n  default: x/y\n%s' "$1" > "$APPDATA_ROOT/hermes/config.yaml"
+  : > "$DIALOG_PASSWORDBOX_QUEUE"
+  : > "$DIALOG_YESNO_QUEUE"
+}
+
+_hm_cfg_call() { grep -qP "$1" "$STUB_CALL_LOG"; }
+
+test_hermes_rerun_migrates_openrouter_pins_to_auto_records_previous_and_restarts() {
+  _hm_setup
+  _hm_seed_existing_with_aux "$(printf 'auxiliary:\n'; _hm_aux_block_or qwen/qwen3.7-flash "${_HM_TASKS[@]}")"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  local t uid_gid; uid_gid="$(id -u):$(id -g)"
+  for t in "${_HM_TASKS[@]}"; do
+    _hm_cfg_call "exec\t-u\t${uid_gid}\thermes\t/opt/hermes/.venv/bin/hermes\tconfig\tset\tauxiliary\.${t}\.provider\tauto$" || { fail "falta provider auto en $t"; return 1; }
+    _hm_cfg_call "config\tset\tauxiliary\.${t}\.model\t$" || { fail "falta model vacío en $t"; return 1; }
+  done
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.compression.timeout\t1800' || return 1
+  # Registro previo (root 0600, una vez), marcador, reinicio y /health.
+  chmod u+rwx "$SECRETS_DIR"
+  assert_file_contains "$SECRETS_DIR/hermes-aux-previous.conf" "model: qwen/qwen3.7-flash" "valores previos guardados" || { chmod 000 "$SECRETS_DIR"; return 1; }
+  [[ -f "$SECRETS_DIR/hermes-aux-auto" ]] || { chmod 000 "$SECRETS_DIR"; fail "falta el marcador"; return 1; }
+  chmod 000 "$SECRETS_DIR"
+  local l_prev l_set
+  l_prev="$(grep -nF 'hermes-aux-previous.conf.tmp.' "$STUB_CALL_LOG" | head -1 | cut -d: -f1)"
+  l_set="$(grep -nF $'config\tset\tauxiliary.' "$STUB_CALL_LOG" | head -1 | cut -d: -f1)"
+  [[ -n "$l_prev" && -n "$l_set" && "$l_prev" -lt "$l_set" ]] || { fail "el registro previo debe guardarse antes de tocar nada"; return 1; }
+  assert_file_contains "$STUB_CALL_LOG" $'docker\trestart\thermes' || return 1
+  assert_contains "$(_hm_dialog_text)" "hermes-aux-previous.conf" "el mensaje final cita el registro" || return 1
+  assert_file_contains "$STATE_FILE" "hermes" || return 1
+  # Con el marcador, una nueva ejecución no vuelve a tocar nada (ni pisa decisiones del usuario).
+  : > "$STUB_CALL_LOG"; sed -i '/^hermes$/d' "$STATE_FILE"
+  printf 'auxiliary:\n' >> "$APPDATA_ROOT/hermes/config.yaml"; _hm_aux_block_or qwen/qwen3.7-flash vision >> "$APPDATA_ROOT/hermes/config.yaml"
+  : > "$DIALOG_YESNO_QUEUE"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary' "con marcador no se revisa 'auxiliary'" || return 1
+}
+
+test_hermes_rerun_migrates_local_pins_with_unset_and_reports_custom_ones() {
+  _hm_setup
+  local custom_t=curator
+  _hm_seed_existing_with_aux "$(printf 'auxiliary:\n'; _hm_aux_block_local $(printf '%s\n' "${_HM_TASKS[@]}" | grep -vx "$custom_t")
+    printf '  curator:\n    provider: openrouter\n    model: google/gemini-3-flash\n')"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary.vision.base_url' "quita la URL local con 'config unset'" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary.vision.api_key' || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary.vision.reasoning_effort' || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary.vision.timeout' || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.vision.provider\tauto' || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" "auxiliary.curator" "no toca la tarea con valores propios" || return 1
+  local texts; texts="$(_hm_dialog_text)"
+  assert_contains "$texts" "valores propios que NO se tocaron" || return 1
+  assert_contains "$texts" "curator (openrouter/google/gemini-3-flash)" || return 1
+  assert_file_contains "$STATE_FILE" "hermes" "las tareas propias no impiden terminar" || return 1
+  chmod u+rwx "$SECRETS_DIR"; [[ -f "$SECRETS_DIR/hermes-aux-auto" ]] || { chmod 000 "$SECRETS_DIR"; fail "falta el marcador"; return 1; }; chmod 000 "$SECRETS_DIR"
+}
+
+test_hermes_aux_migration_failure_is_incomplete_and_rerun_resumes() {
+  _hm_setup
+  _hm_seed_existing_with_aux "$(printf 'auxiliary:\n'; _hm_aux_block_or qwen/qwen3.7-flash "${_HM_TASKS[@]}")"
+  # Orden de vision: provider (1ª llamada) y model (2ª).
+  export STUB_HERMES_CONFIG_SET_FAIL_N="2"
+  if bash "$REPO_ROOT/modules/hermes.sh"; then fail "debió terminar con error si la migración quedó incompleta"; return 1; fi
+  unset STUB_HERMES_CONFIG_SET_FAIL_N
+  local texts; texts="$(_hm_dialog_text)"
+  assert_contains "$texts" "migración incompleta: 1 de 19 tareas auxiliares" || return 1
+  assert_contains "$texts" "vision: openrouter/qwen/qwen3.7-flash" "dice dónde quedó la tarea" || return 1
+  assert_contains "$texts" "vuelva a correr el módulo" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'docker\trestart\thermes' "Hermes se reinicia igual (proceso = disco)" || return 1
+  assert_file_not_contains "$STATE_FILE" "hermes" "no se marca como hecho" || return 1
+  chmod u+rwx "$SECRETS_DIR"; [[ ! -e "$SECRETS_DIR/hermes-aux-auto" ]] || { chmod 000 "$SECRETS_DIR"; fail "marcador con la migración incompleta"; return 1; }; chmod 000 "$SECRETS_DIR"
+  # Re-ejecución: la CLI simulada no escribe el archivo; se deja el estado que habría quedado.
+  : > "$STUB_CALL_LOG"
+  printf 'model:\n  provider: openrouter\n  default: x/y\nauxiliary:\n  vision:\n    provider: auto\n    model: qwen/qwen3.7-flash\n' > "$APPDATA_ROOT/hermes/config.yaml"
+  _hm_aux_block_or qwen/qwen3.7-flash $(printf '%s\n' "${_HM_TASKS[@]}" | grep -vx vision) >> "$APPDATA_ROOT/hermes/config.yaml"
+  : > "$DIALOG_YESNO_QUEUE"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.vision.model\t' "completa la que faltaba" || return 1
+  chmod u+rwx "$SECRETS_DIR"; [[ -f "$SECRETS_DIR/hermes-aux-auto" ]] || { chmod 000 "$SECRETS_DIR"; fail "debió dejar el marcador al completar"; return 1; }; chmod 000 "$SECRETS_DIR"
+  assert_file_contains "$STATE_FILE" "hermes" || return 1
+}
+
+test_hermes_aux_migration_aborts_if_previous_values_cannot_be_saved() {
+  _hm_setup
+  _hm_seed_existing_with_aux "$(printf 'auxiliary:\n'; _hm_aux_block_or qwen/qwen3.7-flash "${_HM_TASKS[@]}")"
+  export STUB_SUDO_TEE_FAIL_TARGET="$SECRETS_DIR/hermes-aux-previous.conf"
+  if bash "$REPO_ROOT/modules/hermes.sh"; then fail "debió terminar con error"; return 1; fi
+  unset STUB_SUDO_TEE_FAIL_TARGET
+  assert_file_not_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary' "no toca nada sin registro previo" || return 1
+  assert_contains "$(_hm_dialog_text)" "no se pudo guardar el registro de sus valores previos" || return 1
+  assert_file_not_contains "$STATE_FILE" "hermes" || return 1
+}
+
+test_hermes_aux_migration_interrupt_prints_incomplete_note_and_exits() {
+  _hm_setup
+  _hm_seed_existing_with_aux "$(printf 'auxiliary:\n'; _hm_aux_block_or qwen/qwen3.7-flash "${_HM_TASKS[@]}")"
+  # El stub manda la señal al proceso 'modules/ollama.sh'; acá corre hermes.sh, así que se envía a este.
+  local rc=0
+  ( export STUB_HERMES_CONFIG_SET_INT_N=5 STUB_HERMES_CONFIG_SET_SIGNAL=TERM; bash -c 'exec -a modules/ollama.sh bash "$1"' _ "$REPO_ROOT/modules/hermes.sh" ) || rc=$?
+  assert_eq "130" "$rc" "sale con 130" || return 1
+  assert_contains "$(_hm_dialog_text)" "Se interrumpió la configuración de Hermes" || return 1
+  assert_contains "$(_hm_dialog_text)" "migración incompleta:" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'docker\trestart\thermes' "reinicia Hermes para que coincida con el disco" || return 1
+  assert_file_not_contains "$STATE_FILE" "hermes" || return 1
+  if (( $(grep -cP '^docker\t.*config\tset\t' "$STUB_CALL_LOG") > 6 )); then fail "siguió configurando tras la interrupción"; return 1; fi
+  chmod u+rwx "$SECRETS_DIR"; [[ ! -e "$SECRETS_DIR/hermes-aux-auto" ]] || { chmod 000 "$SECRETS_DIR"; fail "marcador tras interrupción"; return 1; }; chmod 000 "$SECRETS_DIR"
+}
+
+test_hermes_rerun_with_existing_config_without_auxiliary_block_only_leaves_marker() {
+  _hm_setup
+  _hm_seed_existing_with_aux ""
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary' || return 1
+  chmod u+rwx "$SECRETS_DIR"; [[ -f "$SECRETS_DIR/hermes-aux-auto" ]] || { chmod 000 "$SECRETS_DIR"; fail "falta el marcador"; return 1; }; chmod 000 "$SECRETS_DIR"
 }

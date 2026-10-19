@@ -65,6 +65,11 @@ __PORT_LINES__
     environment:
       - HERMES_UID=__UID__
       - HERMES_GID=__GID__
+      # Hora local para recordatorios/cron: Hermes lee HERMES_TIMEZONE, luego
+      # 'timezone:' de config.yaml y, si no hay ninguno, la hora del proceso
+      # (UTC en el contenedor); 'TZ' solo no lo lee Hermes (hermes_time.py,
+      # v0.22.2). Lo fija el módulo con la zona del servidor.
+      - HERMES_TIMEZONE=__TIMEZONE__
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - API_SERVER_ENABLED=true
       - API_SERVER_HOST=0.0.0.0

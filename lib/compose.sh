@@ -192,7 +192,8 @@ compose_render_cloudflared() {
 # --- Hermes Agent --------------------------------------------------------------
 
 # Argumentos: <subred /24 privada de la red del contenedor> <DNS: IPs
-# separadas por comas> <IP del host>... (una o más: la de la LAN y, si
+# separadas por comas> <zona horaria IANA, p. ej. America/Santiago: va a
+# HERMES_TIMEZONE, que Hermes lee para la hora de los recordatorios/cron> <IP del host>... (una o más: la de la LAN y, si
 # Tailscale está activo, la de Tailscale; en ellas se publican 8642 (API) y
 # 9119 (dashboard)).
 # Nunca 0.0.0.0 ni un puerto "pelado" (que Docker publicaría en todas las
@@ -206,13 +207,24 @@ _compose_valid_ipv4() {
   [[ "$1" != "0.0.0.0" ]]
 }
 
+# Nombre de zona horaria IANA (Area/Ciudad, con hasta dos barras): solo forma,
+# nada que rompa el YAML del compose; que exista en el sistema lo comprueba
+# modules/hermes.sh (_hermes_valid_timezone).
+_compose_valid_timezone() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_+-]*(/[A-Za-z0-9][A-Za-z0-9_+-]*){0,2}$ ]]
+}
+
 compose_render_hermes() {
   local template="$SCRIPT_DIR/compose/hermes/docker-compose.yml"
   [[ -f "$template" ]] || { echo "ERROR: falta $template" >&2; return 1; }
-  [[ $# -ge 3 ]] || { echo "ERROR: compose_render_hermes necesita subred, DNS y al menos una IP." >&2; return 1; }
+  [[ $# -ge 4 ]] || { echo "ERROR: compose_render_hermes necesita subred, DNS, zona horaria y al menos una IP." >&2; return 1; }
 
-  local subnet="$1" dns_csv="$2"
-  shift 2
+  local subnet="$1" dns_csv="$2" timezone="$3"
+  shift 3
+  if ! _compose_valid_timezone "$timezone"; then
+    echo "ERROR: zona horaria no válida para Hermes: '$timezone' (se espera, por ejemplo, America/Santiago)." >&2
+    return 1
+  fi
   if [[ ! "$subnet" =~ ^(10\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]{1,3}\.0/24$ ]]; then
     echo "ERROR: subred no válida para la red de Hermes: '$subnet' (se espera una /24 privada, ej. 10.x.y.0/24)." >&2
     return 1
@@ -247,6 +259,7 @@ compose_render_hermes() {
     | _compose_subst "__UID__" "$uid" \
     | _compose_subst "__GID__" "$gid" \
     | _compose_subst "__SUBNET__" "$subnet" \
+    | _compose_subst "__TIMEZONE__" "$timezone" \
     | _compose_subst "__DNS_LINES__" "$dns_lines" \
     | _compose_subst "__PORT_LINES__" "$port_lines"
 }
