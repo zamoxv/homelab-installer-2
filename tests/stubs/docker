@@ -89,6 +89,13 @@ if [[ "${1:-}" == "network" && "${2:-}" == "ls" && "$*" == *"--format"* ]]; then
   [[ -z "${STUB_DOCKER_NETWORKS:-}" ]] || awk '{print $1}' <<<"$STUB_DOCKER_NETWORKS"
   exit 0
 fi
+# Subredes IPAM de UNA red (módulo ollama): 'network inspect <red> --format
+# {{range .IPAM.Config}}{{.Subnet}} {{end}}' -> subredes de esa red según
+# STUB_DOCKER_NETWORKS ("<nombre> <subred>...").
+if [[ "${1:-}" == "network" && "${2:-}" == "inspect" && "$*" == *"{{range .IPAM.Config}}{{.Subnet}} {{end}}"* && "$*" != *"{{.Name}}"* ]]; then
+  awk -v n="${3:-}" '$1 == n { for (i = 2; i <= NF; i++) printf "%s ", $i; print "" }' <<<"${STUB_DOCKER_NETWORKS:-}"
+  exit 0
+fi
 # STUB_DOCKER_NET_CONTAINERS: líneas "<contenedor> <ip/prefijo>" de una red.
 if [[ "${1:-}" == "network" && "${2:-}" == "inspect" && "$*" == *"Containers"* ]]; then
   [[ -z "${STUB_DOCKER_NET_CONTAINERS:-}" ]] || printf '%s\n' "$STUB_DOCKER_NET_CONTAINERS"

@@ -137,6 +137,11 @@ case "$sub" in
       : > "$STUB_SAFE_ROOT/.mv-failed"
       exit 1
     fi
+    # STUB_SUDO_TEE_FAIL_TARGET=<ruta>: 'sudo tee <ruta>' falla tras consumir stdin.
+    if [[ "$sub" == "tee" && -n "${STUB_SUDO_TEE_FAIL_TARGET:-}" && "${args[-1]}" == "$STUB_SUDO_TEE_FAIL_TARGET"* ]]; then
+      cat >/dev/null 2>&1 || true
+      exit 1
+    fi
     if _stub_all_paths_safe "${args[@]:1}"; then
       _stub_unlock_root_area
       if [[ "$sub" == "install" ]]; then

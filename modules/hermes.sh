@@ -561,7 +561,7 @@ _hermes_validate_subnet() {
 #   (root-only) lista destinos 'ip:puerto/proto'. 'apply' los valida UNO POR
 #   UNO (IPv4 de la propia subred del contenedor, ni .0, .1 ni .255; puerto
 #   1-65535; tcp o udp) y agrega un ACCEPT por cada uno DENTRO de la
-#   construcción atómica de cada cadena (antes del hook), así que sobreviven a
+#   construcción atómica de la cadena FWD (antes del hook), así que sobreviven a
 #   reinicios y a cada 'apply'. Una línea inválida se ignora con un aviso (nunca
 #   se abre una excepción por una línea dudosa). Además queda el hook
 #   HLI2-HERMES-ALLOW para reglas manuales: 'apply' no la reconstruye y
@@ -589,6 +589,7 @@ IPT="\${HLI2_IPTABLES:-/usr/sbin/iptables}"
 SUBNET="${subnet}"
 DNS_HOSTS="${dns_hosts}"
 ALLOW_FILE="${HERMES_EGRESS_ALLOW_FILE}"
+EXPECT_UID="\${HLI2_EGRESS_EXPECT_UID:-0}"
 BLOCKED="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4"
 
 ipt() { "\$IPT" -w "\$@"; }
@@ -605,20 +606,38 @@ delete_jumps() {
   done < <(ipt -S "\$1" 2>/dev/null || true)
 }
 
-# Excepciones válidas de \$ALLOW_FILE, una por línea: "ip puerto proto". Solo
-# destinos dentro de la subred del contenedor (nunca la LAN), host entre .2 y
-# .254; lo demás se ignora con un aviso.
+# Excepciones válidas de \$ALLOW_FILE, una por línea: "ip puerto proto". El
+# archivo se lee como root, así que primero se exige que sea un archivo regular
+# (no un enlace), del uid esperado (0; HLI2_EGRESS_EXPECT_UID solo para los
+# tests) y con modo 600 o 400; si no, se ignora entero con un aviso. Solo se
+# recortan los espacios de los extremos de cada línea (los internos invalidan la
+# línea), un CR (archivo con fin de línea de Windows) la invalida, y solo valen
+# destinos dentro de la subred del contenedor (nunca la LAN), host .2-.254, sin
+# ceros a la izquierda; lo demás se ignora con un aviso.
 allow_rules() {
-  local line a b c d port proto
-  [[ -r "\$ALLOW_FILE" ]] || return 0
+  local line a b c d port proto st
+  [[ -e "\$ALLOW_FILE" || -L "\$ALLOW_FILE" ]] || return 0
+  if [[ -L "\$ALLOW_FILE" || ! -f "\$ALLOW_FILE" ]]; then
+    echo "hli2-hermes-egress: \$ALLOW_FILE no es un archivo regular: se ignora" >&2
+    return 0
+  fi
+  st="\$(stat -c '%u %a' -- "\$ALLOW_FILE" 2>/dev/null)" || st=""
+  if [[ "\$st" != "\$EXPECT_UID 600" && "\$st" != "\$EXPECT_UID 400" ]]; then
+    echo "hli2-hermes-egress: \$ALLOW_FILE debe ser de root (uid \$EXPECT_UID) con modo 600 o 400 (tiene '\$st'): se ignora" >&2
+    return 0
+  fi
   while IFS= read -r line || [[ -n "\$line" ]]; do
-    line="\${line%%#*}"
-    line="\${line//[[:space:]]/}"
-    [[ -n "\$line" ]] || continue
-    if [[ "\$line" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3}):([0-9]{1,5})/(tcp|udp)\$ ]]; then
-      a=\$((10#\${BASH_REMATCH[1]})); b=\$((10#\${BASH_REMATCH[2]})); c=\$((10#\${BASH_REMATCH[3]})); d=\$((10#\${BASH_REMATCH[4]}))
-      port=\$((10#\${BASH_REMATCH[5]})); proto="\${BASH_REMATCH[6]}"
-      if (( a <= 255 && b <= 255 && c <= 255 && d >= 2 && d <= 254 && port >= 1 && port <= 65535 )) && [[ "\$a.\$b.\$c" == "\${SUBNET%.*}" ]]; then
+    if [[ "\$line" == *\$'\\r'* ]]; then
+      echo "hli2-hermes-egress: línea con retorno de carro ignorada en \$ALLOW_FILE" >&2
+      continue
+    fi
+    line="\${line#"\${line%%[![:space:]]*}"}"
+    line="\${line%"\${line##*[![:space:]]}"}"
+    [[ -n "\$line" && "\${line:0:1}" != "#" ]] || continue
+    if [[ "\$line" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2}):([1-9][0-9]{0,4})/(tcp|udp)\$ ]]; then
+      a=\${BASH_REMATCH[1]}; b=\${BASH_REMATCH[2]}; c=\${BASH_REMATCH[3]}; d=\${BASH_REMATCH[4]}
+      port=\${BASH_REMATCH[5]}; proto="\${BASH_REMATCH[6]}"
+      if (( a <= 255 && b <= 255 && c <= 255 && d >= 2 && d <= 254 && port <= 65535 )) && [[ "\$a.\$b.\$c" == "\${SUBNET%.*}" ]]; then
         printf '%s %s %s\\n' "\$a.\$b.\$c.\$d" "\$port" "\$proto"
         continue
       fi
@@ -631,9 +650,13 @@ fill_chain() {
   local chain="\$1" kind="\$2" d r ip port proto
   ipt -N "\$chain"
   ipt -A "\$chain" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  while read -r ip port proto; do
-    ipt -A "\$chain" -d "\$ip" -p "\$proto" --dport "\$port" -j ACCEPT
-  done < <(allow_rules)
+  # Solo en FWD (tráfico hacia otros contenedores/máquinas): la cadena IN es
+  # para destinos que son el propio servidor, y las excepciones son de la subred.
+  if [[ "\$kind" == "fwd" ]]; then
+    while read -r ip port proto; do
+      ipt -A "\$chain" -d "\$ip" -p "\$proto" --dport "\$port" -j ACCEPT
+    done < <(allow_rules)
+  fi
   ipt -A "\$chain" -j HLI2-HERMES-ALLOW
   for d in \$DNS_HOSTS; do
     ipt -A "\$chain" -d "\$d" -p udp --dport 53 -j ACCEPT
@@ -784,17 +807,36 @@ _hermes_valid_allow_entry() {
   [[ "$ip" == "${BASH_REMATCH[1]}" ]]
 }
 
+# Escribe root:root 0600 el archivo $1 con el contenido $2 de forma atómica:
+# temporal en la MISMA carpeta (creado ya con el modo final) y 'mv' (rename). Si
+# algo falla, el archivo anterior queda intacto y no sobra el temporal. No
+# cambia el modo de la carpeta (puede ser /etc/hli2, 0700).
+_hermes_root_write() {
+  local f="$1" content="$2" stage
+  stage="${f}.tmp.$$"
+  sudo install -d -m 0700 -o root -g root "$(dirname "$f")" 2>/dev/null || true
+  sudo install -m 0600 -o root -g root /dev/null "$stage" || return 1
+  if ! printf '%s\n' "$content" | sudo tee "$stage" >/dev/null; then
+    sudo rm -f "$stage"
+    return 1
+  fi
+  if ! sudo mv -f "$stage" "$f"; then
+    sudo rm -f "$stage"
+    return 1
+  fi
+}
+
 # Agrega la excepción $1 al archivo (root-only 0600 en $SECRETS_DIR) si no
-# estaba. Valida contra la subred $2. No toca el resto del archivo. Deja
-# H_ALLOW_CHANGED en 1/0.
-H_ALLOW_CHANGED=0
+# estaba. Valida contra la subred $2. Escritura atómica (_hermes_root_write).
+# Aborta si 'sudo' no está disponible (no se puede saber si el archivo existe:
+# nunca se asume "no existe", se perderían las demás excepciones).
 _hermes_allow_add() {
   local entry="$1" subnet="$2" f content="" line
-  H_ALLOW_CHANGED=0
   _hermes_valid_allow_entry "$entry" "$subnet" || { echo "ERROR: excepción no válida o fuera de la subred de Hermes: '$entry'." >&2; return 1; }
   f="$HERMES_EGRESS_ALLOW_FILE"
-  if priv_file_exists "$f"; then
-    content="$(priv_file_read "$f")" || return 1
+  sudo -n true 2>/dev/null || { echo "ERROR: 'sudo' no está disponible sin contraseña: no se puede leer ni escribir $f." >&2; return 1; }
+  if sudo -n test -f "$f" 2>/dev/null; then
+    content="$(sudo -n cat -- "$f" 2>/dev/null)" || { echo "ERROR: no se pudo leer $f." >&2; return 1; }
     while IFS= read -r line; do
       [[ "$line" == "$entry" ]] && return 0
     done <<<"$content"
@@ -803,10 +845,7 @@ _hermes_allow_add() {
 # Una por línea: ip:puerto/proto. Solo destinos dentro de la subred de Hermes.
 # La lee hli2-hermes-egress en cada 'apply'."
   fi
-  sudo install -d -m 0700 -o root -g root "$SECRETS_DIR" || return 1
-  sudo install -m 0600 -o root -g root /dev/null "$f" || return 1
-  printf '%s\n%s\n' "$content" "$entry" | sudo tee "$f" >/dev/null || return 1
-  H_ALLOW_CHANGED=1
+  _hermes_root_write "$f" "$content"$'\n'"$entry"
 }
 
 # --- Publicación en la IP de Tailscale tras un reinicio ---------------------------------

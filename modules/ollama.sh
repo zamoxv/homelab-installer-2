@@ -53,6 +53,14 @@
 #   enviaría el contexto afuera. Por eso el módulo ofrece vaciar la cadena
 #   ('hermes fallback clear'); es la opción conservadora.
 #
+# - TAREAS AUXILIARES (decisión del usuario, 2026-10-18): las 19 pasan a
+#   gemma4:e2b local ('auxiliary.<tarea>.provider: custom' + base_url, ver
+#   _ollama_aux_pairs; agent/auxiliary_client.py _resolve_task_provider_model).
+#   Se guarda el bloque previo en /etc/hli2/hermes-aux-previous.conf. Excepción
+#   que no se puede cerrar: con un proveedor auxiliar explícito, una caída de
+#   conexión o un error 402/cuota cae al modelo principal (documentación de
+#   Hermes, "Auxiliary Capacity-Error Fallback": el último recurso corre siempre).
+#
 # Red: con Hermes instalado se une a la red de Hermes (nombre real tomado de
 # Docker: Dokploy le antepone el proyecto) con IP fija .250 de su subred
 # (HLI2_OLLAMA_IP lo cambia); el DHCP interno de Docker asigna desde .2 hacia
@@ -87,14 +95,21 @@ _ollama_egress_var() {
   sudo -n cat -- "$script" 2>/dev/null | awk -F'"' -v k="$1" '$0 ~ ("^" k "=") { print $2; exit }'
 }
 
-# Nombre real de la red de Hermes (…hermes-net); vacío y return 1 si no hay
-# exactamente una.
+# Nombre real de la red de Hermes ($1 = subred esperada, la del script de
+# aislamiento): una red '…hermes-net' cuya subred IPAM sea EXACTAMENTE esa. Si
+# hay más de una candidata o ninguna coincide, vacío y return 1 (una red con otra
+# subred no está cubierta por las reglas del firewall).
 _ollama_hermes_network() {
-  local names n found="" count=0
+  local subnet="$1" names n found="" count=0 subs sn
   names="$(hli_docker network ls --format '{{.Name}}' 2>/dev/null)" || return 1
   while IFS= read -r n; do
     [[ "$n" == *hermes-net ]] || continue
-    found="$n"; count=$(( count + 1 ))
+    subs="$(hli_docker network inspect "$n" --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null)" || continue
+    for sn in $subs; do
+      [[ "$sn" == "$subnet" ]] || continue
+      found="$n"; count=$(( count + 1 ))
+      break
+    done
   done <<<"$names"
   [[ "$count" -eq 1 ]] || return 1
   printf '%s' "$found"
@@ -117,9 +132,9 @@ _ollama_detect() {
   local subnet dns net ip
   subnet="$(_ollama_egress_var SUBNET)"
   dns="$(_ollama_egress_var DNS_HOSTS)"
-  net="$(_ollama_hermes_network)" || net=""
+  net="$(_ollama_hermes_network "$subnet")" || net=""
   if [[ -z "$subnet" || -z "$dns" || -z "$net" ]]; then
-    msg "Hermes figura como instalado, pero no se encontró su red de Docker o su script de aislamiento (/usr/local/sbin/hli2-hermes-egress). Ollama se despliega por separado, en su propia red, y NO se integra con Hermes. Vuelva a correr el módulo 'hermes' y luego este."
+    msg "Hermes figura como instalado, pero no se encontró su red de Docker (con la subred del aislamiento) o su script de aislamiento (/usr/local/sbin/hli2-hermes-egress). Ollama se despliega por separado, en su propia red, y NO se integra con Hermes. Vuelva a correr el módulo 'hermes' y luego este."
     return 0
   fi
   ip="${HLI2_OLLAMA_IP:-${subnet%.0/24}.250}"
@@ -203,9 +218,16 @@ _ollama_http_body() {
   curl -sS --connect-timeout 5 --max-time 15 -K - "$url" <<<"header = \"Authorization: Bearer ${key}\"" 2>/dev/null || true
 }
 
-# Pares "clave valor" para 'hermes config set'. Con el proveedor ya presente en
-# config.yaml solo se actualizan las URL (la IP pudo cambiar): no se pisan los
-# tiempos de espera ni nada que el usuario haya editado.
+# Modelo local de las tareas auxiliares (rápido, con imágenes) y archivos de
+# registro root-only (para revertir).
+OLLAMA_AUX_MODEL="gemma4:e2b"
+OLLAMA_AUX_TIMEOUT=3600
+OLLAMA_AUX_PREV_FILE="${SECRETS_DIR}/hermes-aux-previous.conf"
+OLLAMA_FALLBACK_REMOVED_FILE="${SECRETS_DIR}/hermes-fallback-removed.conf"
+
+# Pares "clave valor" del proveedor y las rutas para 'hermes config set'. Con el
+# proveedor ya presente en config.yaml solo se actualizan las URL (la IP pudo
+# cambiar): no se pisan los tiempos de espera ni nada que el usuario haya editado.
 _ollama_config_pairs() {
   local ip="$1" full="$2" m alias base="http://${1}:${OLLAMA_PORT}/v1"
   printf '%s\t%s\n' "providers.${OLLAMA_PROVIDER_ID}.api" "$base"
@@ -228,6 +250,65 @@ _ollama_config_pairs() {
   done
 }
 
+# Tareas auxiliares a la IA local (decisión del usuario, 2026-10-18): TODAS las
+# de HERMES_AUX_TASKS. Cada una con provider 'custom' + base_url + api_key
+# ficticia (agent/auxiliary_client.py _resolve_task_provider_model: una base_url
+# explícita con provider 'custom' se respeta tal cual, sin depender de que el
+# nombre 'providers.ollama-local' se resuelva), modelo gemma4:e2b, pensamiento
+# desactivado ('none': el valor por defecto de esos campos es una cadena, así que
+# 'hermes config set' la conserva literal y no la convierte en null) y tiempo de
+# espera largo. Los campos 'timeout' y 'reasoning_effort' solo existen en el
+# bloque por defecto de algunas tareas (hermes_cli/config_defaults.py): 'review'
+# no tiene ninguno y 'memory_query_rewrite' no tiene 'reasoning_effort'.
+_ollama_aux_pairs() {
+  local ip="$1" t base="http://${1}:${OLLAMA_PORT}/v1" pre
+  for t in "${HERMES_AUX_TASKS[@]}"; do
+    pre="auxiliary.${t}"
+    printf '%s\t%s\n' "${pre}.provider" "custom"
+    printf '%s\t%s\n' "${pre}.model" "$OLLAMA_AUX_MODEL"
+    printf '%s\t%s\n' "${pre}.base_url" "$base"
+    printf '%s\t%s\n' "${pre}.api_key" "no-key-required"
+    [[ "$t" == "review" ]] || printf '%s\t%s\n' "${pre}.timeout" "$OLLAMA_AUX_TIMEOUT"
+    case "$t" in review|memory_query_rewrite) ;; *) printf '%s\t%s\n' "${pre}.reasoning_effort" "none" ;; esac
+  done
+  # La compresión de un contexto largo puede pasar minutos sin emitir nada.
+  printf '%s\t%s\n' "auxiliary.compression.no_progress_timeout" "900"
+}
+
+# Bloque de nivel superior $2 (p. ej. 'auxiliary', 'fallback_providers') del
+# YAML en $1, tal cual está escrito (vacío si no existe).
+_ollama_yaml_block() {
+  awk -v k="$2" '
+    $0 ~ ("^" k ":") { on = 1; print; next }
+    on && /^[^[:space:]#-]/ { on = 0 }
+    on { print }
+  ' <<<"$1"
+}
+
+# Resumen "tarea: proveedor/modelo" del bloque auxiliary (solo tareas escritas).
+_ollama_aux_summary() {
+  awk '
+    function clean(v) { gsub(/["\047]/, "", v); return v }
+    /^auxiliary:/ { on = 1; next }
+    on && /^[^[:space:]#]/ { on = 0 }
+    on && /^  [A-Za-z_]+:[[:space:]]*$/ { task = $1; sub(/:$/, "", task); order[++n] = task; next }
+    on && task != "" && /^    provider:/ { prov[task] = clean($2) }
+    on && task != "" && /^    model:/ { mod[task] = clean($2) }
+    END { for (i = 1; i <= n; i++) { t = order[i]; printf "%s: %s/%s\n", t, (prov[t] == "" ? "auto" : prov[t]), (mod[t] == "" ? "(modelo principal)" : mod[t]) } }
+  ' <<<"$1"
+}
+
+# Tareas auxiliares que YA apuntan a Ollama (base_url con :11434/v1), una por
+# línea: en una re-ejecución solo a ellas se les actualiza la URL.
+_ollama_aux_already_local() {
+  awk '
+    /^auxiliary:/ { on = 1; next }
+    on && /^[^[:space:]#]/ { on = 0 }
+    on && /^  [A-Za-z_]+:[[:space:]]*$/ { task = $1; sub(/:$/, "", task); next }
+    on && task != "" && /^    base_url:.*:11434\/v1/ { print task }
+  ' <<<"$1"
+}
+
 # ¿config.yaml ya tiene la sección providers.ollama-local?
 _ollama_config_has_provider() {
   local content
@@ -235,12 +316,27 @@ _ollama_config_has_provider() {
   grep -Eq "^  ${OLLAMA_PROVIDER_ID}:" <<<"$content"
 }
 
-# ¿Hay entradas en fallback_providers? (lista no vacía: 'fallback_providers:' a
-# secas; vacía se guarda como 'fallback_providers: []').
+# ¿Hay respaldo automático configurado? 'fallback_providers' con entradas (la
+# lista no vacía se guarda como 'fallback_providers:' a secas; vacía, '[]') o la
+# clave heredada 'fallback_model' (Hermes v0.22.2 aún la lee: hermes_cli/
+# fallback_cmd.py _read_chain y _write_chain, que la elimina al escribir; la CLI
+# 'hermes fallback clear' cubre ambas).
 _ollama_config_has_fallback() {
   local content
   content="$(sudo -n cat -- "$(_hermes_config_path)" 2>/dev/null)" || return 1
-  grep -Eq '^fallback_providers:[[:space:]]*$' <<<"$content"
+  grep -Eq '^fallback_providers:[[:space:]]*$' <<<"$content" && return 0
+  local line v
+  line="$(grep -E -m1 '^fallback_model:' <<<"$content")" || return 1
+  v="${line#fallback_model:}"
+  v="${v#"${v%%[![:space:]]*}"}"
+  v="${v%"${v##*[![:space:]]}"}"
+  case "$v" in
+    ""|"#"*)
+      # Valor en las líneas siguientes (mapa o lista) o nulo: hay entradas si el bloque tiene más de una línea.
+      [[ "$(_ollama_yaml_block "$content" fallback_model | wc -l)" -gt 1 ]] ;;
+    null|Null|NULL|"~"|"{}"|"[]") return 1 ;;
+    *) return 0 ;;
+  esac
 }
 
 # Prueba desde DENTRO del contenedor de Hermes que alcanza a Ollama (el firewall
@@ -251,39 +347,100 @@ _ollama_probe_from_hermes() {
     "import urllib.request as u; print(u.urlopen('http://${ip}:${OLLAMA_PORT}/api/tags', timeout=8).status)" 2>/dev/null || true
 }
 
+# Deja en el archivo root-only $OLLAMA_AUX_PREV_FILE los valores de 'auxiliary'
+# previos a la migración (solo la primera vez: una re-ejecución no debe pisar el
+# registro original con valores ya locales). Deja en AUX_PREV_NOTE el resumen.
+_ollama_record_aux_previous() {
+  local content="$1" block summary
+  AUX_PREV_NOTE=""
+  block="$(_ollama_yaml_block "$content" auxiliary)"
+  summary="$(_ollama_aux_summary "$content")"
+  if sudo -n test -f "$OLLAMA_AUX_PREV_FILE" 2>/dev/null; then
+    AUX_PREV_NOTE="Se conserva el registro anterior de las tareas auxiliares en ${OLLAMA_AUX_PREV_FILE}."
+    return 0
+  fi
+  if ! _hermes_root_write "$OLLAMA_AUX_PREV_FILE" "# Valores de 'auxiliary' de Hermes ANTES de pasarlas a la IA local (HLI 2, módulo ollama), $(date +%F).
+# Para revertir una tarea: hermes config set auxiliary.<tarea>.provider/.model con estos valores
+# y vaciar .base_url y .api_key. Solo root.
+${block:-# (sin bloque auxiliary: valores por defecto de Hermes, provider auto)}"; then
+    AUX_PREV_NOTE="AVISO: no se pudo guardar el registro de las tareas auxiliares previas en ${OLLAMA_AUX_PREV_FILE}."
+    return 1
+  fi
+  if [[ -n "$summary" ]]; then
+    AUX_PREV_NOTE="Valores previos de las tareas auxiliares (guardados en ${OLLAMA_AUX_PREV_FILE}, solo root): $(printf '%s' "$summary" | tr '\n' ';')"
+  else
+    AUX_PREV_NOTE="Tareas auxiliares previas: ninguna escrita en config.yaml (provider auto = el modelo principal); registro en ${OLLAMA_AUX_PREV_FILE}."
+  fi
+}
+
 # Agrega el proveedor a config.yaml SIN reescribir el archivo: 'hermes config
 # set' dentro del contenedor, con el uid/gid del agente. Retorna 0 aunque algo
 # falle (el módulo informa y el usuario puede completar a mano).
 _ollama_integrate_hermes() {
-  local ip="$1" uid gid lan_ip key full=1 failed=0 k v body drop_fallback=0
+  local ip="$1" uid gid lan_ip key full=1 failed=0 k v body drop_fallback=0 content block t
   uid="$(id -u "$SERVER_USER")" gid="$(id -g "$SERVER_USER")"
-  INTEGRATION_NOTE=""
+  INTEGRATION_NOTE="" AUX_PREV_NOTE="" FALLBACK_NOTE="" AUX_MOVED=0
+  local -a pairs=()
 
   if ! _hermes_config_valid; then
     INTEGRATION_NOTE="No se integró con Hermes: no hay un config.yaml utilizable en ${APPDATA_ROOT}/hermes. Vuelva a correr el módulo 'hermes' y luego este."
     return 0
   fi
+  content="$(sudo -n cat -- "$(_hermes_config_path)" 2>/dev/null)" || content=""
   if _ollama_config_has_provider; then full=0; fi
 
-  # Privacidad: el respaldo automático es global y mandaría a OpenRouter un
-  # chat local que falle (ver el encabezado de este archivo).
+  # Privacidad: el respaldo automático es global y mandaría a OpenRouter un chat
+  # local que falle (ver el encabezado de este archivo). Cambiar un
+  # comportamiento en vivo exige un "Sí" explícito: el botón por defecto es "No".
   if _ollama_config_has_fallback; then
-    if confirm "Hermes tiene un respaldo automático (fallback_providers) hacia OpenRouter. Es GLOBAL: no se puede excluir a Ollama. Si un chat local falla (tiempo agotado, error del servidor, respuesta vacía), Hermes reintentaría ese mensaje con OpenRouter y la conversación saldría de su casa sin aviso.\n\n¿Quitar el respaldo automático? (Recomendado. Contra: si OpenRouter falla, el chat con el modelo por defecto da error en vez de probar otro. Se restituye con 'hermes fallback add'.)"; then
+    if confirm "Hermes tiene un respaldo automático (fallback_providers) hacia OpenRouter. Es GLOBAL: no se puede excluir a Ollama. Si un chat local falla (tiempo agotado, error del servidor, respuesta vacía), Hermes reintentaría ese mensaje con OpenRouter y la conversación saldría de su casa sin aviso.\n\nSe recomienda quitarlo. Antes de hacerlo se guardan las entradas (solo root) en ${OLLAMA_FALLBACK_REMOVED_FILE} para poder restituirlas con 'hermes fallback add'.\n\nContra: si OpenRouter falla, el chat con el modelo por defecto da error en vez de probar otro.\n\n¿Quitar el respaldo automático?" "no"; then
       drop_fallback=1
     fi
   fi
 
-  while IFS=$'\t' read -r k v; do
+  # Registro previo de 'auxiliary' ANTES de tocar nada (solo en la primera
+  # migración, que es cuando se mueven las tareas).
+  if [[ "$full" -eq 1 ]]; then
+    _ollama_record_aux_previous "$content" || true
+  fi
+
+  if [[ "$drop_fallback" -eq 1 ]]; then
+    block="$(_ollama_yaml_block "$content" fallback_providers)"$'\n'"$(_ollama_yaml_block "$content" fallback_model)"
+    if _hermes_root_write "$OLLAMA_FALLBACK_REMOVED_FILE" "# Respaldo automático de Hermes quitado por el módulo ollama (HLI 2), $(date +%F).
+# Para restituirlo: hermes fallback add (pide proveedor y modelo de cada entrada). Solo root.
+${block}"; then
+      FALLBACK_NOTE="Respaldo automático quitado; las entradas quedaron en ${OLLAMA_FALLBACK_REMOVED_FILE} (solo root): $(printf '%s' "$block" | grep -E '^[[:space:]-]*(provider|model):' | tr -s ' ' | tr '\n' ';')"
+    else
+      # Sin copia no se quita nada: la acción no sería reversible.
+      drop_fallback=0
+      FALLBACK_NOTE="No se pudo guardar una copia de las entradas del respaldo, así que NO se quitó."
+    fi
+  fi
+
+  hli_busy "Configurando Hermes con la CLI (unas decenas de comandos; puede tardar varios minutos)..."
+  mapfile -t pairs < <(_ollama_config_pairs "$ip" "$full")
+  if [[ "$full" -eq 1 ]]; then
+    mapfile -t -O "${#pairs[@]}" pairs < <(_ollama_aux_pairs "$ip")
+    AUX_MOVED=1
+  else
+    # Re-ejecución: solo se actualiza la URL de las tareas que ya eran locales.
+    while IFS= read -r t; do
+      [[ -n "$t" ]] || continue
+      pairs+=("auxiliary.${t}.base_url"$'\t'"http://${ip}:${OLLAMA_PORT}/v1")
+    done < <(_ollama_aux_already_local "$content")
+  fi
+  for k in "${pairs[@]}"; do
+    v="${k#*$'\t'}"; k="${k%%$'\t'*}"
     [[ -n "$k" ]] || continue
     hli_docker exec -u "${uid}:${gid}" hermes "$HERMES_BIN" config set "$k" "$v" >/dev/null 2>&1 || failed=1
-  done < <(_ollama_config_pairs "$ip" "$full")
+  done
 
   if [[ "$drop_fallback" -eq 1 ]]; then
     printf 'y\n' | hli_docker exec -i -u "${uid}:${gid}" hermes "$HERMES_BIN" fallback clear >/dev/null 2>&1 || failed=1
   fi
 
   if [[ "$failed" -eq 1 ]]; then
-    INTEGRATION_NOTE="No se pudo escribir toda la configuración de Hermes con su CLI. Revise ${APPDATA_ROOT}/hermes/config.yaml (providers.${OLLAMA_PROVIDER_ID}, platforms.api_server.model_routes y agent.reasoning_overrides) y reinicie el contenedor 'hermes'."
+    INTEGRATION_NOTE="No se pudo escribir toda la configuración de Hermes con su CLI. Revise ${APPDATA_ROOT}/hermes/config.yaml (providers.${OLLAMA_PROVIDER_ID}, platforms.api_server.model_routes, agent.reasoning_overrides y auxiliary.*) y reinicie el contenedor 'hermes'."
     return 0
   fi
 
@@ -315,12 +472,21 @@ _ollama_integrate_hermes() {
   if [[ "$code" != "200" ]]; then
     INTEGRATION_NOTE+="${INTEGRATION_NOTE:+ }Desde el contenedor de Hermes NO se alcanzó http://${ip}:${OLLAMA_PORT}/api/tags (respuesta: '${code:-ninguna}'). Revise la excepción de firewall: sudo cat ${HERMES_EGRESS_ALLOW_FILE} y sudo iptables -S HLI2-HERMES-FWD."
   fi
-  if [[ "$drop_fallback" -eq 1 ]]; then
-    INTEGRATION_NOTE+="${INTEGRATION_NOTE:+ }Se quitó el respaldo automático de Hermes."
-  elif _ollama_config_has_fallback; then
-    INTEGRATION_NOTE+="${INTEGRATION_NOTE:+ }AVISO: el respaldo automático hacia OpenRouter sigue activo: un chat local que falle podría reintentarse con OpenRouter."
+  if [[ "$drop_fallback" -eq 0 ]] && _ollama_config_has_fallback; then
+    FALLBACK_NOTE="${FALLBACK_NOTE:+$FALLBACK_NOTE }AVISO: el respaldo automático hacia OpenRouter sigue activo: si un chat local FALLA (Ollama caído, tiempo agotado, respuesta vacía), la conversación puede reenviarse a OpenRouter y filtrarse."
   fi
   return 0
+}
+
+# Texto de privacidad del mensaje final: qué queda local y las excepciones
+# explícitas. Sin Hermes no hay nada que declarar de sus tareas.
+_ollama_privacy_text() {
+  local moved="$1" fb="$2" t="" tasks="${HERMES_AUX_TASKS[*]}"
+  t="Privacidad (alcance real, no es total):\n- Local, sin salir de la casa: los chats que usted elija con ${OLLAMA_MODELS[0]} y, en todos los chats, las ${#HERMES_AUX_TASKS[@]} tareas auxiliares de Hermes (${tasks}) con ${OLLAMA_AUX_MODEL}.\n- Excepciones: (1) los chats con el modelo por defecto van a OpenRouter, por diseño. (2) Las herramientas web (buscar, abrir páginas) envían consultas y piden páginas a Internet por naturaleza, también desde un chat local. (3) Si Ollama falla por conexión caída o error de pago/cuota, Hermes cae por diseño al modelo principal de OpenRouter también en las tareas auxiliares; no hay una opción documentada para impedirlo. (4) Respaldo automático: ${fb:-no hay respaldo configurado}."
+  if [[ "$moved" -eq 1 ]]; then
+    t+="\n- Visión: gemma4:e2b admite imágenes según ollama.com/library/gemma4 ('Text, Image input'), pero con menor calidad que un modelo grande; no se verificó que Hermes la detecte con un endpoint propio. Si el análisis de imágenes falla, revierta 'vision' a su valor previo. voice_chat y tts_audio_tags son tareas de texto y también pasaron al modelo local."
+  fi
+  printf '%s' "$t"
 }
 
 # --- Principal -----------------------------------------------------------------------
@@ -371,7 +537,7 @@ _ollama_main() {
   fi
   _ollama_pull_models || return 1
 
-  INTEGRATION_NOTE=""
+  INTEGRATION_NOTE="" AUX_PREV_NOTE="" FALLBACK_NOTE="" AUX_MOVED=0
   local where
   if [[ "$O_MODE" == "hermes" ]]; then
     _ollama_integrate_hermes "$O_IP"
@@ -382,9 +548,14 @@ _ollama_main() {
 
   mark_done ollama
 
-  local aliases="" m
+  local aliases="" m privacy=""
   for m in "${OLLAMA_MODELS[@]}"; do aliases+="$(_ollama_alias "$m") "; done
-  msg "Ollama desplegado (composeId=${composeId}) con los modelos ${OLLAMA_MODELS[*]}.\n\n${where}${INTEGRATION_NOTE:+\n\nATENCIÓN: ${INTEGRATION_NOTE}}\n\nCómo usarlo: en hermes-android elija el modelo por conversación (selector de modelo del chat): gemma4:e4b es el cerebro local; los alias ${aliases% } aparecen en /v1/models. El modelo por defecto de Hermes sigue siendo el de OpenRouter.\n\nLatencia esperada (CPU, medida en este equipo): lectura de ~54 tokens/s y escritura de 12-16 tokens/s con gemma4:e4b. El primer mensaje de cada conversación puede tardar varios minutos (Hermes envía instrucciones y herramientas, decenas de miles de tokens, que hay que leer); los siguientes son más rápidos porque Ollama reutiliza el contexto ya leído. El 'pensamiento' del modelo está desactivado para ahorrar tiempo.\n\nPrivacidad: Ollama no tiene puertos en el host y solo Hermes lo alcanza (una única excepción de firewall). Los chats locales no salen de la casa mientras no haya respaldo automático hacia OpenRouter; el módulo ofrece quitarlo porque es global.\n\nMedición: sudo docker exec ollama ollama ps (modelo cargado, memoria y CONTEXT). Límites: 8 CPU y 20 GB de RAM."
+  if [[ "$O_MODE" == "hermes" ]]; then
+    privacy="$(_ollama_privacy_text "$AUX_MOVED" "$FALLBACK_NOTE")"
+  else
+    privacy="Privacidad: Ollama no tiene puertos en el host y no está conectado a nada; sin Hermes no hay chats que proteger."
+  fi
+  msg "Ollama desplegado (composeId=${composeId}) con los modelos ${OLLAMA_MODELS[*]}.\n\n${where}${INTEGRATION_NOTE:+\n\nATENCIÓN: ${INTEGRATION_NOTE}}\n\nCómo usarlo: en hermes-android elija el modelo por conversación (selector de modelo del chat): gemma4:e4b es el cerebro local; los alias ${aliases% } aparecen en /v1/models. El modelo por defecto de Hermes sigue siendo el de OpenRouter.\n\nLatencia esperada (CPU, medida en este equipo): lectura de ~54 tokens/s y escritura de 12-16 tokens/s con gemma4:e4b. El primer mensaje de cada conversación puede tardar varios minutos (Hermes envía instrucciones y herramientas, decenas de miles de tokens, que hay que leer); los siguientes son más rápidos porque Ollama reutiliza el contexto ya leído. El 'pensamiento' del modelo está desactivado para ahorrar tiempo.\n\n${privacy}${AUX_PREV_NOTE:+\n\n${AUX_PREV_NOTE}}\n\nMedición: sudo docker exec ollama ollama ps (modelo cargado, memoria y CONTEXT). Límites: 8 CPU y 20 GB de RAM."
   return 0
 }
 

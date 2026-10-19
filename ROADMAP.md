@@ -938,7 +938,7 @@ razonamiento): para tareas de fondo se apaga (`think: false`).
 
 **Decisión del usuario:** el modelo local también puede ser **cerebro de
 Hermes** (no solo trabajador de fondo): la espera no le importa y gana
-privacidad total y costo cero. Se elige el cerebro **por conversación**
+privacidad (con las excepciones listadas abajo) y costo cero. Se elige el cerebro **por conversación**
 (hermes-android permite elegir modelo por chat): local para lo privado o sin
 apuro, OpenRouter para lo urgente o difícil. Ollama guarda en caché el
 contexto ya leído, así que la espera larga es sobre todo el primer mensaje
@@ -965,7 +965,7 @@ de cada conversación (a medir).
       que lee `hli2-hermes-egress`.
 - [x] Modelos: `gemma4:e4b` como cerebro local (mejor calidad para
       herramientas) y `gemma4:e2b` para tareas de fondo rápidas.
-- [ ] **Validar en el M70q** (pruebas 130-151 de `docs/VALIDACION.md`).
+- [ ] **Validar en el M70q** (pruebas 130-156 de `docs/VALIDACION.md`).
 - [ ] **Prueba que decide:** tareas reales con herramientas desde un chat
       local (buscar en la web, crear un recordatorio, leer el informe del
       servidor de v2.6d). Si las hace bien, queda como cerebro opcional; si
@@ -1024,30 +1024,69 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
   vacías o inválidas repetidas (no verificado si un error de conexión, como
   Ollama apagado, también lo dispara: se asume que sí). Consecuencia: **un chat
   local que falle se reintentaría contra OpenRouter y la conversación saldría
-  de la casa**. Opción segura elegida: el módulo detecta si hay respaldo
-  configurado y **ofrece quitarlo** (`hermes fallback clear`, por defecto "Sí");
-  costo: el chat con el modelo por defecto da error si OpenRouter falla, en vez de
-  probar otro (se restituye con `hermes fallback add`). Si el usuario lo
-  rechaza, el mensaje final lo advierte. Las tareas auxiliares no pasan por
-  Ollama (siguen en OpenRouter): títulos o compresión de una charla local
-  llegan a OpenRouter (prueba 142). Si eso no es aceptable, apuntar esas tareas
-  a `ollama-local` con `hermes config set auxiliary.<tarea>.provider …`.
+  de la casa**. Opción elegida: el módulo detecta si hay respaldo configurado
+  (`fallback_providers` con entradas **o** la clave heredada `fallback_model`, que
+  v0.22.2 aún lee: `hermes_cli/fallback_cmd.py` `_read_chain`/`_write_chain`) y
+  **ofrece quitarlo** con `hermes fallback clear`. Por ser un cambio de
+  comportamiento en vivo, el botón por defecto es **"No"**, con el texto que
+  recomienda quitarlo. Antes de vaciarlo guarda las entradas en
+  `/etc/hli2/hermes-fallback-removed.conf` (root 0600; si no puede guardarlas, no
+  lo quita) y las muestra en el mensaje final, para restituirlas con `hermes
+  fallback add`. Costo: el chat con el modelo por defecto da error si OpenRouter
+  falla, en vez de probar otro. Si el usuario lo conserva, el mensaje final dice
+  que un chat local que falle puede reenviarse a OpenRouter y filtrarse.
+- **Decisión del usuario (2026-10-18): TODAS las tareas auxiliares de Hermes
+  pasan al modelo local** (`gemma4:e2b`, pensamiento desactivado, 3600 s), en
+  todos los chats, para que la privacidad sea real. El módulo escribe, con
+  `hermes config set` por tarea, las 19 de `HERMES_AUX_TASKS` con `provider:
+  custom` + `base_url` + `api_key` ficticia (en v0.22.2
+  `_resolve_task_provider_model` respeta una `base_url` explícita sin depender de
+  que `providers.ollama-local` se resuelva por nombre), `model`, `timeout`,
+  `reasoning_effort: none` (el valor por defecto de esos campos es una cadena,
+  así que `config set` no la vuelve `null`; `review` no tiene `timeout` ni
+  `reasoning_effort`, `memory_query_rewrite` no tiene `reasoning_effort`) y, para
+  `compression`, `no_progress_timeout: 900`. **Registro para revertir:** antes de
+  tocar nada guarda el bloque `auxiliary:` previo en
+  `/etc/hli2/hermes-aux-previous.conf` (root 0600, escritura atómica, solo la
+  primera vez para no pisar el original) y lo resume en el mensaje final.
+  Re-ejecutar solo actualiza la URL de las tareas que ya eran locales.
+  - `vision`: `gemma4:e2b` admite imágenes según `ollama.com/library/gemma4/tags`
+    ("Text, Image input"), así que se movió; menor calidad que un modelo grande y
+    **no verificado** que Hermes la detecte con un endpoint propio (prueba 152).
+  - `voice_chat` y `tts_audio_tags` son tareas de texto: también se movieron.
+  - Ninguna tarea se dejó en su proveedor anterior.
+  - **Excepciones que quedan (el mensaje final las lista):** (1) los chats con el
+    modelo por defecto van a OpenRouter; (2) las herramientas web (búsqueda,
+    abrir páginas) envían consultas a Internet por naturaleza; (3) **si Ollama
+    falla por conexión caída o error de pago/cuota, Hermes cae al modelo
+    principal (OpenRouter) también en las tareas auxiliares**: la documentación
+    (`fallback-providers`, "Auxiliary Capacity-Error Fallback") dice que ese
+    último recurso corre siempre y no ofrece una opción para impedirlo; (4) el
+    respaldo automático de la conversación, mientras siga configurado.
 - Red y firewall. Hermes vive en `hermes-net` (10.213.144.0/24, definida por el
   compose de Hermes con solo la subred). El compose de Ollama la usa como red
   **externa**; su nombre real lo toma el módulo de Docker (Dokploy le antepone el
   proyecto; mismo criterio que `*hermes-net` de la verificación de redes de
-  Hermes). IP fija `.250` (configurable con `HLI2_OLLAMA_IP`, validada: dentro de
+  Hermes) **y cuya subred IPAM sea exactamente la del script de aislamiento**
+  (si hay otra subred, no está cubierta por el firewall y Ollama queda aparte). IP fija `.250` (configurable con `HLI2_OLLAMA_IP`, validada: dentro de
   la subred, entre .2 y .254, y no usada por otro contenedor): el DHCP de Docker
   asigna desde `.2` hacia arriba, así que con pocos contenedores nunca llega a
   `.250`; no se cambió la red de Hermes (agregar `ip_range` obligaría a
   recrearla). Sin Hermes, Ollama usa su propia red `ollama-net` y no hay
   integración ni reglas (al instalar Hermes después, se vuelve a correr el módulo).
 - Excepción de firewall: `/etc/hli2/hermes-egress-allow.conf` (root 0600, líneas
-  `ip:puerto/proto`). `hli2-hermes-egress apply` valida cada línea (IPv4
-  canónica dentro de la subred de Hermes, host .2-.254, puerto 1-65535, tcp/udp;
-  una línea inválida se ignora con un aviso, nunca se abre por duda) y agrega un
-  ACCEPT por cada una **dentro de la construcción atómica** de las dos cadenas,
-  después de ESTABLISHED,RELATED y antes de los DROP. Al re-ejecutar `hermes` el
+  `ip:puerto/proto`). Como el script lo lee como root, `apply` exige primero un
+  archivo regular (no enlace simbólico), de uid 0 y modo 600 o 400 (si no, lo
+  ignora entero con un aviso); solo recorta los espacios de los extremos de cada
+  línea, descarta las que llevan retorno de carro, ceros a la izquierda,
+  rangos, CIDR o texto extra, y valida cada una (IPv4 canónica dentro de la
+  subred de Hermes, host .2-.254, puerto 1-65535, tcp/udp; una línea inválida se
+  ignora con un aviso, nunca se abre por duda). Agrega un ACCEPT por cada una
+  **dentro de la construcción atómica** de la cadena FWD (la IN, para destinos
+  del propio servidor, no lleva excepciones de la subred), después de
+  ESTABLISHED,RELATED y antes de los DROP. El alta desde el módulo es atómica
+  (temporal en la misma carpeta + `mv`) y aborta si `sudo` no está disponible en
+  vez de suponer que el archivo no existe. Al re-ejecutar `hermes` el
   script se regenera, pero la lista persiste; el módulo `ollama` regenera
   además el script con la versión nueva (una versión anterior no leía la lista).
   El tráfico Hermes -> Ollama dentro del mismo puente pasa por FORWARD (y
