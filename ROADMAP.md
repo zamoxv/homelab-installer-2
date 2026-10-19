@@ -1125,6 +1125,32 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
   elegirlo en la app; el consumo real de memoria con 64k de contexto (límite de
   20 GB); el binario `python` en `/opt/hermes/.venv/bin` usado para la prueba de
   alcance (si falta, el módulo avisa pero no falla).
+- [x] **Validado en el M70q (2026-10-19)**: chat local `gemma4:e4b` desde
+      hermes-android. Primer mensaje de una conversación: varios minutos
+      (~15k tokens de contexto); siguientes: ~1 min por turno (caché de
+      Ollama). CPU ~50 % (Ollama usa un hilo por núcleo físico: 6 de 12), RAM
+      ~12,8 GB con el modelo cargado; el resto de los servicios siguió normal.
+- [x] **Prueba que decide (herramientas):** con la misma petición ("busca la
+      versión de Jellyfin y crea un recordatorio"), `gemma4:e4b` hizo la
+      búsqueda web pero no encontró la herramienta de tareas programadas y
+      respondió una vez en inglés; DeepSeek encadenó terminal + búsquedas +
+      `cronjob create` correctamente. **Conclusión:** el local queda como
+      cerebro opcional para conversación privada, preguntas y búsquedas; las
+      tareas que encadenan herramientas, con el modelo por defecto.
+- [ ] Mejoras para el local: instrucciones fijas en `SOUL.md` (responder
+      siempre en español; usar la herramienta de tareas programadas para
+      recordatorios).
+- [ ] Efecto de tener la compresión en el modelo local: en chats con
+      DeepSeek (ventana de 1M) Hermes compacta al acercarse a 64k (ventana de
+      `gemma4:e2b`) y la compactación corre en CPU (lenta). Es el costo de la
+      privacidad elegida; evaluar si molesta en el uso real.
+- [ ] Con la pantalla bloqueada Android corta la conexión y Hermes cancela el
+      turno ("Your request was not processed"): para respuestas largas del
+      modelo local usar Telegram (v2.6e), donde la conexión la mantiene el
+      servidor.
+- [ ] Zona horaria: el servidor está en UTC y las tareas programadas de
+      Hermes usan esa hora (un "10:00" es 07:00 en Chile). Ajustar
+      `timedatectl set-timezone America/Santiago` y `TZ` del contenedor.
 
 #### v2.6d — Diagnóstico del servidor (solo lectura)
 - [ ] Timer del HLI (cada 5 min) que genera un **informe filtrado**: estado de
