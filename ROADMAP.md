@@ -787,14 +787,17 @@ Dokploy `dokploy.com/templates/hermes`, Docker Hub, código v0.22.2 de
   `triage_specifier`, `kanban_decomposer`, `profile_describer`, `goal_judge`,
   `curator`, `monitor`, `background_review`, `moa_reference`,
   `moa_aggregator` (`web_extract` y `session_search` ya no usan un LLM). El
-  módulo fija las 19 a `provider: openrouter` + el modelo auxiliar barato.
+  módulo siembra las 19 en `provider: auto` + `model: ""` (siguen al modelo del
+  chat; ver "Diseño corregido de las tareas auxiliares" más abajo, 2026-10-19).
   Esta lista debe revisarse al actualizar la imagen.
 - Modelos propuestos por defecto (precios de OpenRouter al 2026-10-16, por
   millón de tokens): principal `deepseek/deepseek-v4.1-flash` (0,032 USD de
   entrada / 0,144 de salida, contexto 1M, herramientas, texto+imagen);
-  auxiliar y respaldo `qwen/qwen3.7-flash` (0,03 / 0,13; 0,10 / 0,40 sobre 32k
-  de prompt; herramientas, texto+imagen+video). Ambos editables en el cuadro
-  de entrada; el módulo valida solo la forma `autor/modelo`.
+  respaldo automático `qwen/qwen3.7-flash` (0,03 / 0,13; 0,10 / 0,40 sobre 32k
+  de prompt; herramientas, texto+imagen+video; constante `HERMES_FALLBACK_MODEL`,
+  no se pregunta). Solo el modelo principal es editable en el cuadro de
+  entrada; el módulo valida solo la forma `autor/modelo`. Ya no hay modelo
+  auxiliar aparte.
 - Las plataformas sin canal de aprobación (`api_server`, webhook) usan
   `approvals.unattended_mode` (por defecto `deny`): con hermes-android y
   `manual` un comando peligroso se **bloquea** en vez de preguntar, salvo que
@@ -806,8 +809,84 @@ Dokploy `dokploy.com/templates/hermes`, Docker Hub, código v0.22.2 de
   valores); que `data_collection: deny` deje al menos un proveedor disponible
   para cada modelo elegido (la API pública no expone la política de datos por
   proveedor; si no queda ninguno, OpenRouter responde error y se usa el
-  respaldo); que `hermes config set` acepte rutas `auxiliary.<tarea>.model`
-  (se usa solo al cambiar modelos en una re-ejecución).
+  respaldo). (Verificado en el código v0.22.2: `hermes config set` acepta
+  rutas anidadas como `auxiliary.<tarea>.model` y existe `hermes config unset
+  <clave>`, `hermes_cli/config.py` `set_config_value` línea 3577 y
+  `unset_config_value` línea 3767.)
+- **Diseño corregido de las tareas auxiliares (2026-10-19).** Decisión del
+  usuario: todas las tareas auxiliares siguen al modelo del chat
+  (`provider: auto`, `model: ""`, sin `base_url`/`api_key` fijos). Reemplaza al
+  diseño original (fijarlas a `qwen/qwen3.7-flash` en OpenRouter, v2.6a) y al de
+  v2.6c (fijarlas a `gemma4:e2b` local). **Por qué fijarlas fue un error:**
+  el issue #24029 (auxiliares que caían en un modelo pago) ya estaba corregido
+  desde 2026-06-28 y `auto` ya significa "el modelo principal del chat actual".
+  Evidencia en Hermes v0.22.2: `hermes_cli/config_defaults.py` `_aux()` (línea
+  26: `provider: auto`, `model: ""` por defecto);
+  `agent/auxiliary_client.py` `_resolve_auto_route` (línea 4676, paso (1) "main
+  provider + main model") y `_main_route_target` (línea 4563) usan la ejecución
+  en curso, publicada en cada turno (`agent/turn_context.py`
+  `_publish_runtime_main`, línea 527) y pasada explícita por la compresión
+  (`agent/conversation_compression.py` línea 2041); esa ejecución respeta el
+  modelo elegido por chat (`gateway/platforms/api_server.py`
+  `_select_agent_runtime`, línea 2268). Sin salto silencioso a otros
+  proveedores: `_discovery_chain_allowed` (línea 4637) lo impide con un
+  proveedor elegido; solo actúa `fallback_providers` (`_try_main_fallback_chain`,
+  línea 4486). Consecuencias del diseño anterior que ahora se evitan: con
+  DeepSeek (1M de contexto) la compresión corría con un modelo auxiliar de
+  ventana menor y avisaba/compactaba pronto (~64k); con un chat local la
+  compresión corría en otro modelo local o iba a OpenRouter. Con `auto`, el
+  auxiliar usa la misma ruta del chat y la compresión reutiliza la ventana de
+  contexto del modelo principal.
+  - **Siembra** (`config.yaml` nuevo): las 19 tareas en `provider: auto` +
+    `model: ""`; `compression.timeout: 1800` y `compression.no_progress_timeout:
+    900` (por defecto 120 s con piso de 300 s, y 60 s sin progreso; un modelo
+    local en CPU necesita mucho más; `config_defaults.py` línea 761) y
+    `title_generation.timeout: 120` (por defecto 30). Constantes en
+    `modules/hermes.sh` (`HERMES_AUX_COMPRESSION_TIMEOUT`, etc.). No hay cuadro
+    de entrada de modelo auxiliar; el respaldo automático sembrado usa la
+    constante `HERMES_FALLBACK_MODEL`.
+  - **Migración compartida** (`modules/hermes.sh`, la reutiliza `ollama`;
+    idempotente): para cada tarea, solo si los valores son los que el HLI
+    escribió (OpenRouter con su modelo auxiliar: el de v2.6a o el que comparte
+    más de la mitad de las tareas; o `custom` + `http://<IP>:11434/v1` + clave
+    ficticia + `gemma4:e2b`) pone `provider: auto` y `model: ""` y **quita** con
+    `hermes config unset` las claves `base_url`, `api_key`, `reasoning_effort`
+    `none` y `timeout` 3600 que escribió; en `compression` y `title_generation`
+    deja los tiempos amplios. **Las tareas con valores propios del usuario no se
+    tocan** y el mensaje final las lista. Cómo se quitan claves: `hermes config
+    unset <clave>` (línea 3767) borra la clave del `config.yaml` del usuario y
+    vale el valor por defecto de `DEFAULT_CONFIG` (`base_url ""`, `api_key ""`,
+    `reasoning_effort ""`, `timeout` de cada tarea); falla si la clave no existe
+    ("Config key not set"), por eso solo se pide quitar lo leído del archivo.
+    `config set <clave> ""` guarda la cadena vacía. El bloque previo se guarda
+    antes de tocar nada en `/etc/hli2/hermes-aux-previous.conf` (root 0600, solo
+    la primera vez). Orden por tarea: tiempos/razonamiento, `api_key`,
+    `base_url`, `model`, `provider` al final, de modo que una interrupción
+    deja la tarea reconocible y la re-ejecución la completa. Nuevo marcador
+    root-only `/etc/hli2/hermes-aux-auto` (se escribe solo con todo en `auto`; con
+    él no se vuelve a revisar `auxiliary`, así no se pisan decisiones
+    posteriores del usuario). Si falla o se interrumpe: "migración incompleta",
+    reinicio de Hermes, sin marcador y el módulo no figura como hecho. El
+    marcador heredado `hermes-aux-migrated` (v2.6c) se trata como "integración de
+    Ollama completa" y se reemplaza por `hermes-ollama-integrated`.
+  - **Zona horaria** (corrige el pendiente de "servidor en UTC"): Hermes lee
+    `HERMES_TIMEZONE`, luego `timezone:` de `config.yaml` y, si no hay,
+    la hora local del proceso (`hermes_time.py` líneas 3-5 y 67-75); `TZ` solo no
+    la lee, así que los recordatorios salían en UTC. El módulo toma la zona del
+    servidor (`timedatectl show -p Timezone --value`, con `/etc/timezone` de
+    respaldo), la valida (regex de forma y existencia en `/usr/share/zoneinfo`) y
+    la pone en `HERMES_TIMEZONE` del compose y en `timezone:` de `config.yaml`
+    (al sembrar). Si el servidor está en UTC (o no se pudo leer) pregunta,
+    proponiendo `America/Santiago` o la zona ya guardada; una respuesta inválida
+    cancela antes de instalar nada.
+  - **Límite conocido (verificado en el código, no corregido):** el apagado del
+    "pensamiento" por modelo (`agent.reasoning_overrides`) lo lee el agente
+    principal; las tareas auxiliares solo toman `auxiliary.<tarea>.reasoning_effort`
+    (`auxiliary_client.py` `_get_task_extra_body`, línea 6405). Con `auto` sin ese
+    valor, una compresión con `gemma4` local no envía `reasoning_effort` y
+    Ollama aplica su comportamiento por defecto (puede ser más lenta). Si molesta,
+    fijar `auxiliary.compression.reasoning_effort none` a mano (afecta a todos los
+    chats) — decisión pendiente del usuario.
 - Digest: además de la etiqueta, la imagen se fija por digest
   (`@sha256:36099926…`, lista de manifiestos amd64+arm64 de `v0.22.2` según
   la API de Docker Hub, verificada el 2026-10-16). Al actualizar se cambian
@@ -915,10 +994,12 @@ Dokploy `dokploy.com/templates/hermes`, Docker Hub, código v0.22.2 de
 - [ ] Niveles: modelo abierto barato por defecto; `openrouter/auto` con nivel
       de costo bajo/medio donde convenga; Claude (vía OpenRouter, por token)
       solo cuando el usuario lo pida explícitamente.
-- [ ] **Cada tarea auxiliar con proveedor y modelo explícitos** (títulos,
-      compresión, visión, etc.) y `fallback_providers` definido: el issue
+- [x] **Tareas auxiliares en `auto`** (títulos, compresión, visión, etc.):
+      siguen al modelo del chat. Corregido el 2026-10-19: el diseño original las
+      fijaba a un modelo barato "para no depender de `auto`", pero el issue
       #24029 (auxiliares que caían en un modelo pago) está cerrado desde
-      2026-06-28, pero no se depende de los valores automáticos.
+      2026-06-28 y `auto` ya usa el modelo del chat (ver "Diseño corregido de
+      las tareas auxiliares" en v2.6a). `fallback_providers` sigue definido.
 - [ ] Caché de prompts, compresión de contexto, herramientas mínimas
       activas, límite de iteraciones.
 - [ ] Medición: una semana de uso real y revisión del gasto por modelo en
@@ -985,7 +1066,7 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
   etiqueta y digest juntos en `compose/ollama/docker-compose.yml`.
 - Variables (código `envconfig/config.go` v0.40.6 y FAQ): `OLLAMA_HOST`,
   `OLLAMA_KEEP_ALIVE` (30m), `OLLAMA_NUM_PARALLEL` (1), `OLLAMA_MAX_LOADED_MODELS`
-  (1: Hermes solo usa `e4b`; las tareas auxiliares siguen en OpenRouter; con dos
+  (1: Hermes solo usa `e4b`; las tareas auxiliares siguen al chat; con dos
   modelos alternándose se recargaría uno desde el disco y se perdería su caché de
   contexto) y `OLLAMA_CONTEXT_LENGTH`. La documentación dice que la API
   compatible con OpenAI **no puede fijar `num_ctx` por petición**, pero
@@ -1035,44 +1116,39 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
   fallback add`. Costo: el chat con el modelo por defecto da error si OpenRouter
   falla, en vez de probar otro. Si el usuario lo conserva, el mensaje final dice
   que un chat local que falle puede reenviarse a OpenRouter y filtrarse.
-- **Decisión del usuario (2026-10-18): TODAS las tareas auxiliares de Hermes
-  pasan al modelo local** (`gemma4:e2b`, pensamiento desactivado, 3600 s), en
-  todos los chats, para que la privacidad sea real. El módulo escribe, con
-  `hermes config set` por tarea, las 19 de `HERMES_AUX_TASKS` con `provider:
-  custom` + `base_url` + `api_key` ficticia (en v0.22.2
-  `_resolve_task_provider_model` respeta una `base_url` explícita sin depender de
-  que `providers.ollama-local` se resuelva por nombre), `model`, `timeout`,
-  `reasoning_effort: none` (el valor por defecto de esos campos es una cadena,
-  así que `config set` no la vuelve `null`; `review` no tiene `timeout` ni
-  `reasoning_effort`, `memory_query_rewrite` no tiene `reasoning_effort`) y, para
-  `compression`, `no_progress_timeout: 900`. **Registro para revertir:** antes de
-  tocar nada guarda el bloque `auxiliary:` previo en
-  `/etc/hli2/hermes-aux-previous.conf` (root 0600, escritura atómica, solo la
-  primera vez para no pisar el original) y lo resume en el mensaje final.
-  **Migración reanudable:** una tarea cuenta como hecha solo si TODAS las claves
-  que escribe el módulo están en `config.yaml` (no basta la URL). El marcador
-  root-only `/etc/hli2/hermes-aux-migrated` se escribe únicamente cuando las 19
-  terminaron bien. Sin marcador, cada re-ejecución completa las que no estén
-  totalmente locales (exista o no el proveedor); con marcador solo refresca la URL
-  de las que siguen locales y **no pisa las que el usuario devolvió a OpenRouter**.
-  Si algo falla (o se interrumpe con Ctrl-C) el módulo reinicia Hermes igual (el
-  proceso coincide con el disco), muestra "migración incompleta: X de 19 tareas…
-  vuelva a correr el módulo" con el proveedor en que quedó cada una, no escribe el
-  marcador y **no marca `ollama` como hecho** (sale con error). Si no puede guardar
-  el registro previo, no migra las tareas.
-  - `vision`: `gemma4:e2b` admite imágenes según `ollama.com/library/gemma4/tags`
-    ("Text, Image input"), así que se movió; menor calidad que un modelo grande y
-    **no verificado** que Hermes la detecte con un endpoint propio (prueba 152).
-  - `voice_chat` y `tts_audio_tags` son tareas de texto: también se movieron.
-  - Ninguna tarea se dejó en su proveedor anterior.
-  - **Excepciones que quedan (el mensaje final las lista):** (1) los chats con el
-    modelo por defecto van a OpenRouter; (2) las herramientas web (búsqueda,
-    abrir páginas) envían consultas a Internet por naturaleza; (3) **si Ollama
-    falla por conexión caída o error de pago/cuota, Hermes cae al modelo
-    principal (OpenRouter) también en las tareas auxiliares**: la documentación
-    (`fallback-providers`, "Auxiliary Capacity-Error Fallback") dice que ese
-    último recurso corre siempre y no ofrece una opción para impedirlo; (4) el
-    respaldo automático de la conversación, mientras siga configurado.
+- **Tareas auxiliares (decisión del usuario, 2026-10-19; reemplaza a la del
+  2026-10-18 "todas a `gemma4:e2b` local"):** ninguna se fija. Todas quedan en
+  `provider: auto` / `model: ""` y siguen al modelo del chat: en un chat local
+  usan el modelo local; en un chat de OpenRouter, ese mismo modelo. El módulo
+  `ollama` ya **no escribe nada en `auxiliary`**; llama a la migración
+  compartida de `modules/hermes.sh` (ver "Diseño corregido de las tareas
+  auxiliares" en v2.6a), que convierte las fijaciones de versiones anteriores
+  (las `custom` + URL de Ollama + `gemma4:e2b` de este módulo y las de OpenRouter
+  de v2.6a), respeta las que el usuario puso a propósito y las lista, guarda el
+  bloque previo en `/etc/hli2/hermes-aux-previous.conf` y es reanudable ("migración
+  incompleta: X de N tareas…", reinicio de Hermes, sin marcador y sin marcar
+  `ollama` como hecho). Marcadores: `/etc/hli2/hermes-aux-auto` (tareas en
+  `auto`) y `/etc/hli2/hermes-ollama-integrated` (proveedor/rutas completos; con
+  él solo se refrescan las URL).
+  - **Qué se conserva:** proveedor `ollama-local`, alias de `model_routes`,
+    tiempos largos del proveedor (`request_timeout_seconds`/`stale_timeout_seconds`
+    3600) y `agent.reasoning_overrides` (pensamiento apagado) para el chat.
+    Compresión y títulos llevan tiempos amplios (1800/900 y 120 s).
+  - **Límite del razonamiento (verificado):** `reasoning_overrides` no alcanza a las
+    tareas auxiliares (ver v2.6a): con `auto` la compresión local no apaga el
+    pensamiento de `gemma4` salvo que se fije `auxiliary.<tarea>.reasoning_effort`.
+  - **Privacidad, con precisión:** en un chat local el cerebro y sus tareas
+    auxiliares quedan en casa. Si Ollama falla, las auxiliares **no saltan solas a
+    OpenRouter**: con un proveedor principal elegido Hermes no adivina otro
+    (`_discovery_chain_allowed`, `auxiliary_client.py` línea 4637) y solo usa
+    `fallback_providers` (`_try_main_fallback_chain`, línea 4486) si está
+    configurado, razón por la que el módulo ofrece quitarlo. Excepciones que
+    quedan (el mensaje final las lista): los chats con el modelo por defecto van a
+    OpenRouter (y sus auxiliares también), las herramientas web envían consultas a
+    Internet, y el estado del respaldo automático tal como esté configurado.
+    No se hacen afirmaciones absolutas.
+  - `vision` usa el modelo del chat; **no verificado** que `gemma4:e4b` describa
+    imágenes a través de Hermes (prueba 153).
 - Red y firewall. Hermes vive en `hermes-net` (10.213.144.0/24, definida por el
   compose de Hermes con solo la subred). El compose de Ollama la usa como red
   **externa**; su nombre real lo toma el módulo de Docker (Dokploy le antepone el
@@ -1140,17 +1216,19 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
 - [ ] Mejoras para el local: instrucciones fijas en `SOUL.md` (responder
       siempre en español; usar la herramienta de tareas programadas para
       recordatorios).
-- [ ] Efecto de tener la compresión en el modelo local: en chats con
-      DeepSeek (ventana de 1M) Hermes compacta al acercarse a 64k (ventana de
-      `gemma4:e2b`) y la compactación corre en CPU (lenta). Es el costo de la
-      privacidad elegida; evaluar si molesta en el uso real.
+- [x] Compresión del contexto: con las auxiliares en `auto` ya no hay
+      compactación temprana en chats con DeepSeek (usa DeepSeek y su ventana de
+      1M); en un chat local comprime con el modelo local (lenta en CPU, de ahí
+      los tiempos amplios). Validar en uso real (pruebas 159-160).
 - [ ] Con la pantalla bloqueada Android corta la conexión y Hermes cancela el
       turno ("Your request was not processed"): para respuestas largas del
       modelo local usar Telegram (v2.6e), donde la conexión la mantiene el
       servidor.
-- [ ] Zona horaria: el servidor está en UTC y las tareas programadas de
-      Hermes usan esa hora (un "10:00" es 07:00 en Chile). Ajustar
-      `timedatectl set-timezone America/Santiago` y `TZ` del contenedor.
+- [x] Zona horaria: el servidor estaba en UTC y las tareas programadas de
+      Hermes usaban esa hora (un "10:00" era 07:00 en Chile). Corregido el
+      2026-10-19 con `HERMES_TIMEZONE` en el compose y `timezone:` en
+      `config.yaml` (el módulo detecta la zona del servidor o la pregunta si es
+      UTC); no hace falta cambiar la zona del servidor. Validar con la prueba 161.
 
 #### v2.6d — Diagnóstico del servidor (solo lectura)
 - [ ] Timer del HLI (cada 5 min) que genera un **informe filtrado**: estado de
