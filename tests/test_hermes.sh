@@ -1472,3 +1472,154 @@ test_hermes_compose_telegram_flag_renders_only_references() {
     printf '%s\n' "$off" | python3 -I -c 'import sys,yaml; yaml.safe_load(sys.stdin)' || { fail "YAML inválido sin Telegram"; return 1; }
   fi
 }
+
+# --- Revisión de privacidad / robustez de la migración (modos local, W1, W4, W5) ----------------
+
+# Como _hm_aux_plan, pero con un fragmento de shell ($2) ejecutado antes (modo, URL, modelo guardado).
+_hm_aux_plan_with() {
+  bash -c 'source "$1"; eval "$3"; _hermes_aux_plan "$2"; printf "%s\n" "${H_AUX_OPS[@]}"; echo "PLANNED:${H_AUX_PLANNED[*]}"; echo "CUSTOM:${H_AUX_CUSTOM[*]}"' \
+    "$REPO_ROOT/modules/_" "$REPO_ROOT/modules/hermes.sh" "$1" "$2"
+}
+_HM_PIN_TASKS=(vision mcp monitor curator kanban_decomposer triage_specifier profile_describer)
+_HM_URL="http://10.213.144.250:11434/v1"
+
+test_hermes_aux_plan_full_mode_pins_vision_and_background_tasks_with_local_fallback() {
+  _hm_setup
+  local out t
+  out="$(_hm_aux_plan_with $'model:\n  default: x/y\n' "H_AUX_MODE=full H_AUX_LOCAL_URL='$_HM_URL'")"
+  for t in "${_HM_PIN_TASKS[@]}"; do
+    assert_contains "$out" "aux:${t}"$'\tset\tauxiliary.'"${t}"$'.provider\tcustom' "$t fijada" || return 1
+    assert_contains "$out" $'auxiliary.'"${t}"$'.base_url\t'"$_HM_URL" || return 1
+    assert_contains "$out" $'auxiliary.'"${t}"$'.timeout\t3600' || return 1
+    assert_contains "$out" $'auxiliary.'"${t}"$'.reasoning_effort\tnone' || return 1
+    assert_contains "$out" $'auxiliary.'"${t}"$'.fallback_chain\t[{"provider":"custom"' || return 1
+  done
+  assert_contains "$out" $'auxiliary.vision.model\tgemma4:e4b' || return 1
+  assert_contains "$out" $'auxiliary.monitor.model\tgemma4:e2b' || return 1
+  assert_contains "$out" '"model":"gemma4:e2b","base_url":"'"$_HM_URL" "vision respalda con e2b" || return 1
+  # El proveedor es lo último de cada tarea.
+  [[ "$(grep -F "aux:curator"$'\t' <<<"$out" | tail -1)" == *"auxiliary.curator.provider"$'\tcustom' ]] || { fail "provider debe ser lo último"; return 1; }
+  # Tareas dentro del turno: siguen en auto (nada de provider/base_url).
+  for t in approval goal_judge memory_query_rewrite voice_chat tts_audio_tags background_review title_generation compression review skills_hub moa_reference; do
+    assert_not_contains "$out" "auxiliary.${t}.provider" "$t sigue en auto" || return 1
+    assert_not_contains "$out" "auxiliary.${t}.base_url" || return 1
+  done
+}
+
+test_hermes_aux_plan_pinned_tasks_are_idempotent_and_user_pins_are_kept() {
+  _hm_setup
+  local yaml out
+  yaml="$(printf 'auxiliary:\n'
+    for t in "${_HM_PIN_TASKS[@]}"; do
+      m=gemma4:e2b; o=gemma4:e4b; [[ "$t" != vision ]] || { m=gemma4:e4b; o=gemma4:e2b; }
+      printf '  %s:\n    provider: custom\n    model: %s\n    base_url: %s\n    api_key: no-key-required\n    timeout: 3600\n    reasoning_effort: none\n    fallback_chain:\n    - provider: custom\n' "$t" "$m" "$_HM_URL"
+    done)"
+  out="$(_hm_aux_plan_with "$yaml" "H_AUX_MODE=full H_AUX_LOCAL_URL='$_HM_URL'")"
+  for t in "${_HM_PIN_TASKS[@]}"; do assert_not_contains "$out" "aux:${t}"$'\t' "$t ya está fijada: nada que hacer" || return 1; done
+  # Otra IP: solo cambian la URL y el respaldo.
+  out="$(_hm_aux_plan_with "$yaml" "H_AUX_MODE=refresh H_AUX_LOCAL_URL='http://10.213.144.77:11434/v1'")"
+  assert_contains "$out" $'auxiliary.vision.base_url\thttp://10.213.144.77:11434/v1' || return 1
+  assert_contains "$out" $'auxiliary.vision.fallback_chain\t' || return 1
+  assert_not_contains "$out" "auxiliary.vision.model" || return 1
+  # Una fijación del usuario (otro servidor) en una tarea destino no se toca y se lista.
+  yaml="$(printf 'auxiliary:\n  vision:\n    provider: custom\n    model: llava\n    base_url: http://192.168.1.50:8080/v1\n    api_key: clave\n')"
+  out="$(_hm_aux_plan_with "$yaml" "H_AUX_MODE=full H_AUX_LOCAL_URL='$_HM_URL'")"
+  assert_not_contains "$out" "auxiliary.vision." || return 1
+  assert_contains "$out" "CUSTOM:vision (custom/llava" || return 1
+}
+
+test_hermes_aux_plan_keep_mode_respects_local_pins_and_converts_the_rest() {
+  _hm_setup
+  local yaml out
+  yaml="$(printf 'auxiliary:\n'; _hm_aux_block_local vision approval)"
+  out="$(_hm_aux_plan_with "$yaml" "H_AUX_MODE=keep")"
+  assert_not_contains "$out" "auxiliary.vision." "vision sigue local" || return 1
+  assert_contains "$out" "aux:approval"$'\tset\tauxiliary.approval.provider\tauto' || return 1
+  # Sin Ollama (modo none) una fijación local se convierte a auto, como antes.
+  out="$(_hm_aux_plan_with "$yaml" "H_AUX_MODE=none")"
+  assert_contains "$out" "aux:vision"$'\tset\tauxiliary.vision.provider\tauto' || return 1
+}
+
+test_hermes_aux_plan_never_overwrites_a_users_reasoning_effort_on_compression_and_titles() {
+  _hm_setup
+  local yaml out
+  yaml="$(printf 'auxiliary:\n  compression:\n    provider: auto\n    model: ""\n    reasoning_effort: low\n  title_generation:\n    provider: auto\n    model: ""\n    reasoning_effort: high\n')"
+  out="$(_hm_aux_plan_with "$yaml" "H_AUX_MODE=none")"
+  assert_not_contains "$out" "reasoning_effort" "valores del usuario intactos" || return 1
+  # También en tareas con pines nuestros que se migran.
+  yaml="$(printf 'auxiliary:\n  compression:\n    provider: openrouter\n    model: qwen/qwen3.7-flash\n    reasoning_effort: medium\n')"
+  out="$(_hm_aux_plan_with "$yaml" "H_AUX_MODE=none")"
+  assert_contains "$out" "aux:compression"$'\tset\tauxiliary.compression.provider\tauto' || return 1
+  assert_not_contains "$out" "auxiliary.compression.reasoning_effort" || return 1
+  # Vacío o ausente sí se completa.
+  yaml="$(printf 'auxiliary:\n  compression:\n    provider: auto\n    model: ""\n    reasoning_effort: ""\n')"
+  out="$(_hm_aux_plan_with "$yaml" "H_AUX_MODE=none")"
+  assert_contains "$out" $'auxiliary.compression.reasoning_effort\tnone' || return 1
+}
+
+test_hermes_aux_plan_uses_the_openrouter_model_saved_in_the_record_for_partial_migrations() {
+  _hm_setup
+  local yaml out t
+  # Quedan 9 tareas con el modelo elegido por el usuario y 10 ya en auto: 9 no son mayoría.
+  yaml="$(printf 'auxiliary:\n'
+    _hm_aux_block_or foo/aux-model vision compression skills_hub approval review mcp title_generation memory_query_rewrite tts_audio_tags
+    for t in voice_chat triage_specifier kanban_decomposer profile_describer goal_judge curator monitor background_review moa_reference moa_aggregator; do printf '  %s:\n    provider: auto\n    model: ""\n' "$t"; done)"
+  out="$(_hm_aux_plan_with "$yaml" "H_AUX_MODE=none")"
+  assert_contains "$out" "CUSTOM:vision (openrouter/foo/aux-model)" "sin el registro, la erosión las deja como propias" || return 1
+  out="$(_hm_aux_plan_with "$yaml" "H_AUX_MODE=none H_AUX_ORMODEL_SAVED=foo/aux-model")"
+  assert_contains "$out" "PLANNED:vision compression skills_hub approval review mcp title_generation memory_query_rewrite tts_audio_tags" "con el modelo anotado se completan las 9" || return 1
+  assert_eq "CUSTOM:" "$(grep '^CUSTOM:' <<<"$out")" "ninguna quedó como propia" || return 1
+}
+
+test_hermes_previous_record_stores_the_openrouter_model_and_reuses_it_on_rerun() {
+  _hm_setup
+  _hm_seed_existing_with_aux "$(printf 'auxiliary:\n'; _hm_aux_block_or foo/aux-model "${_HM_TASKS[@]}")"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  chmod u+rwx "$SECRETS_DIR"
+  assert_file_contains "$SECRETS_DIR/hermes-aux-previous.conf" "# or-model: foo/aux-model" "modelo anotado en el registro" || { chmod 000 "$SECRETS_DIR"; return 1; }
+  rm -f "$SECRETS_DIR/hermes-aux-auto"; chmod 000 "$SECRETS_DIR"
+  # Re-ejecución con 9 tareas que quedaron (la CLI simulada no escribe el archivo).
+  : > "$STUB_CALL_LOG"; sed -i '/^hermes$/d' "$STATE_FILE"
+  { printf 'model:\n  provider: openrouter\n  default: x/y\nauxiliary:\n'
+    _hm_aux_block_or foo/aux-model vision compression skills_hub approval review mcp title_generation memory_query_rewrite tts_audio_tags
+    for t in voice_chat triage_specifier kanban_decomposer profile_describer goal_judge curator monitor background_review moa_reference moa_aggregator; do printf '  %s:\n    provider: auto\n    model: ""\n' "$t"; done; } > "$APPDATA_ROOT/hermes/config.yaml"
+  : > "$DIALOG_YESNO_QUEUE"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.vision.provider\tauto' "completa las que quedaban" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.tts_audio_tags.provider\tauto' || return 1
+  assert_not_contains "$(_hm_dialog_text)" "NO se tocaron" "ninguna se tomó por valores propios" || return 1
+}
+
+test_hermes_previous_record_gets_a_dated_block_appended_on_each_review_that_changes_pins() {
+  _hm_setup
+  _hm_seed_existing_with_aux "$(printf 'auxiliary:\n'; _hm_aux_block_or qwen/qwen3.7-flash vision)"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  chmod u+rwx "$SECRETS_DIR"
+  local first; first="$(< "$SECRETS_DIR/hermes-aux-previous.conf")"
+  rm -f "$SECRETS_DIR/hermes-aux-auto"; chmod 000 "$SECRETS_DIR"
+  # Más tarde el usuario fija otra tarea (un pin nuestro: mismo modelo de antes) y se vuelve a revisar.
+  : > "$STUB_CALL_LOG"; sed -i '/^hermes$/d' "$STATE_FILE"
+  printf 'model:\n  provider: openrouter\n  default: x/y\nauxiliary:\n' > "$APPDATA_ROOT/hermes/config.yaml"
+  _hm_aux_block_or qwen/qwen3.7-flash mcp >> "$APPDATA_ROOT/hermes/config.yaml"
+  : > "$DIALOG_YESNO_QUEUE"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  chmod u+rwx "$SECRETS_DIR"
+  local second; second="$(< "$SECRETS_DIR/hermes-aux-previous.conf")"
+  chmod 000 "$SECRETS_DIR"
+  [[ "$second" == "$first"* ]] || { fail "el registro original debe quedar intacto al inicio"; return 1; }
+  assert_contains "$second" "# --- Revisión del " || return 1
+  assert_contains "$second" "  mcp:"$'\n'"    provider: openrouter" "el valor de mcp quedó recuperable" || return 1
+  assert_contains "$(_hm_dialog_text)" "Se agregó un bloque" || return 1
+}
+
+test_hermes_timezone_note_when_detected_zone_overrides_a_different_config_timezone() {
+  _hm_setup
+  export STUB_TIMEZONE="Europe/Madrid"
+  _hm_seed_previous 0
+  mkdir -p "$APPDATA_ROOT/hermes"
+  printf 'model:\n  provider: openrouter\n  default: x/y\ntimezone: America/Bogota\n' > "$APPDATA_ROOT/hermes/config.yaml"
+  : > "$DIALOG_PASSWORDBOX_QUEUE"; : > "$DIALOG_YESNO_QUEUE"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_file_contains "$STUB_HTTP_BODIES_LOG" "HERMES_TIMEZONE=Europe/Madrid" || return 1
+  assert_contains "$(_hm_dialog_text)" "config.yaml tiene 'timezone: America/Bogota'" "avisa que la zona detectada manda" || return 1
+}

@@ -55,6 +55,9 @@
 #   698-748; sin lista sería "pair", que responde con códigos de emparejamiento).
 #   En config.yaml nuevos se siembra además `unauthorized_dm_behavior: ignore`
 #   (gateway/config_loader.py línea 102).
+# - Un solo usuario: el módulo guarda UN ID en TELEGRAM_ALLOWED_USERS (Hermes
+#   admite una lista separada por comas, pero el módulo no la ofrece) y el
+#   mismo ID es TELEGRAM_HOME_CHANNEL.
 # - Destino por defecto de recordatorios/cron (`deliver: telegram`):
 #   TELEGRAM_HOME_CHANNEL (gateway/config_env.py línea 515; cron/scheduler_delivery.py
 #   líneas 44 y 479-487). En un chat privado el chat_id es el ID del usuario.
@@ -545,12 +548,18 @@ _hermes_config_timezone() {
 # es UTC (o no se pudo leer) se pregunta, proponiendo la ya guardada en
 # config.yaml o, si no hay, HERMES_DEFAULT_TIMEZONE. Una respuesta que no sea
 # una zona válida cancela el despliegue (todavía no se instaló nada).
-H_TZ=""
+H_TZ="" H_TZ_NOTE=""
 _hermes_resolve_timezone() {
   local tz saved default
   tz="$(_hermes_host_timezone)"
   if ! _hermes_utc_like_zone "$tz" && _hermes_valid_timezone "$tz"; then
     H_TZ="$tz"
+    # La variable del compose gana sobre 'timezone:' de config.yaml (hermes_time.py
+    # líneas 67-85): si difieren, se avisa en el mensaje final.
+    local cfg_tz; cfg_tz="$(_hermes_config_timezone)"
+    if [[ -n "$cfg_tz" && "$cfg_tz" != "$tz" ]]; then
+      H_TZ_NOTE="Aviso: config.yaml tiene 'timezone: ${cfg_tz}', pero la zona detectada en el servidor es ${tz} y HERMES_TIMEZONE (que tiene prioridad) quedó en ${tz}. Para usar ${cfg_tz}, cambie la zona del servidor (timedatectl set-timezone) o borre 'timezone:' de config.yaml y vuelva a correr el módulo."
+    fi
     return 0
   fi
   saved="$(_hermes_config_timezone)"
@@ -1052,14 +1061,67 @@ HERMES_AUX_MARKER="${SECRETS_DIR}/hermes-aux-auto"
 HERMES_AUX_MARKER_TAG="# aux-version: 2 (reasoning_effort none en compression y title_generation)"
 HERMES_AUX_LEGACY_MARKER="${SECRETS_DIR}/hermes-aux-migrated"
 HERMES_AUX_PREV_FILE="${SECRETS_DIR}/hermes-aux-previous.conf"
-# Valores que escribió la versión (L); un solo lugar.
-HERMES_LEGACY_LOCAL_AUX_MODEL="gemma4:e2b"
-HERMES_LEGACY_LOCAL_AUX_TIMEOUT=3600
-HERMES_LEGACY_LOCAL_AUX_KEY="no-key-required"
+# Marcador de la integración con Ollama (lo escribe el módulo 'ollama').
+HERMES_OLLAMA_MARKER="${SECRETS_DIR}/hermes-ollama-integrated"
+# Valores de las fijaciones locales (versión (L) y las de abajo); un solo lugar.
+HERMES_AUX_LOCAL_TIMEOUT=3600
+HERMES_AUX_LOCAL_KEY="no-key-required"
 HERMES_OLLAMA_PORT=11434
+
+# TAREAS FIJADAS AL MODELO LOCAL cuando Ollama está integrado (decisión del
+# 2026-10-19 tras la revisión de privacidad; solo las aplica el módulo 'ollama').
+# Todas las demás siguen en 'auto'. Evidencia (Hermes v0.22.2):
+# - vision: el camino 'auto' (_vision_auto_route, agent/auxiliary_client.py
+#   líneas 5657-5683) usa el proveedor principal solo si su cliente sirve para
+#   imágenes y, si no, recorre OpenRouter -> Nous -> DeepInfra
+#   (_VISION_AUTO_PROVIDER_ORDER): una imagen de un chat local podía salir. Con
+#   base_url fijada, resolve_vision_provider_client (líneas 5712-5719) usa solo
+#   ese endpoint, sin recorrer otros proveedores. Modelo gemma4:e4b (admite
+#   imágenes según la biblioteca de Ollama; no verificado a través de Hermes).
+# - Tareas que pueden correr sin chat en vivo (sin main_runtime): con
+#   runtime vacío _main_route_target (línea 4563) cae a model.provider de
+#   config.yaml (OpenRouter), no al chat. El runtime viaja por un ContextVar
+#   que se publica por turno (turn_context.py línea 527) y que un script de
+#   cron, un comando de CLI, el despachador del kanban o el bucle de MCP no
+#   tienen (_normalize_main_runtime, líneas 3109-3119; la copia de
+#   compatibilidad solo vale en el hilo principal, línea 2743). Son:
+#     monitor            cron/scripts/classify_items.py:135 (script de cron)
+#     curator            agent/curator.py (mantenimiento en segundo plano; con
+#                        provider+model fijos usa esos, líneas 1038-1042)
+#     kanban_decomposer  hermes_cli/kanban_decompose.py:318 (CLI/despachador)
+#     triage_specifier   hermes_cli/kanban_specify.py:204 (CLI/despachador)
+#     profile_describer  hermes_cli/profile_describer.py:154 (CLI)
+#     mcp                tools/mcp_tool_sampling.py:214-224 (muestreo en el hilo
+#                        del bucle de MCP, sin runtime del turno)
+#   Modelo gemma4:e2b, razonamiento none, tiempo 3600 s.
+# - Siguen en 'auto' (corren dentro del turno y heredan el runtime del chat por
+#   el ContextVar): compression (runtime explícito, conversation_compression.py
+#   línea 2041), title_generation (main_runtime, title_generator.py líneas
+#   475-522), background_review (runtime del padre, background_review.py línea
+#   250), approval, goal_judge, memory_query_rewrite, tts_audio_tags, voice_chat,
+#   review, skills_hub y moa_*. NO verificado que cada una herede el contexto en
+#   todos los hilos (approval, goal_judge, memory_query_rewrite y las de voz no
+#   pasan main_runtime): si un hilo no lo hereda, caería a model.provider.
+# - RESPALDO DE UNA TAREA FIJADA: ante errores de capacidad (conexión caída,
+#   tiempo agotado, 429 agotado, 402) una tarea con proveedor explícito prueba su
+#   'fallback_chain' y, si no hay, el modelo principal DE config.yaml
+#   (_ladder_provider_fallback líneas 7840-7845 y _try_main_agent_model_fallback
+#   líneas 4304-4345: lee _read_main_provider(), no el chat). Para que no vaya
+#   a OpenRouter se agrega a cada tarea fijada una 'fallback_chain' con el OTRO
+#   modelo local (si esa cadena entrega un cliente, la rama del modelo principal
+#   no se ejecuta; si también falla, _try_payment_fallback, líneas 4245-4256,
+#   queda bloqueada por _discovery_chain_allowed, línea 4637, porque ya hay un
+#   proveedor principal elegido). Basado en la lectura del código; no probado en
+#   vivo.
+declare -A HERMES_AUX_LOCAL_PIN=(
+  [vision]="gemma4:e4b"
+  [monitor]="gemma4:e2b" [curator]="gemma4:e2b" [kanban_decomposer]="gemma4:e2b"
+  [triage_specifier]="gemma4:e2b" [profile_describer]="gemma4:e2b" [mcp]="gemma4:e2b"
+)
 
 # Estado de la migración (globales: los leen los manejadores de Ctrl-C y los
 # mensajes finales de los módulos).
+H_AUX_MODE="none" H_AUX_LOCAL_URL="" H_AUX_SKIP_AUTO=0 H_AUX_ORMODEL_SAVED="" H_AUX_ORMODEL=""
 declare -a H_AUX_OPS=()       # "aux:<tarea>\t<set|unset>\t<clave>\t<valor>"
 declare -a H_AUX_PLANNED=()   # tareas que hay que pasar a 'auto'
 declare -a H_AUX_CUSTOM=()    # tareas con valores propios (no se tocan)
@@ -1077,6 +1139,7 @@ _hermes_aux_parse() {
     /^auxiliary:/ { on = 1; next }
     on && /^[^[:space:]#]/ { on = 0 }
     on && /^  [A-Za-z_]+:[[:space:]]*$/ { task = $1; sub(/:$/, "", task); next }
+    on && task != "" && /^    fallback_chain:/ { printf "%s\tfallback_chain\tyes\n", task }
     on && task != "" && /^    (provider|model|base_url|api_key|timeout|reasoning_effort|no_progress_timeout):/ {
       key = $1; sub(/:$/, "", key); printf "%s\t%s\t%s\n", task, key, clean($2)
     }
@@ -1109,16 +1172,20 @@ _hermes_aux_summary() {
 # Calcula, a partir del YAML $1, qué tareas hay que pasar a 'auto' y con qué
 # operaciones. Llena H_AUX_PLANNED, H_AUX_OPS y H_AUX_CUSTOM (sin tocar nada).
 _hermes_aux_plan() {
-  local content="$1" t task key val p m b k to re np state ormodel best=0 n want_re
+  local content="$1" t task key val p m b k to re np ch state ormodel best=0 n want_re
+  local mode="${H_AUX_MODE:-none}" url="${H_AUX_LOCAL_URL:-}" skip_auto="${H_AUX_SKIP_AUTO:-0}"
+  local lt pin_m other_m chain_json
   local -A cfg=() mcount=()
-  H_AUX_OPS=() H_AUX_PLANNED=() H_AUX_CUSTOM=()
+  H_AUX_OPS=() H_AUX_PLANNED=() H_AUX_CUSTOM=() H_AUX_ORMODEL=""
   while IFS=$'\t' read -r task key val; do
     [[ -n "$task" ]] && cfg["${task}.${key}"]="$val"
   done < <(_hermes_aux_parse "$content")
 
   # Modelo auxiliar que eligió el usuario en la versión (O): el que comparten
   # más de la mitad de las tareas (cuenta también las ya pasadas a 'auto' que
-  # conservan el modelo). El valor por defecto de entonces siempre cuenta.
+  # conservan el modelo) o, si no, el que quedó anotado en el registro previo
+  # (H_AUX_ORMODEL_SAVED): una migración a medias no debe erosionar la
+  # clasificación. El valor por defecto de entonces siempre cuenta.
   ormodel=""
   for t in "${HERMES_AUX_TASKS[@]}"; do
     p="${cfg[$t.provider]:-}" m="${cfg[$t.model]:-}" b="${cfg[$t.base_url]:-}" k="${cfg[$t.api_key]:-}"
@@ -1129,16 +1196,19 @@ _hermes_aux_plan() {
     n="${mcount[$m]}"
     if (( n > best && n * 2 > ${#HERMES_AUX_TASKS[@]} )); then best="$n"; ormodel="$m"; fi
   done
+  [[ -n "$ormodel" ]] || ormodel="${H_AUX_ORMODEL_SAVED:-}"
+  H_AUX_ORMODEL="$ormodel"
 
   for t in "${HERMES_AUX_TASKS[@]}"; do
     p="${cfg[$t.provider]:-}" m="${cfg[$t.model]:-}" b="${cfg[$t.base_url]:-}" k="${cfg[$t.api_key]:-}"
     to="${cfg[$t.timeout]:-}" re="${cfg[$t.reasoning_effort]:-}" np="${cfg[$t.no_progress_timeout]:-}"
+    ch="${cfg[$t.fallback_chain]:-}"
     state=custom
     if [[ ( -z "$p" || "$p" == "auto" ) && -z "$m" && -z "$b" && -z "$k" ]]; then
       state=clean
     elif [[ ( -z "$b" || "$b" =~ ^https?://[^/]+:${HERMES_OLLAMA_PORT}/v1/?$ ) \
-         && ( -z "$k" || "$k" == "$HERMES_LEGACY_LOCAL_AUX_KEY" ) \
-         && ( -z "$m" || "$m" == "$HERMES_LEGACY_LOCAL_AUX_MODEL" ) \
+         && ( -z "$k" || "$k" == "$HERMES_AUX_LOCAL_KEY" ) \
+         && ( -z "$m" || "$m" == "gemma4:e2b" || "$m" == "gemma4:e4b" ) \
          && ( "$p" == "custom" || "$p" == "auto" || -z "$p" ) \
          && ( -n "$b" || -n "$k" || -n "$m" || "$p" == "custom" ) ]]; then
       state=local
@@ -1146,14 +1216,52 @@ _hermes_aux_plan() {
          && ( "$m" == "$HERMES_FALLBACK_MODEL" || "$m" == "$ormodel" ) ]]; then
       state=openrouter
     fi
+    local unit="aux:${t}"
+
+    # Tareas que se fijan al modelo local con Ollama integrado (ver
+    # HERMES_AUX_LOCAL_PIN): visión y tareas sin chat en vivo.
+    lt=0
+    pin_m="${HERMES_AUX_LOCAL_PIN[$t]:-}"
+    [[ -n "$pin_m" && -n "$url" && ( "$mode" == "full" || "$mode" == "refresh" ) ]] && lt=1
+    if [[ "$lt" -eq 1 ]]; then
+      case "$state" in
+        custom) H_AUX_CUSTOM+=("${t} (${p:-auto}/${m:-modelo principal}${b:+, ${b}})"); continue ;;
+        clean|openrouter) [[ "$mode" == "full" ]] || continue ;;
+      esac
+      other_m="gemma4:e2b"; [[ "$pin_m" != "gemma4:e2b" ]] || other_m="gemma4:e4b"
+      chain_json="$(printf '[{"provider":"custom","model":"%s","base_url":"%s","api_key":"%s"}]' "$other_m" "$url" "$HERMES_AUX_LOCAL_KEY")"
+      local -a pin_ops=()
+      [[ "$ch" == "yes" && "$b" == "$url" ]] || pin_ops+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.fallback_chain"$'\t'"${chain_json}")
+      [[ "$k" == "$HERMES_AUX_LOCAL_KEY" ]] || pin_ops+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.api_key"$'\t'"${HERMES_AUX_LOCAL_KEY}")
+      [[ "$b" == "$url" ]] || pin_ops+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.base_url"$'\t'"${url}")
+      if ! [[ "$to" =~ ^[0-9]+$ && "$to" -ge "$HERMES_AUX_LOCAL_TIMEOUT" ]]; then
+        pin_ops+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.timeout"$'\t'"${HERMES_AUX_LOCAL_TIMEOUT}")
+      fi
+      [[ -n "$re" ]] || pin_ops+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.reasoning_effort"$'\t'"${HERMES_AUX_REASONING_EFFORT}")
+      [[ "$m" == "$pin_m" ]] || pin_ops+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.model"$'\t'"${pin_m}")
+      [[ "$p" == "custom" ]] || pin_ops+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.provider"$'\t'"custom")
+      if [[ "${#pin_ops[@]}" -gt 0 ]]; then
+        H_AUX_PLANNED+=("$t")
+        H_AUX_OPS+=("${pin_ops[@]}")
+      fi
+      continue
+    fi
+    # Con Ollama integrado (modo keep) las fijaciones locales vigentes se respetan.
+    if [[ "$mode" == "keep" && -n "$pin_m" && "$state" == "local" ]]; then
+      continue
+    fi
+    [[ "$skip_auto" -eq 0 ]] || continue
+
+    # Tareas 'auto': provider auto / model "" (siguen al modelo del chat).
     want_re=""
     case "$t" in compression|title_generation) want_re="$HERMES_AUX_REASONING_EFFORT" ;; esac
     case "$state" in
       clean)
-        # Ya en auto: solo falta el razonamiento de compresión/títulos.
-        if [[ -n "$want_re" && "$re" != "$want_re" ]]; then
+        # Ya en auto: solo falta el razonamiento de compresión/títulos, y solo
+        # si la clave está vacía o ausente (nunca se pisa un valor del usuario).
+        if [[ -n "$want_re" && -z "$re" ]]; then
           H_AUX_PLANNED+=("$t")
-          H_AUX_OPS+=("aux:${t}"$'\t'"set"$'\t'"auxiliary.${t}.reasoning_effort"$'\t'"${want_re}")
+          H_AUX_OPS+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.reasoning_effort"$'\t'"${want_re}")
         fi
         continue ;;
       custom)
@@ -1161,20 +1269,21 @@ _hermes_aux_plan() {
         continue ;;
     esac
     H_AUX_PLANNED+=("$t")
-    local unit="aux:${t}" want_to=""
+    local want_to=""
     case "$t" in
       compression) want_to="$HERMES_AUX_COMPRESSION_TIMEOUT"
         [[ "$np" == "$HERMES_AUX_COMPRESSION_NO_PROGRESS" ]] || H_AUX_OPS+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.no_progress_timeout"$'\t'"${HERMES_AUX_COMPRESSION_NO_PROGRESS}") ;;
       title_generation) want_to="$HERMES_AUX_TITLE_TIMEOUT" ;;
     esac
-    [[ -z "$want_re" || "$re" == "$want_re" ]] || H_AUX_OPS+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.reasoning_effort"$'\t'"${want_re}")
+    [[ -z "$want_re" || -n "$re" ]] || H_AUX_OPS+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.reasoning_effort"$'\t'"${want_re}")
     if [[ -n "$want_to" ]]; then
       [[ "$to" == "$want_to" ]] || H_AUX_OPS+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.timeout"$'\t'"${want_to}")
-    elif [[ "$state" == local && "$to" == "$HERMES_LEGACY_LOCAL_AUX_TIMEOUT" ]]; then
+    elif [[ "$state" == local && "$to" == "$HERMES_AUX_LOCAL_TIMEOUT" ]]; then
       H_AUX_OPS+=("${unit}"$'\t'"unset"$'\t'"auxiliary.${t}.timeout"$'\t')
     fi
     if [[ "$state" == local ]]; then
       [[ -n "$want_re" || "$re" != "none" ]] || H_AUX_OPS+=("${unit}"$'\t'"unset"$'\t'"auxiliary.${t}.reasoning_effort"$'\t')
+      [[ "$ch" != "yes" ]] || H_AUX_OPS+=("${unit}"$'\t'"unset"$'\t'"auxiliary.${t}.fallback_chain"$'\t')
       [[ -z "$k" ]] || H_AUX_OPS+=("${unit}"$'\t'"unset"$'\t'"auxiliary.${t}.api_key"$'\t')
       [[ -z "$b" ]] || H_AUX_OPS+=("${unit}"$'\t'"unset"$'\t'"auxiliary.${t}.base_url"$'\t')
       # Para (L) primero el modelo y al final el proveedor; para (O) al revés.
@@ -1188,22 +1297,37 @@ _hermes_aux_plan() {
 }
 
 # Deja en el archivo root-only $HERMES_AUX_PREV_FILE los valores de 'auxiliary'
-# previos a la migración (solo la primera vez: una re-ejecución no debe pisar el
-# registro original). Deja en AUX_PREV_NOTE el resumen. Retorna 1 si no pudo
-# guardarlo.
+# previos a la migración. La primera vez crea el archivo; en las siguientes,
+# cuando una revisión va a cambiar fijaciones, AGREGA un bloque con fecha (sin
+# tocar lo anterior), así lo que el usuario fijó después también se puede
+# recuperar. Anota el modelo auxiliar detectado de la versión (O) para que una
+# migración a medias no erosione la clasificación. Deja en AUX_PREV_NOTE el
+# resumen. Retorna 1 si no pudo guardarlo.
 _hermes_aux_record_previous() {
-  local content="$1" block summary
+  local content="$1" block summary existing="" body header
   AUX_PREV_NOTE=""
   block="$(_hermes_yaml_block "$content" auxiliary)"
   summary="$(_hermes_aux_summary "$content")"
+  body="${block:-# (sin bloque auxiliary: valores por defecto de Hermes, provider auto)}"
   if sudo -n test -f "$HERMES_AUX_PREV_FILE" 2>/dev/null; then
-    AUX_PREV_NOTE="Se conserva el registro anterior de las tareas auxiliares en ${HERMES_AUX_PREV_FILE}."
+    existing="$(sudo -n cat -- "$HERMES_AUX_PREV_FILE" 2>/dev/null)" || existing=""
+    if ! _hermes_root_write "$HERMES_AUX_PREV_FILE" "${existing}
+
+# --- Revisión del $(date +%F) (valores justo antes de este cambio) ---
+${H_AUX_ORMODEL:+# or-model: ${H_AUX_ORMODEL}
+}${body}"; then
+      AUX_PREV_NOTE="AVISO: no se pudo agregar el registro de las tareas auxiliares previas en ${HERMES_AUX_PREV_FILE}."
+      return 1
+    fi
+    AUX_PREV_NOTE="Se agregó un bloque con los valores previos de las tareas auxiliares al registro ${HERMES_AUX_PREV_FILE} (solo root)."
     return 0
   fi
-  if ! _hermes_root_write "$HERMES_AUX_PREV_FILE" "# Valores de 'auxiliary' de Hermes ANTES de pasarlas a 'auto' (siguen al modelo del chat; HLI 2), $(date +%F).
+  header="# Valores de 'auxiliary' de Hermes ANTES de cambiarlas (siguen al modelo del chat o, con Ollama, se fijan al modelo local; HLI 2), $(date +%F).
 # Para revertir una tarea: hermes config set auxiliary.<tarea>.provider/.model con estos valores
 # (y .base_url/.api_key si los tenía). Solo root.
-${block:-# (sin bloque auxiliary: valores por defecto de Hermes, provider auto)}"; then
+${H_AUX_ORMODEL:+# or-model: ${H_AUX_ORMODEL}
+}"
+  if ! _hermes_root_write "$HERMES_AUX_PREV_FILE" "${header}${body}"; then
     AUX_PREV_NOTE="AVISO: no se pudo guardar el registro de las tareas auxiliares previas en ${HERMES_AUX_PREV_FILE}."
     return 1
   fi
@@ -1214,27 +1338,31 @@ ${block:-# (sin bloque auxiliary: valores por defecto de Hermes, provider auto)}
   fi
 }
 
-# Prepara la migración con el config.yaml $1: llena H_AUX_* (plan, tareas con
-# valores propios y proveedor/modelo previos) y guarda el registro previo ANTES
-# de que se toque nada. Con el marcador presente no revisa nada (así no se
-# pisan las decisiones que el usuario tome después).
+# Prepara la migración con el config.yaml $1 y el modo $2 (none | keep | full |
+# refresh; ver HERMES_AUX_LOCAL_PIN) con la URL local $3: llena H_AUX_* (plan,
+# tareas con valores propios y proveedor/modelo previos) y guarda el registro
+# previo ANTES de que se toque nada. Con el marcador presente no se revisan las
+# tareas 'auto' (así no se pisan las decisiones que el usuario tome después);
+# las fijaciones locales sí se revisan en los modos full/refresh.
 _hermes_aux_prepare() {
   local content="$1" line custom
+  H_AUX_MODE="${2:-none}" H_AUX_LOCAL_URL="${3:-}" H_AUX_SKIP_AUTO=0 H_AUX_ORMODEL_SAVED=""
   H_AUX_OPS=() H_AUX_PLANNED=() H_AUX_CUSTOM=() H_AUX_PREV_PROV=()
   H_AUX_SKIP=0 H_AUX_PREV_FAIL=0 H_AUX_INCOMPLETE=0 AUX_PREV_NOTE="" AUX_CUSTOM_NOTE=""
-  # Un marcador sin la etiqueta de razonamiento es de la versión anterior: se
-  # revisa otra vez (el plan va por valores y no toca lo que el usuario fijó).
+  # Un marcador sin la etiqueta de la versión actual se revisa otra vez (el plan
+  # va por valores y no toca lo que el usuario fijó).
   if sudo -n cat -- "$HERMES_AUX_MARKER" 2>/dev/null | grep -qF "$HERMES_AUX_MARKER_TAG"; then
-    H_AUX_SKIP=1
-    return 0
+    H_AUX_SKIP=1 H_AUX_SKIP_AUTO=1
+    [[ "$H_AUX_MODE" == "full" || "$H_AUX_MODE" == "refresh" ]] || return 0
   fi
+  H_AUX_ORMODEL_SAVED="$(sudo -n cat -- "$HERMES_AUX_PREV_FILE" 2>/dev/null | sed -n 's/^# or-model: //p' | head -n1)" || H_AUX_ORMODEL_SAVED=""
   while IFS= read -r line; do
     [[ -n "$line" ]] && H_AUX_PREV_PROV["${line%%:*}"]="${line#*: }"
   done < <(_hermes_aux_summary "$content")
   _hermes_aux_plan "$content"
   if [[ "${#H_AUX_CUSTOM[@]}" -gt 0 ]]; then
     custom="$(printf '%s; ' "${H_AUX_CUSTOM[@]}")"
-    AUX_CUSTOM_NOTE="Tareas auxiliares con valores propios que NO se tocaron (siguen fijadas a lo que usted puso; para que sigan al modelo del chat use 'hermes config set auxiliary.<tarea>.provider auto' y '.model \"\"'): ${custom%; }."
+    AUX_CUSTOM_NOTE="Tareas auxiliares con valores propios que NO se tocaron (siguen fijadas a lo que usted puso): ${custom%; }."
   fi
   if [[ "${#H_AUX_PLANNED[@]}" -gt 0 ]]; then
     if ! _hermes_aux_record_previous "$content"; then
@@ -1338,7 +1466,12 @@ _hermes_aux_migrate() {
   AUX_MIGRATION_NOTE="" H_AUX_RESTARTED=0
   _hermes_config_valid || return 0
   content="$(sudo -n cat -- "$(_hermes_config_path)" 2>/dev/null)" || content=""
-  _hermes_aux_prepare "$content"
+  # Con Ollama integrado se respetan las fijaciones locales (modo keep).
+  local aux_mode=none
+  if sudo -n test -f "$HERMES_OLLAMA_MARKER" 2>/dev/null || sudo -n test -f "$HERMES_AUX_LEGACY_MARKER" 2>/dev/null; then
+    aux_mode=keep
+  fi
+  _hermes_aux_prepare "$content" "$aux_mode"
   H_RUN=("${H_AUX_OPS[@]}")
   H_OPS_FAILED=0 H_UNIT_OK=()
   if [[ "${#H_RUN[@]}" -gt 0 ]]; then
@@ -1726,7 +1859,7 @@ _hermes_main() {
   else
     ts_note="Tailscale no está activo en el servidor: por ahora Hermes solo responde en la LAN. Instale/inicie sesión con el módulo 'tailscale' y vuelva a correr este módulo para publicarlo también en la IP de Tailscale."
   fi
-  msg "Hermes desplegado (composeId=$composeId) y respondiendo en http://${lan_ip}:8642.\n\n${ts_note}\n\nApp Android: descargue el APK desde GitHub (https://github.com/rusty4444/hermes-android/releases; el de arm64-v8a sirve para teléfonos modernos). Permita instalar de orígenes desconocidos, agregue una conexión con servidor, puerto 8642 y la clave de API.\n\nDashboard: http://${ts_ip:-$lan_ip}:9119 (usuario admin).\n\nLos puertos 8642 y 9119 solo se publican en la IP de la LAN y en la de Tailscale: no hay acceso desde Internet. El agente, por su parte, no puede iniciar conexiones hacia la LAN, Tailscale ni el propio servidor (reglas de iptables 'HLI2-HERMES-*', servicio hli2-hermes-egress); sí tiene Internet.\n\nZona horaria: ${H_TZ} (los recordatorios y tareas programadas salen a esa hora). Las tareas auxiliares (títulos, compresión de contexto, visión, etc.) siguen al modelo de cada chat.${tg_note:+\n\n${tg_note}}${AUX_PREV_NOTE:+\n\n${AUX_PREV_NOTE}}${AUX_CUSTOM_NOTE:+\n\n${AUX_CUSTOM_NOTE}}\n\nRecomendación: reserve en el router (DHCP) la IP ${lan_ip} para este servidor; si cambia la IP de la LAN o de Tailscale, vuelva a correr este módulo para volver a publicar los puertos."
+  msg "Hermes desplegado (composeId=$composeId) y respondiendo en http://${lan_ip}:8642.\n\n${ts_note}\n\nApp Android: descargue el APK desde GitHub (https://github.com/rusty4444/hermes-android/releases; el de arm64-v8a sirve para teléfonos modernos). Permita instalar de orígenes desconocidos, agregue una conexión con servidor, puerto 8642 y la clave de API.\n\nDashboard: http://${ts_ip:-$lan_ip}:9119 (usuario admin).\n\nLos puertos 8642 y 9119 solo se publican en la IP de la LAN y en la de Tailscale: no hay acceso desde Internet. El agente, por su parte, no puede iniciar conexiones hacia la LAN, Tailscale ni el propio servidor (reglas de iptables 'HLI2-HERMES-*', servicio hli2-hermes-egress); sí tiene Internet.\n\nZona horaria: ${H_TZ} (los recordatorios y tareas programadas salen a esa hora).${H_TZ_NOTE:+ ${H_TZ_NOTE}} Las tareas auxiliares (títulos, compresión de contexto, visión, etc.) siguen al modelo de cada chat.${tg_note:+\n\n${tg_note}}${AUX_PREV_NOTE:+\n\n${AUX_PREV_NOTE}}${AUX_CUSTOM_NOTE:+\n\n${AUX_CUSTOM_NOTE}}\n\nRecomendación: reserve en el router (DHCP) la IP ${lan_ip} para este servidor; si cambia la IP de la LAN o de Tailscale, vuelva a correr este módulo para volver a publicar los puertos."
 
   mark_done hermes
   return 0

@@ -238,7 +238,7 @@ OLLAMA_FALLBACK_REMOVED_FILE="${SECRETS_DIR}/hermes-fallback-removed.conf"
 # con él (o con el marcador heredado hermes-aux-migrated de versiones
 # anteriores, que solo se escribía con todo hecho) una re-ejecución refresca
 # nada más las URL y no pisa tiempos ni nada que usted haya editado.
-OLLAMA_INTEGRATED_MARKER="${SECRETS_DIR}/hermes-ollama-integrated"
+OLLAMA_INTEGRATED_MARKER="$HERMES_OLLAMA_MARKER"
 
 # Pares "clave valor" del proveedor y las rutas para 'hermes config set'. Con el
 # proveedor ya presente en config.yaml solo se actualizan las URL (la IP pudo
@@ -306,7 +306,7 @@ _ollama_probe_from_hermes() {
 # resultado queda en INCOMPLETE, INTEGRATION_NOTE, FALLBACK_NOTE y H_AUX_*.
 _ollama_integrate_hermes() {
   local ip="$1" uid gid lan_ip key full=1 other_failed=0 k v body drop_fallback=0 content block entry
-  local integrated=0
+  local integrated=0 base="http://${1}:${OLLAMA_PORT}/v1"
   local -a all=()
   uid="$(id -u "$SERVER_USER")" gid="$(id -g "$SERVER_USER")"
   INTEGRATION_NOTE="" FALLBACK_NOTE="" INCOMPLETE=0
@@ -322,7 +322,9 @@ _ollama_integrate_hermes() {
   fi
   # Plan de las tareas auxiliares (y registro de sus valores previos ANTES de
   # tocar nada; si no se puede guardar, no se migran).
-  _hermes_aux_prepare "$content"
+  # Con Ollama: visión y tareas sin chat en vivo se fijan al modelo local (modo
+  # full); con la integración ya hecha solo se refresca la URL (modo refresh).
+  _hermes_aux_prepare "$content" "$([[ "$integrated" -eq 1 ]] && echo refresh || echo full)" "$base"
 
   # Privacidad: el respaldo automático es global y mandaría a OpenRouter un chat
   # local que falle (ver el encabezado de este archivo). Cambiar un
@@ -423,11 +425,14 @@ ${block}"; then
 # tareas. Las afirmaciones salen del código de Hermes v0.22.2 (ver el
 # encabezado de este archivo y de modules/hermes.sh); nada es absoluto.
 _ollama_privacy_text() {
-  local fb="$1" t
-  t="Privacidad (alcance real, no es total):\n- Local, sin salir de la casa: los chats que usted elija con ${OLLAMA_MODELS[0]} y las tareas auxiliares de esos mismos chats (compresión de contexto, títulos, aprobaciones, visión, etc.): todas están en 'auto', o sea usan el modelo del chat, así que en un chat local usan el modelo local."
-  t+="\n- Si Ollama falla en un chat local, las tareas auxiliares NO saltan solas a OpenRouter: con un proveedor ya elegido Hermes no prueba otros por su cuenta; solo puede usar el respaldo automático ('fallback_providers') si está configurado (punto 3 de las excepciones)."
-  t+="\n- Excepciones: (1) los chats con el modelo por defecto van a OpenRouter, y también sus tareas auxiliares (siguen al chat). (2) Las herramientas web (buscar, abrir páginas) envían consultas y piden páginas a Internet por naturaleza, también desde un chat local. (3) Respaldo automático: ${fb:-no hay respaldo configurado}."
-  t+="\n- Visión: la tarea 'vision' usa el modelo del chat; no se verificó que ${OLLAMA_MODELS[0]} describa imágenes a través de Hermes. Si falla en un chat local, analice la imagen en un chat con el modelo por defecto."
+  local fb="$1" t pinned="" task
+  for task in "${!HERMES_AUX_LOCAL_PIN[@]}"; do [[ "$task" == vision ]] || pinned+="${task} "; done
+  pinned="$(printf '%s\n' $pinned | sort | tr '\n' ' ')"
+  t="Privacidad (alcance real, no es total):\n- Chats locales interactivos con ${OLLAMA_MODELS[0]}: el cerebro y las tareas auxiliares que corren dentro del turno (compresión de contexto, títulos, aprobaciones, etc.) están en 'auto', o sea usan el modelo del chat y, en un chat local, el modelo local."
+  t+="\n- Fijadas al modelo local, en TODOS los chats: la visión (${HERMES_AUX_LOCAL_PIN[vision]}; sin esto una imagen podía pasar a OpenRouter si el modelo del chat no la admitía) y las tareas que pueden correr sin un chat en vivo (${pinned% }; sin esto resolverían a OpenRouter, el proveedor de config.yaml). Cada una lleva un respaldo local con el otro modelo, para que un fallo de Ollama no las mande al modelo principal de OpenRouter (según la lectura del código; no probado en vivo)."
+  t+="\n- Si Ollama falla en un chat local, las tareas 'auto' NO saltan solas a OpenRouter: con un proveedor ya elegido Hermes no prueba otros por su cuenta; solo puede usar el respaldo automático ('fallback_providers') si está configurado (ver 3)."
+  t+="\n- Excepciones: (1) los chats con el modelo por defecto van a OpenRouter, y también sus tareas auxiliares (siguen al chat). (2) Las herramientas web (buscar, abrir páginas) envían consultas y piden páginas a Internet por naturaleza, también desde un chat local. (3) Respaldo automático: ${fb:-no hay respaldo configurado}. (4) No se verificó que approval, goal_judge, memory_query_rewrite y las tareas de voz hereden el chat en todos los hilos: si alguna no lo hiciera, resolvería a OpenRouter."
+  t+="\n- Visión: no se verificó que ${HERMES_AUX_LOCAL_PIN[vision]} describa imágenes a través de Hermes; si falla, no debería mandarse a otro proveedor: la tarea da error."
   [[ -z "$AUX_CUSTOM_NOTE" ]] || t+="\n- ${AUX_CUSTOM_NOTE}"
   printf '%s' "$t"
 }

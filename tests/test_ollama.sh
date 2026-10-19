@@ -828,28 +828,41 @@ test_ollama_legacy_fallback_model_key_is_detected_and_cleared() {
 
 # --- Tareas auxiliares locales ------------------------------------------------------------------
 
-test_ollama_never_pins_aux_tasks_and_leaves_them_on_auto() {
+test_ollama_pins_vision_and_background_tasks_locally_and_leaves_the_rest_on_auto() {
   _ol_setup
   _ol_seed_hermes
   echo "yes" > "$DIALOG_YESNO_QUEUE"
   bash "$REPO_ROOT/modules/ollama.sh" || return 1
-  # Instalación sin 'auxiliary': solo se agrega el razonamiento apagado de compresión y títulos; ninguna tarea se fija.
-  assert_eq "2" "$(grep -cP '^docker\t.*config\tset\tauxiliary' "$STUB_CALL_LOG")" "solo los dos reasoning_effort" || return 1
-  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.compression.reasoning_effort\tnone' || return 1
-  assert_file_not_contains "$STUB_CALL_LOG" $'.provider\tauto' "ninguna tarea se fija" || return 1
-  assert_file_not_contains "$STUB_CALL_LOG" $'config\tunset' || return 1
+  local ex=$'config\tset\t' t url="http://${_OL_IP}:11434/v1"
   assert_eq "19" "${#_OL_TASKS[@]}" "las 19 tareas de v0.22.2" || return 1
+  for t in "${_OL_PIN_TASKS[@]}"; do
+    assert_file_contains "$STUB_CALL_LOG" "${ex}auxiliary.${t}.provider"$'\tcustom' "provider custom en $t" || return 1
+    assert_file_contains "$STUB_CALL_LOG" "${ex}auxiliary.${t}.model"$'\t'"$(_ol_pin_model "$t")" || return 1
+    assert_file_contains "$STUB_CALL_LOG" "${ex}auxiliary.${t}.base_url"$'\t'"$url" || return 1
+    assert_file_contains "$STUB_CALL_LOG" "${ex}auxiliary.${t}.api_key"$'\tno-key-required' || return 1
+    assert_file_contains "$STUB_CALL_LOG" "${ex}auxiliary.${t}.timeout"$'\t3600' || return 1
+    assert_file_contains "$STUB_CALL_LOG" "${ex}auxiliary.${t}.reasoning_effort"$'\tnone' || return 1
+    # Respaldo local con el OTRO modelo (nunca el modelo principal de OpenRouter).
+    assert_file_contains "$STUB_CALL_LOG" "${ex}auxiliary.${t}.fallback_chain"$'\t[{"provider":"custom","model":"'"$(_ol_pin_other "$t")"'","base_url":"'"$url"'","api_key":"no-key-required"}]' || return 1
+    # El proveedor se escribe AL FINAL de la tarea (una interrupción la deja reconocible).
+    [[ "$(grep -P "config\tset\tauxiliary\.${t}\." "$STUB_CALL_LOG" | tail -1)" == *"auxiliary.${t}.provider"$'\tcustom' ]] || { fail "el provider debe ser lo último de $t"; return 1; }
+  done
+  # Las demás siguen al chat: solo el razonamiento apagado de compresión y títulos.
+  assert_eq "2" "$(grep -cP '^docker\t.*config\tset\tauxiliary\.(compression|title_generation)\.reasoning_effort' "$STUB_CALL_LOG")" || return 1
+  for t in "${_OL_TASKS[@]}"; do
+    _ol_is_pinned "$t" && continue
+    assert_file_not_contains "$STUB_CALL_LOG" "${ex}auxiliary.${t}.provider" "$t sigue en auto" || return 1
+    assert_file_not_contains "$STUB_CALL_LOG" "${ex}auxiliary.${t}.base_url" || return 1
+  done
   assert_file_not_contains "$STUB_CALL_LOG" $'config\tset\tmodel' "el modelo por defecto no se toca" || return 1
-  # Lo que SÍ se conserva: proveedor local, rutas, tiempos largos y razonamiento apagado del chat.
-  local ex=$'config\tset\t'
   assert_file_contains "$STUB_CALL_LOG" "${ex}providers.ollama-local.request_timeout_seconds"$'\t3600' || return 1
   assert_file_contains "$STUB_CALL_LOG" "${ex}agent.reasoning_overrides.gemma4:e4b"$'\tfalse' || return 1
-  assert_file_contains "$STUB_CALL_LOG" "${ex}platforms.api_server.model_routes.gemma4-e4b-local.provider"$'\tollama-local' || return 1
+  # Primero el registro previo; los marcadores solo al final.
   _ol_marker_exists || { fail "debió dejar el marcador de tareas en auto"; return 1; }
   _ol_file_exists hermes-ollama-integrated || { fail "debió dejar el marcador de integración"; return 1; }
 }
 
-test_ollama_migrates_previous_local_pins_to_auto_without_openrouter_values() {
+test_ollama_migrates_previous_local_pins_keeping_only_the_tasks_that_need_the_local_model() {
   _ol_setup
   _ol_seed_hermes
   _ol_config_with_local_aux "${_OL_TASKS[@]}"
@@ -857,18 +870,25 @@ test_ollama_migrates_previous_local_pins_to_auto_without_openrouter_values() {
   bash "$REPO_ROOT/modules/ollama.sh" || return 1
   local ex=$'config\tset\t' t
   for t in "${_OL_TASKS[@]}"; do
-    assert_file_contains "$STUB_CALL_LOG" "${ex}auxiliary.${t}.provider"$'\tauto' "provider auto en $t" || return 1
-    assert_file_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary.'"${t}"$'.base_url' || return 1
-    assert_file_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary.'"${t}"$'.api_key' || return 1
+    if _ol_is_pinned "$t"; then
+      # Fijaciones de la versión anterior que siguen siendo nuestras: se completan, no se quitan.
+      assert_file_not_contains "$STUB_CALL_LOG" "${ex}auxiliary.${t}.provider" "$t ya era custom" || return 1
+      assert_file_not_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary.'"${t}"$'.base_url' || return 1
+      assert_file_contains "$STUB_CALL_LOG" "${ex}auxiliary.${t}.fallback_chain" "le agrega el respaldo local a $t" || return 1
+    else
+      assert_file_contains "$STUB_CALL_LOG" "${ex}auxiliary.${t}.provider"$'\tauto' "provider auto en $t" || return 1
+      assert_file_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary.'"${t}"$'.base_url' || return 1
+      assert_file_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary.'"${t}"$'.api_key' || return 1
+    fi
   done
+  # vision pasa de e2b a e4b.
+  assert_file_contains "$STUB_CALL_LOG" "${ex}auxiliary.vision.model"$'\tgemma4:e4b' || return 1
   assert_file_contains "$STUB_CALL_LOG" "${ex}auxiliary.compression.timeout"$'\t1800' || return 1
-  assert_file_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary.vision.reasoning_effort' || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary.approval.reasoning_effort' || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary.compression.reasoning_effort' "ya está en none y es lo esperado" || return 1
   assert_file_not_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary.review.timeout' "review no tenía timeout" || return 1
-  assert_file_not_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary.review.reasoning_effort' || return 1
-  assert_file_not_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary.memory_query_rewrite.reasoning_effort' || return 1
   assert_file_not_contains "$STUB_CALL_LOG" "auxiliary.compression.no_progress_timeout" "ya estaba en 900" || return 1
-  # Nada nuevo apunta a OpenRouter ni a Ollama desde 'auxiliary'.
-  if grep -P $'config\tset\tauxiliary[^\t]*\t.*(openrouter|11434)' "$STUB_CALL_LOG" | grep -q .; then fail "algún valor auxiliar nuevo apunta a un proveedor fijo"; return 1; fi
+  if grep -P $'config\tset\tauxiliary[^\t]*\t.*openrouter' "$STUB_CALL_LOG" | grep -q .; then fail "algún valor auxiliar nuevo apunta a OpenRouter"; return 1; fi
   _ol_marker_exists || { fail "sin marcador tras migrar todo"; return 1; }
   assert_file_contains "$STATE_FILE" "ollama" || return 1
   assert_not_contains "$(_ol_dialog_text)" "migración incompleta" || return 1
@@ -877,27 +897,51 @@ test_ollama_migrates_previous_local_pins_to_auto_without_openrouter_values() {
 test_ollama_leaves_user_custom_aux_pins_alone_and_lists_them() {
   _ol_setup
   _ol_seed_hermes
-  { printf 'auxiliary:\n'; _ol_aux_block_local $(_ol_all_but vision); printf '  vision:\n    provider: openrouter\n    model: google/gemini-3-flash\n'; } >> "$APPDATA_ROOT/hermes/config.yaml"
+  # 'vision' y 'curator' los fijó el usuario a mano a otro proveedor/servidor: no se tocan.
+  { printf 'auxiliary:\n'; _ol_aux_block_pinned $(printf '%s\n' "${_OL_PIN_TASKS[@]}" | grep -vxE 'vision|curator')
+    printf '  vision:\n    provider: openrouter\n    model: google/gemini-3-flash\n'
+    printf '  curator:\n    provider: custom\n    model: mi-modelo\n    base_url: http://192.168.1.50:8080/v1\n    api_key: secreto-mio\n'; } >> "$APPDATA_ROOT/hermes/config.yaml"
   echo "no" > "$DIALOG_YESNO_QUEUE"
   bash "$REPO_ROOT/modules/ollama.sh" || return 1
-  assert_file_not_contains "$STUB_CALL_LOG" "auxiliary.vision" "no pisa la decisión del usuario" || return 1
-  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.compression.provider\tauto' || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" $'auxiliary.vision' "no pisa la decisión del usuario" || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" $'auxiliary.curator' || return 1
   assert_contains "$(_ol_dialog_text)" "vision (openrouter/google/gemini-3-flash)" "el mensaje final la lista" || return 1
   assert_contains "$(_ol_dialog_text)" "valores propios que NO se tocaron" || return 1
   assert_file_contains "$STATE_FILE" "ollama" || return 1
 }
 
-test_ollama_with_aux_marker_present_does_not_touch_auxiliary() {
+test_ollama_with_aux_marker_present_pins_local_tasks_but_not_the_auto_ones() {
   _ol_setup
   _ol_seed_hermes empty
-  # El módulo 'hermes' ya dejó el marcador; el usuario fijó 'vision' a mano después.
+  # El módulo 'hermes' ya dejó el marcador (instalación sin Ollama); el usuario fijó 'approval' a mano.
   _ol_secret_unlock; printf '# listo\n# aux-version: 2 (reasoning_effort none en compression y title_generation)\n' > "$SECRETS_DIR/hermes-aux-auto"; chmod 0600 "$SECRETS_DIR/hermes-aux-auto"; _ol_secret_lock
-  { printf 'auxiliary:\n  vision:\n    provider: openrouter\n    model: qwen/qwen3.7-flash\n'; } >> "$APPDATA_ROOT/hermes/config.yaml"
+  { printf 'auxiliary:\n  approval:\n    provider: openrouter\n    model: qwen/qwen3.7-flash\n'; } >> "$APPDATA_ROOT/hermes/config.yaml"
   : > "$DIALOG_YESNO_QUEUE"
   bash "$REPO_ROOT/modules/ollama.sh" || return 1
-  assert_file_not_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary' "respeta la decisión posterior del usuario" || return 1
-  assert_file_not_contains "$STUB_CALL_LOG" $'config\tunset\tauxiliary' || return 1
+  # Las tareas 'auto' no se revisan (respeta lo posterior del usuario)...
+  assert_file_not_contains "$STUB_CALL_LOG" $'auxiliary.approval' || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" $'auxiliary.compression' || return 1
+  # ...pero las que el módulo necesita locales sí se fijan, aunque el marcador ya exista.
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.vision.provider\tcustom' || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.monitor.provider\tcustom' || return 1
   assert_file_contains "$STATE_FILE" "ollama" || return 1
+}
+
+test_ollama_rerun_refreshes_the_url_of_pinned_tasks_only() {
+  _ol_setup
+  _ol_seed_hermes empty
+  _ol_marker_set
+  { printf 'auxiliary:\n'; _OL_IP_FOR="10.213.144.9" _ol_aux_block_pinned "${_OL_PIN_TASKS[@]}"
+    printf '  approval:\n    provider: openrouter\n    model: qwen/qwen3.7-flash\n'; } >> "$APPDATA_ROOT/hermes/config.yaml"
+  : > "$DIALOG_YESNO_QUEUE"
+  bash "$REPO_ROOT/modules/ollama.sh" || return 1
+  local t
+  for t in "${_OL_PIN_TASKS[@]}"; do
+    assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.'"${t}"$'.base_url\thttp://'"${_OL_IP}:11434/v1" "URL nueva en $t" || return 1
+    assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.'"${t}"$'.fallback_chain\t' "respaldo con la URL nueva en $t" || return 1
+    assert_file_not_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.'"${t}"$'.model' "solo la URL" || return 1
+  done
+  assert_file_not_contains "$STUB_CALL_LOG" $'auxiliary.approval' "no toca lo que fijó el usuario" || return 1
 }
 
 test_ollama_legacy_marker_means_integrated_and_is_replaced() {
@@ -940,7 +984,11 @@ test_ollama_aux_previous_settings_recorded_once_and_shown() {
   : > "$DIALOG_YESNO_QUEUE"
   bash "$REPO_ROOT/modules/ollama.sh" || return 1
   _ol_secret_unlock
-  assert_eq "$before" "$(< "$f")" "registro original intacto" || { _ol_secret_lock; return 1; }
+  # El registro original queda intacto al inicio y la revisión nueva se AGREGA con fecha.
+  local after; after="$(< "$f")"
+  [[ "$after" == "$before"* ]] || { _ol_secret_lock; fail "el registro original debe seguir al inicio"; return 1; }
+  assert_contains "$after" "# --- Revisión del " "bloque nuevo con fecha" || { _ol_secret_lock; return 1; }
+  assert_contains "$after" "base_url: http://10.213.144.9:11434/v1" "con los valores de la segunda revisión" || { _ol_secret_lock; return 1; }
   _ol_secret_lock
 }
 
@@ -953,9 +1001,14 @@ test_ollama_final_message_states_privacy_exceptions_and_no_overclaim() {
   bash "$REPO_ROOT/modules/ollama.sh" || return 1
   local texts; texts="$(_ol_dialog_text)"
   assert_contains "$texts" "Privacidad (alcance real, no es total)" || return 1
-  assert_contains "$texts" "las tareas auxiliares de esos mismos chats" "aux local en chats locales" || return 1
-  assert_contains "$texts" "todas están en 'auto', o sea usan el modelo del chat" || return 1
-  assert_contains "$texts" "NO saltan solas a OpenRouter" "qué pasa si Ollama falla" || return 1
+  assert_contains "$texts" "Chats locales interactivos con gemma4:e4b" "alcance acotado a chats interactivos" || return 1
+  assert_contains "$texts" "están en 'auto', o sea usan el modelo del chat" || return 1
+  assert_contains "$texts" "Fijadas al modelo local, en TODOS los chats: la visión (gemma4:e4b" "visión fijada" || return 1
+  assert_contains "$texts" "curator kanban_decomposer mcp monitor profile_describer triage_specifier" "lista exacta de las tareas sin chat en vivo" || return 1
+  assert_contains "$texts" "respaldo local con el otro modelo" || return 1
+  assert_contains "$texts" "las tareas 'auto' NO saltan solas a OpenRouter" "qué pasa si Ollama falla" || return 1
+  assert_contains "$texts" "approval, goal_judge, memory_query_rewrite" "excepción no verificada" || return 1
+  assert_contains "$texts" "no debería mandarse a otro proveedor" || return 1
   assert_contains "$texts" "solo puede usar el respaldo automático ('fallback_providers') si está configurado" "con el matiz exacto" || return 1
   assert_contains "$texts" "los chats con el modelo por defecto van a OpenRouter, y también sus tareas auxiliares" "excepción 1" || return 1
   assert_contains "$texts" "herramientas web" "excepción 2: búsqueda web" || return 1
@@ -980,6 +1033,30 @@ test_ollama_final_message_states_privacy_exceptions_and_no_overclaim() {
 _ol_config_with_local_aux() {
   { printf 'auxiliary:\n'; _ol_aux_block_local "$@"; } >> "$APPDATA_ROOT/hermes/config.yaml"
 }
+# Tareas que el módulo fija al modelo local (visión y tareas sin chat en vivo) y modelo de cada una.
+_OL_PIN_TASKS=(vision monitor curator kanban_decomposer triage_specifier profile_describer mcp)
+_ol_pin_model() { [[ "$1" == vision ]] && echo gemma4:e4b || echo gemma4:e2b; }
+_ol_pin_other() { [[ "$1" == vision ]] && echo gemma4:e2b || echo gemma4:e4b; }
+_ol_is_pinned() { local t; for t in "${_OL_PIN_TASKS[@]}"; do [[ "$t" == "$1" ]] && return 0; done; return 1; }
+# Bloque 'auxiliary:' de las tareas $@ totalmente fijadas (modelo, URL con la IP $_OL_IP_FOR, clave, tiempo,
+# razonamiento y respaldo local), como lo dejaría la CLI.
+_ol_aux_block_pinned() {
+  local t ip="${_OL_IP_FOR:-$_OL_IP}"
+  for t in "$@"; do
+    printf '  %s:\n    provider: custom\n    model: %s\n    base_url: http://%s:11434/v1\n    api_key: no-key-required\n    timeout: 3600\n    reasoning_effort: none\n    fallback_chain:\n    - provider: custom\n      model: %s\n      base_url: http://%s:11434/v1\n      api_key: no-key-required\n' \
+      "$t" "$(_ol_pin_model "$t")" "$ip" "$(_ol_pin_other "$t")" "$ip"
+  done
+}
+# Bloque 'auxiliary:' con TODO ya migrado: fijadas las del módulo y en auto las demás.
+_ol_aux_block_done() {
+  local t
+  _ol_aux_block_pinned "${_OL_PIN_TASKS[@]}"
+  for t in "${_OL_TASKS[@]}"; do
+    _ol_is_pinned "$t" && continue
+    printf '  %s:\n    provider: auto\n    model: ""\n' "$t"
+    case "$t" in compression|title_generation) printf '    reasoning_effort: none\n' ;; esac
+  done
+}
 _ol_all_but() {
   local t x
   for t in "${_OL_TASKS[@]}"; do
@@ -994,26 +1071,25 @@ test_ollama_aux_failure_midway_is_reported_and_rerun_completes_the_rest() {
   _ol_seed_hermes
   _ol_config_with_local_aux "${_OL_TASKS[@]}"
   printf 'no\nno\n' > "$DIALOG_YESNO_QUEUE"
-  # 15 base + vision (6: timeout, razonamiento, api_key, base_url, model, provider) = 21; la 22 es la
-  # primera de compression.
-  export STUB_HERMES_CONFIG_SET_FAIL_N="22"
+  # 15 llamadas base + vision (2: respaldo y modelo e4b) = 17; la 18 es la primera de compression.
+  export STUB_HERMES_CONFIG_SET_FAIL_N="18"
   if bash "$REPO_ROOT/modules/ollama.sh"; then fail "debió terminar con error si la migración quedó incompleta"; return 1; fi
   unset STUB_HERMES_CONFIG_SET_FAIL_N
   local texts; texts="$(_ol_dialog_text)"
   assert_contains "$texts" "migración incompleta: 1 de 19 tareas auxiliares quedaron sin pasar a 'auto' o a medias" || return 1
   assert_contains "$texts" "compression: custom/gemma4:e2b" "dice dónde quedó la tarea" || return 1
   assert_contains "$texts" "vuelva a correr el módulo" || return 1
-  # Hermes se reinició igual (proceso = disco), no hay marcadores y el módulo no figura como hecho.
   assert_file_contains "$STUB_CALL_LOG" $'docker\trestart\thermes' || return 1
   _ol_marker_exists && { fail "se escribió el marcador con la migración incompleta"; return 1; }
   _ol_file_exists hermes-ollama-integrated && { fail "marcador de integración con la migración incompleta"; return 1; }
   assert_file_not_contains "$STATE_FILE" "ollama" "no se marca como hecho" || return 1
   # Re-ejecución: la CLI simulada no escribe el archivo, así que se deja el estado que habría quedado
-  # (todo en auto menos compression, que sigue fijada).
+  # (todo migrado menos compression, que sigue fijada).
   : > "$STUB_CALL_LOG"
   _ol_seed_hermes
-  { printf 'auxiliary:\n'; _ol_aux_block_local compression
-    local t; for t in $(_ol_all_but compression); do printf '  %s:\n    provider: auto\n    model: ""\n' "$t"; done; } >> "$APPDATA_ROOT/hermes/config.yaml"
+  { printf 'auxiliary:\n'; _ol_aux_block_pinned "${_OL_PIN_TASKS[@]}"
+    _ol_aux_block_local compression
+    local t; for t in $(_ol_all_but compression); do _ol_is_pinned "$t" && continue; printf '  %s:\n    provider: auto\n    model: ""\n' "$t"; case "$t" in title_generation) printf '    reasoning_effort: none\n' ;; esac; done; } >> "$APPDATA_ROOT/hermes/config.yaml"
   printf 'no\nno\n' > "$DIALOG_YESNO_QUEUE"
   bash "$REPO_ROOT/modules/ollama.sh" || return 1
   assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.compression.provider\tauto' "completa la que faltaba" || return 1
@@ -1034,7 +1110,11 @@ test_ollama_aux_migration_resumes_even_when_provider_already_exists() {
   bash "$REPO_ROOT/modules/ollama.sh" || return 1
   local t
   for t in "${_OL_TASKS[@]}"; do
-    assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.'"${t}"$'.provider\tauto' "migra $t" || return 1
+    if _ol_is_pinned "$t"; then
+      assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.'"${t}"$'.fallback_chain' "completa $t" || return 1
+    else
+      assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.'"${t}"$'.provider\tauto' "migra $t" || return 1
+    fi
   done
   # Sin marcador de integración, el proveedor se completa entero (tiempos incluidos).
   assert_file_contains "$STUB_CALL_LOG" "providers.ollama-local.request_timeout_seconds" || return 1
@@ -1075,7 +1155,7 @@ test_ollama_aux_migration_aborts_if_previous_values_cannot_be_saved() {
   assert_file_not_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.' "no toca las auxiliares sin registro previo" || return 1
   assert_file_contains "$STUB_CALL_LOG" $'config\tset\tproviders.ollama-local.api' "el proveedor sí se configura" || return 1
   assert_contains "$(_ol_dialog_text)" "no se pudo guardar el registro de sus valores previos" || return 1
-  assert_contains "$(_ol_dialog_text)" "migración incompleta: 3 de 3" || return 1
+  assert_contains "$(_ol_dialog_text)" "migración incompleta: 9 de 9" || return 1
   _ol_marker_exists && { fail "marcador sin migrar"; return 1; }
   assert_file_not_contains "$STATE_FILE" "ollama" || return 1
   assert_file_contains "$STUB_CALL_LOG" $'docker\trestart\thermes' "Hermes se reinicia igual" || return 1
