@@ -1246,6 +1246,56 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
 - [ ] Polling (sin puertos entrantes), `TELEGRAM_ALLOWED_USERS` con el ID del
       usuario (sin lista, todos rechazados). Las conversaciones pasan por los
       servidores de Telegram.
+- Implementado en `modules/hermes.sh` (2026-10-19; **sin validar en el servidor**,
+  pruebas 163-168 de `docs/VALIDACION.md`). Paso opcional en la instalación y en
+  cada re-ejecución: "¿Configurar Telegram como canal de Hermes (avisos y
+  recordatorios al teléfono)?" (por defecto No); si ya está configurado ofrece
+  cambiarlo o quitarlo. Explica antes cómo obtener el token (`@BotFather`,
+  `/newbot`) y el ID (`@userinfobot`); pide el token con cuadro de contraseña
+  (forma `^[0-9]{6,12}:[A-Za-z0-9_-]{30,}$`) y el ID numérico (`^[0-9]{5,15}$`).
+  Ambos se guardan en `/etc/hli2/hermes.env` (root 0600; sin las líneas
+  `TELEGRAM_*` si no está configurado), viajan a Dokploy por el canal `env` entre
+  comillas simples y el compose solo lleva referencias `${...}`; **si Telegram no
+  está configurado el compose no incluye ninguna variable `TELEGRAM_*`**
+  (`compose_render_hermes --telegram`).
+- Hechos verificados en el código de Hermes v0.22.2:
+  - `TELEGRAM_BOT_TOKEN` activa la plataforma solo si no está vacío
+    (`gateway/config_env.py` línea 512, `_Cred.__call__` línea 231); el adaptador
+    sin token no conecta (`plugins/platforms/telegram/adapter.py` línea 3169-3171).
+  - `TELEGRAM_ALLOWED_USERS`: IDs numéricos separados por comas
+    (`gateway/pairing.py` línea 68; `hermes_cli/config_defaults.py` línea 3025).
+  - **Polling por defecto**; webhook solo con `TELEGRAM_WEBHOOK_URL`
+    (`plugins/platforms/telegram/adapter.py` líneas 3098 y 3155-3161), que el módulo no define: no hay
+    puertos entrantes. El token de la plantilla de Hermes sigue la forma
+    `^\d+:[A-Za-z0-9_-]{30,}$` (`hermes_cli/setup_platforms.py` línea 12).
+  - `unauthorized_dm_behavior`: valores `pair|ignore|decline`
+    (`gateway/config.py` línea 165); por defecto `pair`, pero con una lista
+    `TELEGRAM_ALLOWED_USERS` definida el valor efectivo es `ignore`
+    (`gateway/authz_mixin.py` líneas 698-748). Los `config.yaml` nuevos además
+    siembran `unauthorized_dm_behavior: ignore` (`gateway/config_loader.py` línea
+    102). En `config.yaml` ya existentes no se toca (rige el valor por defecto con
+    lista, que es `ignore`).
+  - Destino por defecto de `deliver: telegram` en cron: `TELEGRAM_HOME_CHANNEL`
+    (`gateway/config_env.py` línea 515; `cron/scheduler_delivery.py` líneas 42-46 y
+    479-487). El módulo la fija al mismo ID del usuario (en un chat privado el
+    `chat_id` es el ID del usuario).
+  - Estado de la conexión: `GET /health/detailed` (con la clave de la API,
+    `gateway/platforms/api_server.py` línea 2430) incluye
+    `platforms.telegram.state` (`connected` al conectar,
+    `gateway/status.py` línea 1160). El módulo lo consulta tras el despliegue y
+    avisa si no figura como conectado (no falla).
+  - Salida a Internet: el polling usa HTTPS saliente a `api.telegram.org`; el
+    aislamiento de salida solo bloquea rangos privados, así que no hace falta
+    ninguna regla nueva.
+  - `python-telegram-bot[webhooks]==22.8` viene en la imagen: el `Dockerfile`
+    (línea 245) instala el extra `messaging` (`pyproject.toml` líneas 259-264);
+    como respaldo el adaptador lo instala al vuelo
+    (`plugins/platforms/telegram/adapter.py` líneas 336-352), también por HTTPS
+    saliente. Que arranque y conecte **no está verificado** en el servidor.
+- Limitaciones: las conversaciones por Telegram pasan por los servidores de
+  Telegram (el mensaje del módulo lo dice); con un modelo local, la respuesta
+  llega aunque el teléfono tenga la pantalla bloqueada porque la conexión la
+  mantiene el servidor (a confirmar en la prueba 167).
 
 #### v2.6f — Claude Code como segundo agente
 - [ ] Documentar el uso desde el teléfono (Remote Control, sesiones en la nube,
