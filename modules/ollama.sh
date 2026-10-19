@@ -55,7 +55,7 @@
 #
 # - TAREAS AUXILIARES (decisión del usuario, 2026-10-18): las 19 pasan a
 #   gemma4:e2b local ('auxiliary.<tarea>.provider: custom' + base_url, ver
-#   _ollama_aux_pairs; agent/auxiliary_client.py _resolve_task_provider_model).
+#   _ollama_aux_task_pairs; agent/auxiliary_client.py _resolve_task_provider_model).
 #   Se guarda el bloque previo en /etc/hli2/hermes-aux-previous.conf. Excepción
 #   que no se puede cerrar: con un proveedor auxiliar explícito, una caída de
 #   conexión o un error 402/cuota cae al modelo principal (documentación de
@@ -259,20 +259,49 @@ _ollama_config_pairs() {
 # 'hermes config set' la conserva literal y no la convierte en null) y tiempo de
 # espera largo. Los campos 'timeout' y 'reasoning_effort' solo existen en el
 # bloque por defecto de algunas tareas (hermes_cli/config_defaults.py): 'review'
-# no tiene ninguno y 'memory_query_rewrite' no tiene 'reasoning_effort'.
-_ollama_aux_pairs() {
-  local ip="$1" t base="http://${1}:${OLLAMA_PORT}/v1" pre
-  for t in "${HERMES_AUX_TASKS[@]}"; do
-    pre="auxiliary.${t}"
-    printf '%s\t%s\n' "${pre}.provider" "custom"
-    printf '%s\t%s\n' "${pre}.model" "$OLLAMA_AUX_MODEL"
-    printf '%s\t%s\n' "${pre}.base_url" "$base"
-    printf '%s\t%s\n' "${pre}.api_key" "no-key-required"
-    [[ "$t" == "review" ]] || printf '%s\t%s\n' "${pre}.timeout" "$OLLAMA_AUX_TIMEOUT"
-    case "$t" in review|memory_query_rewrite) ;; *) printf '%s\t%s\n' "${pre}.reasoning_effort" "none" ;; esac
-  done
+# no tiene ninguno y 'memory_query_rewrite' no tiene 'reasoning_effort'. Pares
+# "clave valor" de UNA tarea ($1) con la IP $2.
+_ollama_aux_task_pairs() {
+  local t="$1" base="http://${2}:${OLLAMA_PORT}/v1" pre="auxiliary.${1}"
+  printf '%s\t%s\n' "${pre}.provider" "custom"
+  printf '%s\t%s\n' "${pre}.model" "$OLLAMA_AUX_MODEL"
+  printf '%s\t%s\n' "${pre}.base_url" "$base"
+  printf '%s\t%s\n' "${pre}.api_key" "no-key-required"
+  [[ "$t" == "review" ]] || printf '%s\t%s\n' "${pre}.timeout" "$OLLAMA_AUX_TIMEOUT"
+  case "$t" in review|memory_query_rewrite) ;; *) printf '%s\t%s\n' "${pre}.reasoning_effort" "none" ;; esac
   # La compresión de un contexto largo puede pasar minutos sin emitir nada.
-  printf '%s\t%s\n' "auxiliary.compression.no_progress_timeout" "900"
+  [[ "$t" != "compression" ]] || printf '%s\t%s\n' "${pre}.no_progress_timeout" "900"
+  return 0
+}
+
+# Tareas de $1 (contenido de config.yaml) que YA están totalmente migradas con la
+# IP $2: se comprueba CADA clave que el módulo escribe (provider, model,
+# base_url, api_key, timeout, reasoning_effort y, en compresión,
+# no_progress_timeout), no solo la URL. Una migración interrumpida deja tareas a
+# medias; esas no cuentan. Una tarea por línea.
+_ollama_aux_fully_local() {
+  local content="$1" ip="$2" t k v field ok task key val
+  local -A cfg=()
+  while IFS=$'\t' read -r task key val; do
+    [[ -n "$task" ]] && cfg["${task}.${key}"]="$val"
+  done < <(awk '
+    function clean(v) { gsub(/["\047]/, "", v); return v }
+    /^auxiliary:/ { on = 1; next }
+    on && /^[^[:space:]#]/ { on = 0 }
+    on && /^  [A-Za-z_]+:[[:space:]]*$/ { task = $1; sub(/:$/, "", task); next }
+    on && task != "" && /^    (provider|model|base_url|api_key|timeout|reasoning_effort|no_progress_timeout):/ {
+      key = $1; sub(/:$/, "", key); printf "%s\t%s\t%s\n", task, key, clean($2)
+    }
+  ' <<<"$content")
+  for t in "${HERMES_AUX_TASKS[@]}"; do
+    ok=1
+    while IFS=$'\t' read -r k v; do
+      [[ -n "$k" ]] || continue
+      field="${k#auxiliary.${t}.}"
+      [[ "${cfg["${t}.${field}"]:-}" == "$v" ]] || ok=0
+    done < <(_ollama_aux_task_pairs "$t" "$ip")
+    [[ "$ok" -eq 0 ]] || printf '%s\n' "$t"
+  done
 }
 
 # Bloque de nivel superior $2 (p. ej. 'auxiliary', 'fallback_providers') del
@@ -307,13 +336,6 @@ _ollama_aux_already_local() {
     on && /^  [A-Za-z_]+:[[:space:]]*$/ { task = $1; sub(/:$/, "", task); next }
     on && task != "" && /^    base_url:.*:11434\/v1/ { print task }
   ' <<<"$1"
-}
-
-# ¿config.yaml ya tiene la sección providers.ollama-local?
-_ollama_config_has_provider() {
-  local content
-  content="$(sudo -n cat -- "$(_hermes_config_path)" 2>/dev/null)" || return 1
-  grep -Eq "^  ${OLLAMA_PROVIDER_ID}:" <<<"$content"
 }
 
 # ¿Hay respaldo automático configurado? 'fallback_providers' con entradas (la
@@ -373,21 +395,78 @@ ${block:-# (sin bloque auxiliary: valores por defecto de Hermes, provider auto)}
   fi
 }
 
-# Agrega el proveedor a config.yaml SIN reescribir el archivo: 'hermes config
-# set' dentro del contenedor, con el uid/gid del agente. Retorna 0 aunque algo
-# falle (el módulo informa y el usuario puede completar a mano).
+# Estado de la migración de las tareas auxiliares (globales: los lee el manejador
+# de Ctrl-C y el mensaje final).
+OLLAMA_AUX_MARKER="${SECRETS_DIR}/hermes-aux-migrated"
+declare -A AUX_DONE=()        # tarea -> 1 si ya está totalmente migrada
+declare -A AUX_PREV_PROV=()   # tarea -> proveedor/modelo antes de migrar
+INCOMPLETE=0
+_OL_CUR_UNIT="" _OL_CUR_FAILED=0
+
+# Cierra la unidad en curso: una tarea queda hecha solo si TODAS sus claves se
+# escribieron bien.
+_ollama_close_unit() {
+  if [[ "$_OL_CUR_UNIT" == aux:* && "$_OL_CUR_FAILED" -eq 0 ]]; then
+    AUX_DONE["${_OL_CUR_UNIT#aux:}"]=1
+  fi
+  _OL_CUR_UNIT="" _OL_CUR_FAILED=0
+}
+
+# "migración incompleta: X de N tareas ..." con las que faltan y su proveedor
+# actual (el previo a la migración).
+_ollama_incomplete_note() {
+  local t pending="" n=0
+  for t in "${HERMES_AUX_TASKS[@]}"; do
+    [[ -n "${AUX_DONE[$t]:-}" ]] && continue
+    n=$(( n + 1 ))
+    pending+="${t}: ${AUX_PREV_PROV[$t]:-auto/(modelo principal)}; "
+  done
+  if [[ "$n" -gt 0 ]]; then
+    printf 'migración incompleta: %s de %s tareas auxiliares quedaron sin migrar o a medias (%s); vuelva a correr el módulo para completarla.' \
+      "$n" "${#HERMES_AUX_TASKS[@]}" "${pending%; }"
+  else
+    printf 'configuración de Hermes incompleta: alguna clave no se pudo escribir con la CLI; vuelva a correr el módulo.'
+  fi
+}
+
+# Ctrl-C / TERM mientras se configura Hermes: el disco puede tener la
+# configuración a medias, así que se reinicia Hermes (para que el proceso
+# coincida con el disco), se muestra el mismo aviso y se sale SIN marcar el
+# módulo como hecho.
+_ollama_interrupt() {
+  trap - INT TERM
+  INCOMPLETE=1
+  hli_docker restart hermes >/dev/null 2>&1 || true
+  msg "Se interrumpió la configuración de Hermes. $(_ollama_incomplete_note)\n\nHermes se reinició para que coincida con lo que quedó escrito."
+  exit 130
+}
+
+# Agrega el proveedor y migra las tareas auxiliares SIN reescribir config.yaml:
+# 'hermes config set' dentro del contenedor, con el uid/gid del agente.
+# Migración reanudable: sin el marcador /etc/hli2/hermes-aux-migrated (que solo
+# se escribe cuando las 19 tareas terminaron bien) cada re-ejecución completa las
+# tareas que no estén totalmente locales, tenga o no el proveedor; con el marcador
+# solo se refresca la URL de las tareas que siguen siendo locales (respeta las que
+# el usuario devolvió a OpenRouter a propósito). Retorna 0; el resultado queda en
+# INCOMPLETE, INTEGRATION_NOTE y AUX_*.
 _ollama_integrate_hermes() {
-  local ip="$1" uid gid lan_ip key full=1 failed=0 k v body drop_fallback=0 content block t
+  local ip="$1" uid gid lan_ip key full=1 failed=0 k v body drop_fallback=0 content block t unit entry rest
+  local completed=0 skip_aux=0 base="http://${1}:${OLLAMA_PORT}/v1" line
+  local -a units=() local_now=()
   uid="$(id -u "$SERVER_USER")" gid="$(id -g "$SERVER_USER")"
-  INTEGRATION_NOTE="" AUX_PREV_NOTE="" FALLBACK_NOTE="" AUX_MOVED=0
-  local -a pairs=()
+  INTEGRATION_NOTE="" AUX_PREV_NOTE="" FALLBACK_NOTE="" AUX_MOVED=0 INCOMPLETE=0
+  AUX_DONE=() AUX_PREV_PROV=()
 
   if ! _hermes_config_valid; then
     INTEGRATION_NOTE="No se integró con Hermes: no hay un config.yaml utilizable en ${APPDATA_ROOT}/hermes. Vuelva a correr el módulo 'hermes' y luego este."
     return 0
   fi
   content="$(sudo -n cat -- "$(_hermes_config_path)" 2>/dev/null)" || content=""
-  if _ollama_config_has_provider; then full=0; fi
+  sudo -n test -f "$OLLAMA_AUX_MARKER" 2>/dev/null && completed=1
+  [[ "$completed" -eq 0 ]] || full=0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && AUX_PREV_PROV["${line%%:*}"]="${line#*: }"
+  done < <(_ollama_aux_summary "$content")
 
   # Privacidad: el respaldo automático es global y mandaría a OpenRouter un chat
   # local que falle (ver el encabezado de este archivo). Cambiar un
@@ -398,10 +477,30 @@ _ollama_integrate_hermes() {
     fi
   fi
 
-  # Registro previo de 'auxiliary' ANTES de tocar nada (solo en la primera
-  # migración, que es cuando se mueven las tareas).
-  if [[ "$full" -eq 1 ]]; then
-    _ollama_record_aux_previous "$content" || true
+  # Qué tareas hay que tocar.
+  if [[ "$completed" -eq 1 ]]; then
+    # Migración ya completada: solo la URL de las tareas que siguen apuntando a Ollama.
+    while IFS= read -r t; do
+      [[ -n "$t" ]] || continue
+      local_now+=("$t"); AUX_DONE["$t"]=1
+      units+=("aux:${t}"$'\t'"auxiliary.${t}.base_url"$'\t'"$base")
+    done < <(_ollama_aux_already_local "$content")
+  else
+    local -a todo=()
+    while IFS= read -r t; do [[ -n "$t" ]] && AUX_DONE["$t"]=1; done < <(_ollama_aux_fully_local "$content" "$ip")
+    for t in "${HERMES_AUX_TASKS[@]}"; do [[ -n "${AUX_DONE[$t]:-}" ]] || todo+=("$t"); done
+    if [[ "${#todo[@]}" -gt 0 ]]; then
+      # Registro previo ANTES de tocar nada; si no se puede guardar, no se migra.
+      if ! _ollama_record_aux_previous "$content"; then
+        skip_aux=1
+      else
+        for t in "${todo[@]}"; do
+          while IFS=$'\t' read -r k v; do
+            [[ -n "$k" ]] && units+=("aux:${t}"$'\t'"${k}"$'\t'"${v}")
+          done < <(_ollama_aux_task_pairs "$t" "$ip")
+        done
+      fi
+    fi
   fi
 
   if [[ "$drop_fallback" -eq 1 ]]; then
@@ -417,41 +516,66 @@ ${block}"; then
     fi
   fi
 
+  # Proveedor, rutas y overrides (unidad 'base') primero, después las tareas.
+  local -a all=()
+  while IFS=$'\t' read -r k v; do
+    [[ -n "$k" ]] && all+=("base"$'\t'"${k}"$'\t'"${v}")
+  done < <(_ollama_config_pairs "$ip" "$full")
+  all+=("${units[@]}")
+
   hli_busy "Configurando Hermes con la CLI (unas decenas de comandos; puede tardar varios minutos)..."
-  mapfile -t pairs < <(_ollama_config_pairs "$ip" "$full")
-  if [[ "$full" -eq 1 ]]; then
-    mapfile -t -O "${#pairs[@]}" pairs < <(_ollama_aux_pairs "$ip")
-    AUX_MOVED=1
-  else
-    # Re-ejecución: solo se actualiza la URL de las tareas que ya eran locales.
-    while IFS= read -r t; do
-      [[ -n "$t" ]] || continue
-      pairs+=("auxiliary.${t}.base_url"$'\t'"http://${ip}:${OLLAMA_PORT}/v1")
-    done < <(_ollama_aux_already_local "$content")
-  fi
-  for k in "${pairs[@]}"; do
-    v="${k#*$'\t'}"; k="${k%%$'\t'*}"
-    [[ -n "$k" ]] || continue
-    hli_docker exec -u "${uid}:${gid}" hermes "$HERMES_BIN" config set "$k" "$v" >/dev/null 2>&1 || failed=1
+  trap '_ollama_interrupt' INT TERM
+  _OL_CUR_UNIT="" _OL_CUR_FAILED=0
+  for entry in "${all[@]}"; do
+    unit="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"; k="${rest%%$'\t'*}"; v="${rest#*$'\t'}"
+    if [[ "$unit" != "$_OL_CUR_UNIT" ]]; then _ollama_close_unit; _OL_CUR_UNIT="$unit"; fi
+    if ! hli_docker exec -u "${uid}:${gid}" hermes "$HERMES_BIN" config set "$k" "$v" >/dev/null 2>&1; then
+      _OL_CUR_FAILED=1; failed=1
+    fi
   done
+  _ollama_close_unit
 
   if [[ "$drop_fallback" -eq 1 ]]; then
     printf 'y\n' | hli_docker exec -i -u "${uid}:${gid}" hermes "$HERMES_BIN" fallback clear >/dev/null 2>&1 || failed=1
   fi
+  trap - INT TERM
 
-  if [[ "$failed" -eq 1 ]]; then
-    INTEGRATION_NOTE="No se pudo escribir toda la configuración de Hermes con su CLI. Revise ${APPDATA_ROOT}/hermes/config.yaml (providers.${OLLAMA_PROVIDER_ID}, platforms.api_server.model_routes, agent.reasoning_overrides y auxiliary.*) y reinicie el contenedor 'hermes'."
-    return 0
+  # ¿Quedó todo? (en modo 'completed' las tareas ya no locales no cuentan).
+  local pending=0
+  if [[ "$completed" -eq 0 ]]; then
+    for t in "${HERMES_AUX_TASKS[@]}"; do [[ -n "${AUX_DONE[$t]:-}" ]] || pending=$(( pending + 1 )); done
+  fi
+  if [[ "$failed" -eq 1 || "$skip_aux" -eq 1 || "$pending" -gt 0 ]]; then
+    INCOMPLETE=1
+  elif [[ "$completed" -eq 0 ]]; then
+    # Todo escrito: se deja el marcador (solo ahora). Sin él no se puede decir "hecho".
+    if _hermes_root_write "$OLLAMA_AUX_MARKER" "# Migración de las tareas auxiliares de Hermes a la IA local completada (HLI 2, módulo ollama), $(date +%F).
+# Mientras exista, volver a correr el módulo solo refresca la URL de las tareas locales (no pisa las que usted devolvió a OpenRouter). Bórrelo para repetir la migración completa."; then
+      AUX_MOVED=1
+    else
+      INCOMPLETE=1
+    fi
+  else
+    AUX_MOVED=1
+  fi
+  if [[ "$INCOMPLETE" -eq 1 ]]; then
+    if [[ "$skip_aux" -eq 1 ]]; then
+      INTEGRATION_NOTE="No se migraron las tareas auxiliares porque no se pudo guardar el registro de sus valores previos (${OLLAMA_AUX_PREV_FILE}). $(_ollama_incomplete_note)"
+    else
+      INTEGRATION_NOTE="$(_ollama_incomplete_note)"
+    fi
   fi
 
+  # Hermes se reinicia SIEMPRE (también con una migración incompleta): el proceso
+  # tiene que coincidir con lo que quedó en el disco.
   hli_docker restart hermes >/dev/null 2>&1 || true
   lan_ip="$(_hermes_lan_ip)"
   if ! _hermes_private_lan_ip "$lan_ip"; then
-    INTEGRATION_NOTE="Hermes quedó configurado y reiniciado, pero no se pudo determinar la IP de la LAN para verificarlo. Compruebe /v1/models a mano."
+    INTEGRATION_NOTE+="${INTEGRATION_NOTE:+ }Hermes quedó configurado y reiniciado, pero no se pudo determinar la IP de la LAN para verificarlo. Compruebe /v1/models a mano."
     return 0
   fi
   if ! _hermes_wait_health "http://${lan_ip}:8642/health"; then
-    INTEGRATION_NOTE="Se configuró Hermes y se reinició, pero http://${lan_ip}:8642/health no respondió a tiempo. Revise los logs (sudo docker logs --tail 50 hermes) y config.yaml."
+    INTEGRATION_NOTE+="${INTEGRATION_NOTE:+ }Hermes se reinició, pero http://${lan_ip}:8642/health no respondió a tiempo. Revise los logs (sudo docker logs --tail 50 hermes) y config.yaml."
     return 0
   fi
 
@@ -464,7 +588,7 @@ ${block}"; then
     [[ "$body" == *"$(_ollama_alias "$m")"* ]] || missing+="$(_ollama_alias "$m") "
   done
   if [[ -n "$missing" ]]; then
-    INTEGRATION_NOTE="Hermes responde, pero /v1/models NO lista: ${missing}. Los modelos pueden aparecer igual en el selector de la app (que usa /api/model/options); si no, revise 'platforms.api_server.model_routes' en config.yaml."
+    INTEGRATION_NOTE+="${INTEGRATION_NOTE:+ }Hermes responde, pero /v1/models NO lista: ${missing}. Los modelos pueden aparecer igual en el selector de la app (que usa /api/model/options); si no, revise 'platforms.api_server.model_routes' en config.yaml."
   fi
 
   local code
@@ -481,15 +605,18 @@ ${block}"; then
 # Texto de privacidad del mensaje final: qué queda local y las excepciones
 # explícitas. Sin Hermes no hay nada que declarar de sus tareas.
 _ollama_privacy_text() {
-  local moved="$1" fb="$2" t="" tasks="${HERMES_AUX_TASKS[*]}"
-  t="Privacidad (alcance real, no es total):\n- Local, sin salir de la casa: los chats que usted elija con ${OLLAMA_MODELS[0]} y, en todos los chats, las ${#HERMES_AUX_TASKS[@]} tareas auxiliares de Hermes (${tasks}) con ${OLLAMA_AUX_MODEL}.\n- Excepciones: (1) los chats con el modelo por defecto van a OpenRouter, por diseño. (2) Las herramientas web (buscar, abrir páginas) envían consultas y piden páginas a Internet por naturaleza, también desde un chat local. (3) Si Ollama falla por conexión caída o error de pago/cuota, Hermes cae por diseño al modelo principal de OpenRouter también en las tareas auxiliares; no hay una opción documentada para impedirlo. (4) Respaldo automático: ${fb:-no hay respaldo configurado}."
-  if [[ "$moved" -eq 1 ]]; then
+  local fb="$1" t="" local_list="" other="" n=0 task
+  for task in "${HERMES_AUX_TASKS[@]}"; do
+    if [[ -n "${AUX_DONE[$task]:-}" ]]; then local_list+="${task} "; n=$(( n + 1 )); else other+="${task} "; fi
+  done
+  t="Privacidad (alcance real, no es total):\n- Local, sin salir de la casa: los chats que usted elija con ${OLLAMA_MODELS[0]} y, en todos los chats, ${n} de las ${#HERMES_AUX_TASKS[@]} tareas auxiliares de Hermes (${local_list% }) con ${OLLAMA_AUX_MODEL}."
+  [[ -z "$other" ]] || t+="\n- NO locales (siguen en su proveedor anterior o a medias): ${other% }."
+  t+="\n- Excepciones: (1) los chats con el modelo por defecto van a OpenRouter, por diseño. (2) Las herramientas web (buscar, abrir páginas) envían consultas y piden páginas a Internet por naturaleza, también desde un chat local. (3) Si Ollama falla por conexión caída o error de pago/cuota, Hermes cae por diseño al modelo principal de OpenRouter también en las tareas auxiliares; no hay una opción documentada para impedirlo. (4) Respaldo automático: ${fb:-no hay respaldo configurado}."
+  if [[ "$n" -gt 0 ]]; then
     t+="\n- Visión: gemma4:e2b admite imágenes según ollama.com/library/gemma4 ('Text, Image input'), pero con menor calidad que un modelo grande; no se verificó que Hermes la detecte con un endpoint propio. Si el análisis de imágenes falla, revierta 'vision' a su valor previo. voice_chat y tts_audio_tags son tareas de texto y también pasaron al modelo local."
   fi
   printf '%s' "$t"
 }
-
-# --- Principal -----------------------------------------------------------------------
 
 _ollama_main() {
   _ollama_detect || return 1
@@ -537,7 +664,7 @@ _ollama_main() {
   fi
   _ollama_pull_models || return 1
 
-  INTEGRATION_NOTE="" AUX_PREV_NOTE="" FALLBACK_NOTE="" AUX_MOVED=0
+  INTEGRATION_NOTE="" AUX_PREV_NOTE="" FALLBACK_NOTE="" AUX_MOVED=0 INCOMPLETE=0
   local where
   if [[ "$O_MODE" == "hermes" ]]; then
     _ollama_integrate_hermes "$O_IP"
@@ -546,16 +673,19 @@ _ollama_main() {
     where="Ollama quedó en su propia red, sin integración: Hermes no está instalado (o no se encontró su red). Cuando instale Hermes, vuelva a correr este módulo para conectarlos."
   fi
 
-  mark_done ollama
+  # Con la migración incompleta NO se marca como hecho: el menú y las
+  # re-ejecuciones lo muestran pendiente.
+  [[ "$INCOMPLETE" -eq 1 ]] || mark_done ollama
 
   local aliases="" m privacy=""
   for m in "${OLLAMA_MODELS[@]}"; do aliases+="$(_ollama_alias "$m") "; done
   if [[ "$O_MODE" == "hermes" ]]; then
-    privacy="$(_ollama_privacy_text "$AUX_MOVED" "$FALLBACK_NOTE")"
+    privacy="$(_ollama_privacy_text "$FALLBACK_NOTE")"
   else
     privacy="Privacidad: Ollama no tiene puertos en el host y no está conectado a nada; sin Hermes no hay chats que proteger."
   fi
   msg "Ollama desplegado (composeId=${composeId}) con los modelos ${OLLAMA_MODELS[*]}.\n\n${where}${INTEGRATION_NOTE:+\n\nATENCIÓN: ${INTEGRATION_NOTE}}\n\nCómo usarlo: en hermes-android elija el modelo por conversación (selector de modelo del chat): gemma4:e4b es el cerebro local; los alias ${aliases% } aparecen en /v1/models. El modelo por defecto de Hermes sigue siendo el de OpenRouter.\n\nLatencia esperada (CPU, medida en este equipo): lectura de ~54 tokens/s y escritura de 12-16 tokens/s con gemma4:e4b. El primer mensaje de cada conversación puede tardar varios minutos (Hermes envía instrucciones y herramientas, decenas de miles de tokens, que hay que leer); los siguientes son más rápidos porque Ollama reutiliza el contexto ya leído. El 'pensamiento' del modelo está desactivado para ahorrar tiempo.\n\n${privacy}${AUX_PREV_NOTE:+\n\n${AUX_PREV_NOTE}}\n\nMedición: sudo docker exec ollama ollama ps (modelo cargado, memoria y CONTEXT). Límites: 8 CPU y 20 GB de RAM."
+  [[ "$INCOMPLETE" -eq 0 ]] || return 1
   return 0
 }
 

@@ -70,7 +70,13 @@ case "$sub" in
     exit 0
     ;;
   sh)
-    exec "${args[@]}"
+    # Se corre de verdad con el área root-only destrabada solo durante la
+    # llamada (p. ej. 'sh -c rm -f <ruta>.tmp.*' del módulo ollama).
+    _stub_unlock_root_area
+    "${args[@]}"
+    rc=$?
+    _stub_relock_root_area
+    exit "$rc"
     ;;
   docker)
     unset -v 'args[0]'

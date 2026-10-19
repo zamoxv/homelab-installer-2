@@ -60,6 +60,33 @@ _ol_seed_hermes() {
   } > "$APPDATA_ROOT/hermes/config.yaml"
 }
 
+# Marcador de migración completada (root-only), como lo deja el módulo.
+_ol_marker_set() {
+  _ol_secret_unlock
+  printf '# migrado\n' > "$SECRETS_DIR/hermes-aux-migrated"
+  chmod 0600 "$SECRETS_DIR/hermes-aux-migrated"
+  _ol_secret_lock
+}
+_ol_marker_exists() {
+  local rc=0
+  _ol_secret_unlock
+  [[ -f "$SECRETS_DIR/hermes-aux-migrated" ]] || rc=1
+  _ol_secret_lock
+  return "$rc"
+}
+
+# Bloque 'auxiliary:' como lo dejaría 'hermes config set' tras migrar las tareas
+# de la lista $@ (la CLI simulada no escribe el archivo): campos completos.
+_ol_aux_block_local() {
+  local t
+  for t in "$@"; do
+    printf '  %s:\n    provider: custom\n    model: gemma4:e2b\n    base_url: http://%s:11434/v1\n    api_key: no-key-required\n' "$t" "$_OL_IP"
+    [[ "$t" == review ]] || printf '    timeout: 3600\n'
+    case "$t" in review|memory_query_rewrite) ;; *) printf '    reasoning_effort: none\n' ;; esac
+    [[ "$t" != compression ]] || printf '    no_progress_timeout: 900\n'
+  done
+}
+
 _ol_standalone_env() {
   export STUB_DOCKER_INSPECT_NETWORKS="ollama_ollama-net"
 }
@@ -237,15 +264,6 @@ test_ollama_egress_script_applies_allow_list_inside_atomic_build() {
   assert_contains "$ipt" $'-A\tHLI2-HERMES-FWD-new\t-d\t192.168.0.0/16\t-j\tDROP' || return 1
 }
 
-test_ollama_egress_script_without_allow_file_adds_no_exceptions() {
-  _ol_setup
-  _ol_seed_hermes
-  : > "$STUB_CALL_LOG"
-  _ol_run_egress apply || return 1
-  # Solo DNS (puerto 53): ninguna otra regla con --dport.
-  if _ol_ipt_calls | grep -F -- $'--dport' | grep -vF -- $'--dport\t53\t' | grep -q .; then fail "hay reglas con --dport (salvo DNS) sin archivo de excepciones"; return 1; fi
-}
-
 # --- Despliegue con Hermes ------------------------------------------------------------
 
 test_ollama_deploy_with_hermes() {
@@ -331,6 +349,7 @@ test_ollama_rerun_with_existing_provider_only_updates_urls() {
   _ol_setup
   _ol_seed_hermes empty
   printf 'providers:\n  ollama-local:\n    api: http://10.213.144.9:11434/v1\n    request_timeout_seconds: 7200\n' >> "$APPDATA_ROOT/hermes/config.yaml"
+  _ol_marker_set
   : > "$DIALOG_YESNO_QUEUE"
   bash "$REPO_ROOT/modules/ollama.sh" || return 1
   local ex=$'config\tset\t'
@@ -505,8 +524,8 @@ test_ollama_pull_failure_is_clear_and_not_marked_done() {
 }
 
 test_ollama_alias_names() {
-  assert_eq "gemma4-e4b-local" "$( ( source "$REPO_ROOT/modules/ollama.sh"; _ollama_alias gemma4:e4b ) )" || return 1
-  assert_eq "gemma4-e2b-local" "$( ( source "$REPO_ROOT/modules/ollama.sh"; _ollama_alias gemma4:e2b ) )" || return 1
+  assert_eq "gemma4-e4b-local" "$(bash -c 'source "$1"; _ollama_alias gemma4:e4b' "$REPO_ROOT/modules/_" "$REPO_ROOT/modules/ollama.sh")" || return 1
+  assert_eq "gemma4-e2b-local" "$(bash -c 'source "$1"; _ollama_alias gemma4:e2b' "$REPO_ROOT/modules/_" "$REPO_ROOT/modules/ollama.sh")" || return 1
 }
 
 # --- Registro y backup -------------------------------------------------------------------------
@@ -551,9 +570,21 @@ test_ollama_registry_and_backup_exclude_models() {
 _ol_allow_file() {
   local content="$1" mode="${2:-600}"
   _ol_secret_unlock
+  rm -f "$SECRETS_DIR/hermes-egress-allow.conf"
   printf '%s' "$content" > "$SECRETS_DIR/hermes-egress-allow.conf"
   chmod "$mode" "$SECRETS_DIR/hermes-egress-allow.conf"
   _ol_secret_lock
+}
+
+# Reglas con --dport que NO son de DNS ni del control positivo (puerto 9000).
+_ol_unexpected_dport() {
+  _ol_ipt_calls | grep -F -- $'--dport' | grep -vE -- $'--dport\t(53|9000)\t' | grep -q .
+}
+# Control positivo: una entrada válida en un archivo bueno SÍ se aplica (si el
+# script se cayera, las pruebas negativas pasarían por la razón equivocada).
+_OL_CONTROL="10.213.144.30:9000/tcp"
+_ol_control_applied() {
+  _ol_ipt_calls | grep -qF -- $'-A\tHLI2-HERMES-FWD-new\t-d\t10.213.144.30\t-p\ttcp\t--dport\t9000\t-j\tACCEPT'
 }
 
 test_ollama_egress_script_rejects_hostile_allow_lines() {
@@ -566,26 +597,22 @@ test_ollama_egress_script_rejects_hostile_allow_lines() {
     "10.213.144.250:70000/tcp" "10.213.144.250:80/TCP" "10.213.144.250:80" "10.213.144.1:80/tcp"
     "10.213.144.255:80/tcp" "10.213.144.5:80/tcp;rm -rf /" "\$(id):80/tcp" "10.213.144.5:80/tcp|x"
   )
-  local h ipt
+  local h
   for h in "${hostile[@]}"; do
-    _ol_allow_file "$h"$'\n'
+    _ol_allow_file "$h"$'\n'"$_OL_CONTROL"$'\n'
     : > "$STUB_CALL_LOG"
     _ol_run_egress apply || return 1
-    ipt="$(_ol_ipt_calls)"
-    if grep -F -- $'--dport' <<<"$ipt" | grep -vF -- $'--dport\t53\t' | grep -q .; then fail "abrió una excepción por la línea [$h]"; return 1; fi
+    _ol_control_applied || { fail "el control positivo no se aplicó con la línea [$h]"; return 1; }
+    if _ol_unexpected_dport; then fail "abrió una excepción por la línea [$h]"; return 1; fi
     assert_contains "$(< "$HLI2_TEST_SCRATCH/egress.err")" "ignorada" "avisa por [$h]" || return 1
   done
-  # CRLF: una línea válida con retorno de carro se descarta (archivo de Windows).
-  _ol_allow_file "${_OL_IP}:11434/tcp"$'\r\n'
+  # CRLF: la línea válida con retorno de carro se descarta; la siguiente sí vale.
+  _ol_allow_file "${_OL_IP}:11434/tcp"$'\r\n'"$_OL_CONTROL"$'\n'
   : > "$STUB_CALL_LOG"
   _ol_run_egress apply || return 1
-  if _ol_ipt_calls | grep -F -- $'--dport' | grep -vF -- $'--dport\t53\t' | grep -q .; then fail "aceptó una línea con CR"; return 1; fi
+  _ol_control_applied || { fail "control positivo ausente (CRLF)"; return 1; }
+  if _ol_ipt_calls | grep -qF -- $'--dport\t11434\t'; then fail "aceptó una línea con CR"; return 1; fi
   assert_contains "$(< "$HLI2_TEST_SCRATCH/egress.err")" "retorno de carro" || return 1
-  # Una línea mala no invalida las buenas.
-  _ol_allow_file $'basura\n'"${_OL_IP}:11434/tcp"$'\n'
-  : > "$STUB_CALL_LOG"
-  _ol_run_egress apply || return 1
-  assert_contains "$(_ol_ipt_calls)" $'-A\tHLI2-HERMES-FWD-new\t-d\t'"${_OL_IP}"$'\t-p\ttcp\t--dport\t11434\t-j\tACCEPT' || return 1
 }
 
 test_ollama_egress_script_accepts_last_line_without_newline_and_trims_edges() {
@@ -600,37 +627,67 @@ test_ollama_egress_script_accepts_last_line_without_newline_and_trims_edges() {
 test_ollama_egress_script_ignores_allow_file_with_bad_mode_owner_or_symlink() {
   _ol_setup
   _ol_seed_hermes
-  local mode ipt
+  local mode
   for mode in 644 640 660 666 700 755; do
-    _ol_allow_file "${_OL_IP}:11434/tcp"$'\n' "$mode"
+    _ol_allow_file "$_OL_CONTROL"$'\n' "$mode"
     : > "$STUB_CALL_LOG"
     _ol_run_egress apply || return 1
-    if _ol_ipt_calls | grep -F -- $'--dport' | grep -vF -- $'--dport\t53\t' | grep -q .; then fail "leyó un archivo con modo $mode"; return 1; fi
+    if _ol_control_applied; then fail "leyó un archivo con modo $mode"; return 1; fi
     assert_contains "$(< "$HLI2_TEST_SCRATCH/egress.err")" "modo 600 o 400" "aviso para el modo $mode" || return 1
+    # Control positivo: el MISMO contenido con modo 600 sí se aplica.
+    _ol_allow_file "$_OL_CONTROL"$'\n' 600
+    : > "$STUB_CALL_LOG"
+    _ol_run_egress apply || return 1
+    _ol_control_applied || { fail "el control positivo (modo 600) no se aplicó tras $mode"; return 1; }
   done
-  # Modo 400 sí vale.
-  _ol_allow_file "${_OL_IP}:11434/tcp"$'\n' 400
+  # Modo 400 también vale.
+  _ol_allow_file "$_OL_CONTROL"$'\n' 400
   : > "$STUB_CALL_LOG"
   _ol_run_egress apply || return 1
-  assert_contains "$(_ol_ipt_calls)" $'-d\t'"${_OL_IP}"$'\t-p\ttcp' "modo 400 aceptado" || return 1
-  # Otro dueño: se espera uid 0 (aquí el del test); con uno distinto, se ignora.
+  _ol_control_applied || { fail "modo 400 rechazado"; return 1; }
+  # Otro dueño: se espera uid 0; el archivo es del usuario del test -> se ignora.
+  _ol_allow_file "$_OL_CONTROL"$'\n' 600
   _ol_secret_unlock
   : > "$STUB_CALL_LOG"
   HLI2_EGRESS_EXPECT_UID=0 HLI2_IPTABLES="$STUBS_DIR/iptables" bash "$HLI2_HERMES_SBIN_DIR/hli2-hermes-egress" apply 2>"$HLI2_TEST_SCRATCH/egress.err" || true
   _ol_secret_lock
   assert_contains "$(< "$HLI2_TEST_SCRATCH/egress.err")" "debe ser de root" "otro dueño" || return 1
-  if grep -F $'iptables\t' "$STUB_CALL_LOG" | grep -F -- $'--dport' | grep -vF -- $'--dport\t53\t' | grep -q .; then fail "leyó un archivo de otro dueño"; return 1; fi
-  # Enlace simbólico: se ignora aunque el destino sea válido.
+  if _ol_control_applied; then fail "leyó un archivo de otro dueño"; return 1; fi
+  # El mismo archivo con el uid correcto sí se aplica (control).
+  : > "$STUB_CALL_LOG"
+  _ol_run_egress apply || return 1
+  _ol_control_applied || { fail "control positivo (dueño correcto) ausente"; return 1; }
+  # Enlace simbólico: se ignora aunque el destino sea válido y de modo 600.
   _ol_secret_unlock
-  printf '%s\n' "${_OL_IP}:11434/tcp" > "$HLI2_TEST_SCRATCH/real-allow.conf"
+  printf '%s\n' "$_OL_CONTROL" > "$HLI2_TEST_SCRATCH/real-allow.conf"
   chmod 600 "$HLI2_TEST_SCRATCH/real-allow.conf"
   rm -f "$SECRETS_DIR/hermes-egress-allow.conf"
   ln -s "$HLI2_TEST_SCRATCH/real-allow.conf" "$SECRETS_DIR/hermes-egress-allow.conf"
   _ol_secret_lock
   : > "$STUB_CALL_LOG"
   _ol_run_egress apply || return 1
-  if _ol_ipt_calls | grep -F -- $'--dport' | grep -vF -- $'--dport\t53\t' | grep -q .; then fail "siguió un enlace simbólico"; return 1; fi
+  if _ol_control_applied; then fail "siguió un enlace simbólico"; return 1; fi
   assert_contains "$(< "$HLI2_TEST_SCRATCH/egress.err")" "no es un archivo regular" || return 1
+  # Control: el mismo contenido como archivo regular sí se aplica.
+  _ol_allow_file "$_OL_CONTROL"$'\n' 600
+  : > "$STUB_CALL_LOG"
+  _ol_run_egress apply || return 1
+  _ol_control_applied || { fail "control positivo (archivo regular) ausente"; return 1; }
+}
+
+test_ollama_egress_script_without_allow_file_adds_no_exceptions() {
+  _ol_setup
+  _ol_seed_hermes
+  : > "$STUB_CALL_LOG"
+  _ol_run_egress apply || return 1
+  # Solo DNS (puerto 53): ninguna otra regla con --dport.
+  if _ol_ipt_calls | grep -F -- $'--dport' | grep -vF -- $'--dport\t53\t' | grep -q .; then fail "hay reglas con --dport (salvo DNS) sin archivo de excepciones"; return 1; fi
+  assert_contains "$(_ol_ipt_calls)" $'-A\tHLI2-HERMES-FWD-new\t-d\t1.1.1.1\t-p\tudp\t--dport\t53\t-j\tACCEPT' "el script sí corre (DNS presente)" || return 1
+  # Control positivo: con un archivo bueno aparece la excepción.
+  _ol_allow_file "$_OL_CONTROL"$'\n' 600
+  : > "$STUB_CALL_LOG"
+  _ol_run_egress apply || return 1
+  _ol_control_applied || { fail "control positivo ausente"; return 1; }
 }
 
 # --- Revisión: escritura atómica de la lista -------------------------------------------
@@ -641,7 +698,7 @@ test_ollama_allow_add_is_atomic_and_keeps_old_file_on_failure() {
   ( source "$REPO_ROOT/modules/hermes.sh"; _hermes_allow_add "${_OL_IP}:11434/tcp" "$_OL_SUBNET" ) || return 1
   _ol_secret_unlock; before="$(< "$f")"; _ol_secret_lock
   # Temporal en la misma carpeta + mv.
-  grep -qP "^sudo\tmv\t-f\t$f\.tmp\.[0-9]+\t$f$" "$STUB_CALL_LOG" || { fail "la escritura no usó temporal + mv"; return 1; }
+  grep -qP "^sudo\t-n\tmv\t-f\t$f\.tmp\.[0-9]+\t$f$" "$STUB_CALL_LOG" || { fail "la escritura no usó temporal + mv"; return 1; }
   # Falla 'tee': el archivo anterior queda intacto y no sobra el temporal.
   export STUB_SUDO_TEE_FAIL_TARGET="$f"
   if ( source "$REPO_ROOT/modules/hermes.sh"; _hermes_allow_add "10.213.144.20:8080/tcp" "$_OL_SUBNET" ) 2>/dev/null; then fail "debió fallar si tee falla"; return 1; fi
@@ -825,6 +882,7 @@ test_ollama_rerun_updates_url_only_for_aux_tasks_already_local() {
   _ol_setup
   _ol_seed_hermes empty
   printf 'providers:\n  ollama-local:\n    api: http://10.213.144.9:11434/v1\nauxiliary:\n  vision:\n    provider: custom\n    model: gemma4:e2b\n    base_url: http://10.213.144.9:11434/v1\n  compression:\n    provider: openrouter\n    model: qwen/qwen3.7-flash\n' >> "$APPDATA_ROOT/hermes/config.yaml"
+  _ol_marker_set
   : > "$DIALOG_YESNO_QUEUE"
   bash "$REPO_ROOT/modules/ollama.sh" || return 1
   assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.vision.base_url\thttp://'"${_OL_IP}:11434/v1" "la tarea local sigue a la IP nueva" || return 1
@@ -855,4 +913,162 @@ test_ollama_final_message_states_privacy_exceptions_and_no_overclaim() {
   echo "yes" > "$DIALOG_YESNO_QUEUE"
   bash "$REPO_ROOT/modules/ollama.sh" || return 1
   assert_contains "$(_ol_dialog_text)" "Respaldo automático quitado" || return 1
+}
+
+# --- Migración de las tareas auxiliares: reanudable, completa y sin pisar al usuario ---------
+
+# config.yaml de Hermes con el bloque 'auxiliary:' de las tareas $@ totalmente
+# migradas (lo que dejaría la CLI real).
+_ol_config_with_local_aux() {
+  { printf 'auxiliary:\n'; _ol_aux_block_local "$@"; } >> "$APPDATA_ROOT/hermes/config.yaml"
+}
+_ol_all_but() {
+  local t x
+  for t in "${_OL_TASKS[@]}"; do
+    for x in "$@"; do [[ "$t" == "$x" ]] && continue 2; done
+    printf '%s\n' "$t"
+  done
+}
+
+test_ollama_aux_completion_check_requires_every_key() {
+  _ol_setup
+  local content out
+  content="$(printf 'auxiliary:\n'; _ol_aux_block_local vision compression review memory_query_rewrite)
+$(printf '  skills_hub:\n    provider: custom\n    model: gemma4:e2b\n    base_url: http://%s:11434/v1\n' "$_OL_IP")
+$(printf '  approval:\n    provider: custom\n    model: gemma4:e2b\n    base_url: http://10.213.144.9:11434/v1\n    api_key: no-key-required\n    timeout: 3600\n    reasoning_effort: none\n')
+$(printf '  mcp:\n    provider: custom\n    model: gemma4:e2b\n    base_url: http://%s:11434/v1\n    api_key: no-key-required\n    timeout: 3600\n    reasoning_effort: low\n' "$_OL_IP")
+$(printf '  curator:\n    provider: openrouter\n    model: gemma4:e2b\n    base_url: http://%s:11434/v1\n    api_key: no-key-required\n    timeout: 3600\n    reasoning_effort: none\n' "$_OL_IP")"
+  out="$( bash -c 'source "$1"; _ollama_aux_fully_local "$2" "$3"' "$REPO_ROOT/modules/_" "$REPO_ROOT/modules/ollama.sh" "$content" "$_OL_IP" | tr '\n' ' ')"
+  assert_eq "vision compression review memory_query_rewrite " "$out" "solo las tareas con TODAS las claves (no basta la URL)" || return 1
+  # Sin el no_progress_timeout, compression tampoco cuenta.
+  content="$(printf 'auxiliary:\n'; _ol_aux_block_local vision compression | grep -v no_progress_timeout)"
+  out="$( bash -c 'source "$1"; _ollama_aux_fully_local "$2" "$3"' "$REPO_ROOT/modules/_" "$REPO_ROOT/modules/ollama.sh" "$content" "$_OL_IP" | tr '\n' ' ')"
+  assert_eq "vision " "$out" || return 1
+}
+
+test_ollama_aux_failure_midway_is_reported_and_rerun_completes_the_rest() {
+  _ol_setup
+  _ol_seed_hermes
+  printf 'no\nno\n' > "$DIALOG_YESNO_QUEUE"
+  # 15 llamadas de proveedor/rutas + vision (6) + compression (7) + 2 de skills_hub = 30.
+  export STUB_HERMES_CONFIG_SET_FAIL_N="30"
+  if bash "$REPO_ROOT/modules/ollama.sh"; then fail "debió terminar con error si la migración quedó incompleta"; return 1; fi
+  unset STUB_HERMES_CONFIG_SET_FAIL_N
+  local texts; texts="$(_ol_dialog_text)"
+  assert_contains "$texts" "migración incompleta: 1 de 19 tareas auxiliares quedaron sin migrar o a medias" || return 1
+  assert_contains "$texts" "skills_hub: auto/(modelo principal)" "dice dónde quedó la tarea" || return 1
+  assert_contains "$texts" "vuelva a correr el módulo" || return 1
+  assert_contains "$texts" "NO locales" "el aviso de privacidad no promete las 19" || return 1
+  assert_contains "$texts" "18 de las 19 tareas auxiliares" || return 1
+  # Hermes se reinició igual (proceso = disco), no hay marcador y el módulo no figura como hecho.
+  assert_file_contains "$STUB_CALL_LOG" $'docker\trestart\thermes' || return 1
+  _ol_marker_exists && { fail "se escribió el marcador con la migración incompleta"; return 1; }
+  assert_file_not_contains "$STATE_FILE" "ollama" "no se marca como hecho" || return 1
+  # Re-ejecución: la CLI simulada no escribe el archivo, así que se deja el
+  # estado que habría quedado (todo menos skills_hub, que tiene solo medio bloque).
+  : > "$STUB_CALL_LOG"
+  { printf 'auxiliary:\n'; _ol_aux_block_local $(_ol_all_but skills_hub); printf '  skills_hub:\n    provider: custom\n'; } >> "$APPDATA_ROOT/hermes/config.yaml"
+  printf 'no\nno\n' > "$DIALOG_YESNO_QUEUE"
+  bash "$REPO_ROOT/modules/ollama.sh" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.skills_hub.model\tgemma4:e2b' "completa la que faltaba" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.skills_hub.reasoning_effort\tnone' || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" "auxiliary.vision." "no repite lo ya hecho" || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" "auxiliary.compression." || return 1
+  _ol_marker_exists || { fail "debió dejar el marcador al completar"; return 1; }
+  assert_file_contains "$STATE_FILE" "ollama" "ahora sí figura como hecho" || return 1
+  assert_not_contains "$(_ol_dialog_text)" "migración incompleta" || return 1
+}
+
+test_ollama_aux_migration_resumes_even_when_provider_already_exists() {
+  _ol_setup
+  _ol_seed_hermes empty
+  # Estado de una primera ejecución interrumpida: el proveedor ya está, ninguna tarea.
+  printf 'providers:\n  ollama-local:\n    api: http://10.213.144.9:11434/v1\n' >> "$APPDATA_ROOT/hermes/config.yaml"
+  : > "$DIALOG_YESNO_QUEUE"
+  bash "$REPO_ROOT/modules/ollama.sh" || return 1
+  local t
+  for t in "${_OL_TASKS[@]}"; do
+    assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.'"${t}"$'.provider\tcustom' "migra $t" || return 1
+  done
+  _ol_marker_exists || { fail "sin marcador tras migrar todo"; return 1; }
+}
+
+test_ollama_completed_migration_respects_task_moved_back_by_the_user() {
+  _ol_setup
+  _ol_seed_hermes empty
+  : > "$DIALOG_YESNO_QUEUE"
+  bash "$REPO_ROOT/modules/ollama.sh" || return 1
+  _ol_marker_exists || { fail "primera migración sin marcador"; return 1; }
+  # El usuario devolvió 'vision' a OpenRouter; las demás siguen locales.
+  : > "$STUB_CALL_LOG"
+  sed -i '/^ollama$/d' "$STATE_FILE"
+  { printf 'auxiliary:\n'; _ol_aux_block_local $(_ol_all_but vision); printf '  vision:\n    provider: openrouter\n    model: qwen/qwen3.7-flash\n'; } >> "$APPDATA_ROOT/hermes/config.yaml"
+  export HLI2_OLLAMA_IP="10.213.144.77"
+  : > "$DIALOG_YESNO_QUEUE"
+  bash "$REPO_ROOT/modules/ollama.sh" || return 1
+  unset HLI2_OLLAMA_IP
+  assert_file_not_contains "$STUB_CALL_LOG" "auxiliary.vision" "no pisa la decisión del usuario" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.compression.base_url\thttp://10.213.144.77:11434/v1' "refresca la URL de las locales" || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" "auxiliary.compression.model" "solo la URL" || return 1
+  assert_file_not_contains "$STUB_CALL_LOG" "reasoning_effort" || return 1
+  _ol_marker_exists || { fail "el marcador debe seguir"; return 1; }
+  assert_file_contains "$STATE_FILE" "ollama" || return 1
+  # El mensaje dice la verdad: vision NO es local.
+  assert_contains "$(_ol_dialog_text)" "NO locales (siguen en su proveedor anterior o a medias): vision" || return 1
+  assert_contains "$(_ol_dialog_text)" "18 de las 19 tareas auxiliares" || return 1
+}
+
+test_ollama_aux_migration_aborts_if_previous_values_cannot_be_saved() {
+  _ol_setup
+  _ol_seed_hermes
+  printf 'auxiliary:\n  vision:\n    provider: openrouter\n    model: qwen/qwen3.7-flash\n' >> "$APPDATA_ROOT/hermes/config.yaml"
+  printf 'no\n' > "$DIALOG_YESNO_QUEUE"
+  export STUB_SUDO_TEE_FAIL_TARGET="$SECRETS_DIR/hermes-aux-previous.conf"
+  if bash "$REPO_ROOT/modules/ollama.sh"; then fail "debió terminar con error"; return 1; fi
+  unset STUB_SUDO_TEE_FAIL_TARGET
+  assert_file_not_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.' "no toca las auxiliares sin registro previo" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tproviders.ollama-local.api' "el proveedor sí se configura" || return 1
+  assert_contains "$(_ol_dialog_text)" "no se pudo guardar el registro de sus valores previos" || return 1
+  assert_contains "$(_ol_dialog_text)" "migración incompleta: 19 de 19" || return 1
+  _ol_marker_exists && { fail "marcador sin migrar"; return 1; }
+  assert_file_not_contains "$STATE_FILE" "ollama" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'docker\trestart\thermes' "Hermes se reinicia igual" || return 1
+}
+
+test_ollama_interrupt_during_config_prints_incomplete_note_and_exits() {
+  _ol_setup
+  _ol_seed_hermes
+  printf 'no\nno\n' > "$DIALOG_YESNO_QUEUE"
+  export STUB_HERMES_CONFIG_SET_INT_N=22 STUB_HERMES_CONFIG_SET_SIGNAL=TERM
+  local rc=0
+  bash "$REPO_ROOT/modules/ollama.sh" || rc=$?
+  unset STUB_HERMES_CONFIG_SET_INT_N STUB_HERMES_CONFIG_SET_SIGNAL
+  assert_eq "130" "$rc" "sale con 130" || return 1
+  local texts; texts="$(_ol_dialog_text)"
+  assert_contains "$texts" "Se interrumpió la configuración de Hermes" || return 1
+  assert_contains "$texts" "migración incompleta:" "mismo aviso que un fallo" || return 1
+  assert_contains "$texts" "vuelva a correr el módulo" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'docker\trestart\thermes' "reinicia Hermes para que coincida con el disco" || return 1
+  _ol_marker_exists && { fail "marcador tras interrupción"; return 1; }
+  assert_file_not_contains "$STATE_FILE" "ollama" || return 1
+  # Dejó de configurar apenas llegó la señal.
+  if (( $(grep -cP '^docker\t.*config\tset\t' "$STUB_CALL_LOG") > 22 )); then fail "siguió configurando tras la interrupción"; return 1; fi
+}
+
+# --- Escritura de archivos root: siempre 'sudo -n' y sin restos ------------------------------
+
+test_ollama_root_write_uses_sudo_n_and_cleans_stale_temporaries() {
+  _ol_setup
+  local f="$SECRETS_DIR/hermes-egress-allow.conf"
+  # Resto de una escritura interrumpida de otro proceso.
+  _ol_secret_unlock
+  printf 'viejo\n' > "$f.tmp.99999"
+  ( source "$REPO_ROOT/modules/hermes.sh"; _hermes_allow_add "${_OL_IP}:11434/tcp" "$_OL_SUBNET" ) || return 1
+  _ol_secret_unlock
+  [[ ! -e "$f.tmp.99999" ]] || { _ol_secret_lock; fail "no limpió el temporal huérfano"; return 1; }
+  assert_file_contains "$f" "${_OL_IP}:11434/tcp" || { _ol_secret_lock; return 1; }
+  _ol_secret_lock
+  # Ninguna operación privilegiada sin -n.
+  if grep -E $'^sudo\t(install|tee|mv|rm)\t' "$STUB_CALL_LOG" | grep -q .; then fail "una escritura privilegiada corrió sin 'sudo -n'"; return 1; fi
+  assert_file_contains "$STUB_CALL_LOG" $'sudo\t-n\tinstall\t-m\t0600\t-o\troot\t-g\troot\t/dev/null\t'"$f.tmp." || return 1
 }

@@ -1049,7 +1049,17 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
   tocar nada guarda el bloque `auxiliary:` previo en
   `/etc/hli2/hermes-aux-previous.conf` (root 0600, escritura atómica, solo la
   primera vez para no pisar el original) y lo resume en el mensaje final.
-  Re-ejecutar solo actualiza la URL de las tareas que ya eran locales.
+  **Migración reanudable:** una tarea cuenta como hecha solo si TODAS las claves
+  que escribe el módulo están en `config.yaml` (no basta la URL). El marcador
+  root-only `/etc/hli2/hermes-aux-migrated` se escribe únicamente cuando las 19
+  terminaron bien. Sin marcador, cada re-ejecución completa las que no estén
+  totalmente locales (exista o no el proveedor); con marcador solo refresca la URL
+  de las que siguen locales y **no pisa las que el usuario devolvió a OpenRouter**.
+  Si algo falla (o se interrumpe con Ctrl-C) el módulo reinicia Hermes igual (el
+  proceso coincide con el disco), muestra "migración incompleta: X de 19 tareas…
+  vuelva a correr el módulo" con el proveedor en que quedó cada una, no escribe el
+  marcador y **no marca `ollama` como hecho** (sale con error). Si no puede guardar
+  el registro previo, no migra las tareas.
   - `vision`: `gemma4:e2b` admite imágenes según `ollama.com/library/gemma4/tags`
     ("Text, Image input"), así que se movió; menor calidad que un modelo grande y
     **no verificado** que Hermes la detecte con un endpoint propio (prueba 152).

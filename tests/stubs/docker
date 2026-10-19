@@ -101,6 +101,24 @@ if [[ "${1:-}" == "network" && "${2:-}" == "inspect" && "$*" == *"Containers"* ]
   [[ -z "${STUB_DOCKER_NET_CONTAINERS:-}" ]] || printf '%s\n' "$STUB_DOCKER_NET_CONTAINERS"
   exit 0
 fi
+# 'hermes config set' numerados (módulo ollama): STUB_HERMES_CONFIG_SET_FAIL_N="3 7"
+# hace fallar esos números de llamada; STUB_HERMES_CONFIG_SET_INT_N=N manda SIGINT
+# la señal STUB_HERMES_CONFIG_SET_SIGNAL (INT por defecto) al proceso 'modules/ollama.sh' en la llamada N, que sí termina bien.
+if [[ "${1:-}" == "exec" && "$*" == *"config set"* ]]; then
+  _cnt_file="${STUB_CALL_LOG:-/dev/null}.cfgset"
+  _n=$(( $(cat "$_cnt_file" 2>/dev/null || echo 0) + 1 ))
+  echo "$_n" > "$_cnt_file"
+  if [[ " ${STUB_HERMES_CONFIG_SET_FAIL_N:-} " == *" $_n "* ]]; then exit 1; fi
+  if [[ -n "${STUB_HERMES_CONFIG_SET_INT_N:-}" && "$_n" == "$STUB_HERMES_CONFIG_SET_INT_N" ]]; then
+    _p="$PPID"
+    while [[ "$_p" -gt 1 ]]; do
+      if tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null | grep -q 'modules/ollama.sh'; then kill -"${STUB_HERMES_CONFIG_SET_SIGNAL:-INT}" "$_p"; break; fi
+      _p="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')"
+      [[ -n "$_p" ]] || break
+    done
+  fi
+  exit 0
+fi
 # Módulo ollama: 'docker exec' dentro de los contenedores ollama/hermes.
 # STUB_OLLAMA_MODELS: etiquetas ya descargadas; STUB_OLLAMA_PULL_FAIL=1: la
 # descarga falla; STUB_OLLAMA_REACH: código HTTP que "ve" Hermes al sondear a

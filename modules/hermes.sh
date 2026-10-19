@@ -809,19 +809,23 @@ _hermes_valid_allow_entry() {
 
 # Escribe root:root 0600 el archivo $1 con el contenido $2 de forma atómica:
 # temporal en la MISMA carpeta (creado ya con el modo final) y 'mv' (rename). Si
-# algo falla, el archivo anterior queda intacto y no sobra el temporal. No
+# algo falla, el archivo anterior queda intacto y no sobra el temporal; si el
+# proceso muere a medias, la próxima escritura borra los restos. No
 # cambia el modo de la carpeta (puede ser /etc/hli2, 0700).
 _hermes_root_write() {
   local f="$1" content="$2" stage
   stage="${f}.tmp.$$"
-  sudo install -d -m 0700 -o root -g root "$(dirname "$f")" 2>/dev/null || true
-  sudo install -m 0600 -o root -g root /dev/null "$stage" || return 1
-  if ! printf '%s\n' "$content" | sudo tee "$stage" >/dev/null; then
-    sudo rm -f "$stage"
+  # Restos de una escritura interrumpida antes (nombre único por proceso: no
+  # hay trap que pueda pisar el de quien llama).
+  sudo -n sh -c 'rm -f -- "$1".tmp.*' _ "$f" 2>/dev/null || true
+  sudo -n install -d -m 0700 -o root -g root "$(dirname "$f")" 2>/dev/null || true
+  sudo -n install -m 0600 -o root -g root /dev/null "$stage" || return 1
+  if ! printf '%s\n' "$content" | sudo -n tee "$stage" >/dev/null; then
+    sudo -n rm -f "$stage"
     return 1
   fi
-  if ! sudo mv -f "$stage" "$f"; then
-    sudo rm -f "$stage"
+  if ! sudo -n mv -f "$stage" "$f"; then
+    sudo -n rm -f "$stage"
     return 1
   fi
 }
