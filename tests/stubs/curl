@@ -109,6 +109,15 @@ case "$url" in
     if [[ -n "${STUB_HERMES_HEALTH_FAIL_AFTER_RESTART:-}" ]] && grep -q $'^docker\trestart\t' "${STUB_CALL_LOG:-/dev/null}" 2>/dev/null; then exit 7; fi
     resp='{"status":"ok"}'
     ;;
+  # STUB_HERMES_TELEGRAM_STATE=<estado>: /health/detailed informa esa plataforma
+  # telegram (por defecto, sin plataformas).
+  *:8642/health/detailed)
+    if [[ -n "${STUB_HERMES_TELEGRAM_STATE:-}" ]]; then
+      resp="{\"platforms\":{\"telegram\":{\"state\":\"${STUB_HERMES_TELEGRAM_STATE}\"}}}"
+    else
+      resp='{"platforms":{}}'
+    fi
+    ;;
   *:8642/v1/models)
     if [[ -n "${STUB_HERMES_MODELS_CODE:-}" ]]; then
       http_code="$STUB_HERMES_MODELS_CODE"

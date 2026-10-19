@@ -191,7 +191,7 @@ compose_render_cloudflared() {
 
 # --- Hermes Agent --------------------------------------------------------------
 
-# Argumentos: <subred /24 privada de la red del contenedor> <DNS: IPs
+# Argumentos: [--telegram] <subred /24 privada de la red del contenedor> <DNS: IPs
 # separadas por comas> <zona horaria IANA, p. ej. America/Santiago: va a
 # HERMES_TIMEZONE, que Hermes lee para la hora de los recordatorios/cron> <IP del host>... (una o más: la de la LAN y, si
 # Tailscale está activo, la de Tailscale; en ellas se publican 8642 (API) y
@@ -217,6 +217,14 @@ _compose_valid_timezone() {
 compose_render_hermes() {
   local template="$SCRIPT_DIR/compose/hermes/docker-compose.yml"
   [[ -f "$template" ]] || { echo "ERROR: falta $template" >&2; return 1; }
+  # Opción --telegram (al inicio): agrega las variables de Telegram al
+  # contenedor (sus valores llegan por el canal "env" de Dokploy). Sin ella no
+  # se renderiza ninguna variable TELEGRAM_*.
+  local telegram_lines=""
+  if [[ "${1:-}" == "--telegram" ]]; then
+    shift
+    telegram_lines="      - TELEGRAM_BOT_TOKEN=\${TELEGRAM_BOT_TOKEN}"$'\n'"      - TELEGRAM_ALLOWED_USERS=\${TELEGRAM_ALLOWED_USERS}"$'\n'"      - TELEGRAM_HOME_CHANNEL=\${TELEGRAM_ALLOWED_USERS}"
+  fi
   [[ $# -ge 4 ]] || { echo "ERROR: compose_render_hermes necesita subred, DNS, zona horaria y al menos una IP." >&2; return 1; }
 
   local subnet="$1" dns_csv="$2" timezone="$3"
@@ -260,6 +268,7 @@ compose_render_hermes() {
     | _compose_subst "__GID__" "$gid" \
     | _compose_subst "__SUBNET__" "$subnet" \
     | _compose_subst "__TIMEZONE__" "$timezone" \
+    | _compose_subst "__TELEGRAM_ENV__" "$telegram_lines" \
     | _compose_subst "__DNS_LINES__" "$dns_lines" \
     | _compose_subst "__PORT_LINES__" "$port_lines"
 }

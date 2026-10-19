@@ -69,7 +69,7 @@ _hm_dialog_text() { grep -F $'dialog\t' "$STUB_CALL_LOG" || true; }
 _hm_first_run_queues() {
   echo "$_HM_OR_KEY" > "$DIALOG_PASSWORDBOX_QUEUE"
   echo "deepseek/deepseek-v4.1-flash" > "$DIALOG_INPUTBOX_QUEUE"
-  echo "yes" > "$DIALOG_YESNO_QUEUE"
+  printf 'no\nyes\n' > "$DIALOG_YESNO_QUEUE"     # Telegram: no; credenciales guardadas: sí
 }
 
 # Estado de una instalación previa: secretos guardados (pendiente=0) y datos.
@@ -225,8 +225,8 @@ test_hermes_rerun_can_rotate_api_key_and_change_main_model() {
   _hm_seed_previous 0
   mkdir -p "$APPDATA_ROOT/hermes"
   printf '# mio\nmodel:\n  default: x/y\n' > "$APPDATA_ROOT/hermes/config.yaml"
-  # rotar API: sí; reemplazar OpenRouter: no; cambiar modelo: sí; guardé creds: sí
-  printf 'yes\nno\nyes\nyes\n' > "$DIALOG_YESNO_QUEUE"
+  # rotar API: sí; reemplazar OpenRouter: no; cambiar modelo: sí; Telegram: no; guardé creds: sí
+  printf 'yes\nno\nyes\nno\nyes\n' > "$DIALOG_YESNO_QUEUE"
   echo "foo/bar-model" > "$DIALOG_INPUTBOX_QUEUE"
   : > "$DIALOG_PASSWORDBOX_QUEUE"
 
@@ -424,7 +424,7 @@ test_hermes_credentials_shown_again_until_confirmed() {
   assert_file_not_contains "$STATE_FILE" "hermes" || return 1
   # Re-ejecución: rotar no, reemplazar no, cambiar modelos no, guardadas sí.
   : > "$STUB_TEXTBOX_LOG"
-  printf 'no\nno\nno\nyes\n' > "$DIALOG_YESNO_QUEUE"
+  printf 'no\nno\nno\nno\nyes\n' > "$DIALOG_YESNO_QUEUE"
   : > "$DIALOG_PASSWORDBOX_QUEUE"
   bash "$REPO_ROOT/modules/hermes.sh" || return 1
   assert_contains "$(< "$STUB_TEXTBOX_LOG")" "$(_hm_secret API_SERVER_KEY)" "se muestran de nuevo" || return 1
@@ -539,7 +539,7 @@ test_hermes_partial_secrets_file_loads_all_and_generates_only_missing() {
   chmod 0600 "$SECRETS_DIR/hermes.env"; chmod 000 "$SECRETS_DIR"
   : > "$DIALOG_PASSWORDBOX_QUEUE"; : > "$DIALOG_YESNO_QUEUE"
   echo "deepseek/deepseek-v4.1-flash" > "$DIALOG_INPUTBOX_QUEUE"
-  printf 'no\nno\nyes\n' > "$DIALOG_YESNO_QUEUE"   # rotar: no; reemplazar: no; credenciales guardadas: sí
+  printf 'no\nno\nno\nyes\n' > "$DIALOG_YESNO_QUEUE"   # rotar: no; reemplazar: no; Telegram: no; credenciales guardadas: sí
   bash "$REPO_ROOT/modules/hermes.sh" || return 1
   assert_eq "$_HM_OR_KEY" "$(_hm_secret OPENROUTER_API_KEY)" "la clave de OpenRouter no se pierde ni se vuelve a pedir" || return 1
   assert_eq "Custom1234abcd" "$(_hm_secret HERMES_DASHBOARD_BASIC_AUTH_PASSWORD)" "contraseña existente conservada" || return 1
@@ -590,7 +590,7 @@ test_hermes_health_failure_after_model_change_is_reported() {
   _hm_seed_previous 0
   mkdir -p "$APPDATA_ROOT/hermes"
   printf 'model:\n  default: x/y\n' > "$APPDATA_ROOT/hermes/config.yaml"
-  printf 'no\nno\nyes\n' > "$DIALOG_YESNO_QUEUE"
+  printf 'no\nno\nyes\nno\n' > "$DIALOG_YESNO_QUEUE"
   echo "foo/bar-model" > "$DIALOG_INPUTBOX_QUEUE"
   export STUB_HERMES_HEALTH_FAIL_AFTER_RESTART=1
   if bash "$REPO_ROOT/modules/hermes.sh"; then fail "debió fallar"; return 1; fi
@@ -946,7 +946,7 @@ test_hermes_timezone_utc_host_asks_and_validates() {
     export STUB_TIMEZONE="$utc"
     echo "$_HM_OR_KEY" > "$DIALOG_PASSWORDBOX_QUEUE"
     printf '%s\n%s\n' "deepseek/deepseek-v4.1-flash" "America/Bogota" > "$DIALOG_INPUTBOX_QUEUE"
-    echo "yes" > "$DIALOG_YESNO_QUEUE"
+    printf 'no\nyes\n' > "$DIALOG_YESNO_QUEUE"
     bash "$REPO_ROOT/modules/hermes.sh" || { fail "falló con el servidor en [$utc]"; return 1; }
     assert_contains "$(_hm_dialog_text)" "El servidor está en UTC" "pregunta con [$utc]" || return 1
     assert_file_contains "$STUB_HTTP_BODIES_LOG" "HERMES_TIMEZONE=America/Bogota" || return 1
@@ -1298,4 +1298,177 @@ test_hermes_old_aux_marker_without_version_tag_is_reviewed_again_for_reasoning()
   assert_file_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.compression.reasoning_effort\tnone' || return 1
   assert_file_not_contains "$STUB_CALL_LOG" $'auxiliary.vision' "el resto ya está en auto" || return 1
   chmod u+rwx "$SECRETS_DIR"; assert_file_contains "$SECRETS_DIR/hermes-aux-auto" "aux-version: 2" "marcador actualizado" || { chmod 000 "$SECRETS_DIR"; return 1; }; chmod 000 "$SECRETS_DIR"
+}
+
+# --- Telegram (opcional) --------------------------------------------------------------------------
+
+_HM_TG_TOKEN="123456789:AAE$(printf 'xY_-%.0s' {1..10})"
+_HM_TG_USER="987654321"
+
+_hm_tg_env_has() { chmod u+rwx "$SECRETS_DIR"; local rc=0; grep -q "$1" "$SECRETS_DIR/hermes.env" || rc=1; chmod 000 "$SECRETS_DIR"; return "$rc"; }
+
+# Primera ejecución configurando Telegram: Telegram sí, credenciales guardadas sí.
+_hm_tg_first_run_queues() {
+  printf '%s\n%s\n' "$_HM_OR_KEY" "$_HM_TG_TOKEN" > "$DIALOG_PASSWORDBOX_QUEUE"
+  printf '%s\n%s\n' "deepseek/deepseek-v4.1-flash" "$_HM_TG_USER" > "$DIALOG_INPUTBOX_QUEUE"
+  printf 'yes\nyes\n' > "$DIALOG_YESNO_QUEUE"
+}
+
+# Borra los secretos guardados (vuelve a una instalación nueva).
+_hm_secrets_reset() { chmod u+rwx "$SECRETS_DIR"; rm -f "$SECRETS_DIR/hermes.env"; chmod 000 "$SECRETS_DIR"; }
+
+# Re-ejecución de una instalación con Telegram ya configurado.
+_hm_tg_seed_existing() {
+  _hm_seed_previous 0
+  chmod u+rwx "$SECRETS_DIR"
+  printf 'TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_ALLOWED_USERS=%s\n' "$_HM_TG_TOKEN" "$_HM_TG_USER" >> "$SECRETS_DIR/hermes.env"
+  chmod 000 "$SECRETS_DIR"
+  mkdir -p "$APPDATA_ROOT/hermes"
+  printf 'model:\n  provider: openrouter\n  default: x/y\n' > "$APPDATA_ROOT/hermes/config.yaml"
+  : > "$DIALOG_PASSWORDBOX_QUEUE"; : > "$DIALOG_INPUTBOX_QUEUE"
+}
+
+test_hermes_telegram_not_configured_by_default_renders_no_telegram_vars() {
+  _hm_setup
+  _hm_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_file_not_contains "$STUB_HTTP_BODIES_LOG" "TELEGRAM" "ni en el compose ni en el env" || return 1
+  _hm_tg_env_has TELEGRAM && { fail "claves TELEGRAM_* sin configurar"; return 1; }
+  if grep -F $'dialog\t' "$STUB_CALL_LOG" | grep -qF "token del bot"; then fail "pidió el token sin que se pidiera Telegram"; return 1; fi
+  assert_contains "$(_hm_dialog_text)" "¿Configurar Telegram como canal de Hermes" "pregunta opcional" || return 1
+  grep -F $'dialog\t' "$STUB_CALL_LOG" | grep -F "Configurar Telegram" | grep -qF -- '--defaultno' || { fail "la pregunta debe tener 'No' por defecto"; return 1; }
+  assert_file_contains "$APPDATA_ROOT/hermes/config.yaml" "unauthorized_dm_behavior: ignore" || return 1
+  assert_not_contains "$(_hm_dialog_text)" "Telegram: " "sin sección de Telegram en el mensaje final" || return 1
+}
+
+test_hermes_telegram_configured_goes_through_env_channel_and_never_through_argv_or_logs() {
+  _hm_setup
+  export STUB_HERMES_TELEGRAM_STATE=connected
+  _hm_tg_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  # Secretos guardados root-only y enviados por el canal env entre comillas simples.
+  _hm_tg_env_has "^TELEGRAM_BOT_TOKEN=${_HM_TG_TOKEN}\$" || { fail "token sin guardar"; return 1; }
+  _hm_tg_env_has "^TELEGRAM_ALLOWED_USERS=${_HM_TG_USER}\$" || { fail "ID sin guardar"; return 1; }
+  assert_file_contains "$STUB_HTTP_BODIES_LOG" "TELEGRAM_BOT_TOKEN='${_HM_TG_TOKEN}'" || return 1
+  assert_file_contains "$STUB_HTTP_BODIES_LOG" "TELEGRAM_ALLOWED_USERS='${_HM_TG_USER}'" || return 1
+  # El compose solo lleva referencias; el ID es el destino por defecto de los avisos.
+  assert_file_contains "$STUB_HTTP_BODIES_LOG" '- TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}' || return 1
+  assert_file_contains "$STUB_HTTP_BODIES_LOG" '- TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}' || return 1
+  assert_file_contains "$STUB_HTTP_BODIES_LOG" '- TELEGRAM_HOME_CHANNEL=${TELEGRAM_ALLOWED_USERS}' || return 1
+  assert_file_not_contains "$STUB_HTTP_BODIES_LOG" "- TELEGRAM_BOT_TOKEN=${_HM_TG_TOKEN}" "el token no va en el compose" || return 1
+  assert_file_not_contains "$REPO_ROOT/compose/hermes/docker-compose.yml" "$_HM_TG_TOKEN" || return 1
+  # Nunca en argv ni en logs.
+  assert_file_not_contains "$STUB_CALL_LOG" "$_HM_TG_TOKEN" "token fuera de argv" || return 1
+  if grep -rqF -- "$_HM_TG_TOKEN" "$LOG_DIR" 2>/dev/null; then fail "el token apareció en $LOG_DIR"; return 1; fi
+  assert_not_contains "$(< "$STUB_TEXTBOX_LOG")" "$_HM_TG_TOKEN" || return 1
+  # Explicación previa y mensaje final.
+  local texts; texts="$(_hm_dialog_text)"
+  assert_contains "$texts" "@BotFather" || return 1
+  assert_contains "$texts" "/newbot" || return 1
+  assert_contains "$texts" "@userinfobot" || return 1
+  assert_contains "$texts" "Telegram: conectado" || return 1
+  assert_contains "$texts" "/start" || return 1
+  assert_contains "$texts" "recuérdame en 2 minutos probar Telegram" || return 1
+  # El estado se consultó con la clave de la API por stdin.
+  grep -qF $'\t-K\t-\thttp://'"${_HM_LAN}:8642/health/detailed" "$STUB_CALL_LOG" || { fail "/health/detailed debe usar -K -"; return 1; }
+}
+
+test_hermes_telegram_not_connected_is_reported_without_failing() {
+  _hm_setup
+  _hm_tg_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_contains "$(_hm_dialog_text)" "Telegram: NO figura como conectado" || return 1
+  assert_file_contains "$STATE_FILE" "hermes" || return 1
+}
+
+test_hermes_telegram_invalid_token_or_user_id_is_rejected_before_deploying() {
+  _hm_setup
+  local bad
+  for bad in "hola" "123:abc" "12345:$(printf 'a%.0s' {1..35})" "1234567890123:$(printf 'a%.0s' {1..35})" "123456789:$(printf 'a%.0s' {1..29})" "123456789:$(printf 'a%.0s' {1..30})'; x" "${_HM_TG_TOKEN} extra"; do
+    : > "$STUB_CALL_LOG"; : > "$STUB_HTTP_BODIES_LOG"; _hm_secrets_reset
+    printf '%s\n%s\n' "$_HM_OR_KEY" "$bad" > "$DIALOG_PASSWORDBOX_QUEUE"
+    echo "deepseek/deepseek-v4.1-flash" > "$DIALOG_INPUTBOX_QUEUE"
+    echo "yes" > "$DIALOG_YESNO_QUEUE"
+    if bash "$REPO_ROOT/modules/hermes.sh"; then fail "aceptó el token [$bad]"; return 1; fi
+    assert_contains "$(_hm_dialog_text)" "no tiene la forma de un token de bot de Telegram" "mensaje para [$bad]" || return 1
+    assert_file_not_contains "$STUB_HTTP_BODIES_LOG" "compose.create" || return 1
+  done
+  for bad in "abc" "1234" "1234567890123456" "12 34567" "-12345" "12345; rm -rf /"; do
+    : > "$STUB_CALL_LOG"; : > "$STUB_HTTP_BODIES_LOG"; _hm_secrets_reset
+    printf '%s\n%s\n' "$_HM_OR_KEY" "$_HM_TG_TOKEN" > "$DIALOG_PASSWORDBOX_QUEUE"
+    printf '%s\n%s\n' "deepseek/deepseek-v4.1-flash" "$bad" > "$DIALOG_INPUTBOX_QUEUE"
+    echo "yes" > "$DIALOG_YESNO_QUEUE"
+    if bash "$REPO_ROOT/modules/hermes.sh"; then fail "aceptó el ID [$bad]"; return 1; fi
+    assert_contains "$(_hm_dialog_text)" "debe ser numérico" "mensaje para [$bad]" || return 1
+    assert_file_not_contains "$STUB_HTTP_BODIES_LOG" "compose.create" || return 1
+    assert_file_not_contains "$STUB_CALL_LOG" "$_HM_TG_TOKEN" || return 1
+    if _hm_tg_env_has TELEGRAM_BOT_TOKEN; then fail "guardó un token con un ID inválido"; return 1; fi
+  done
+}
+
+test_hermes_telegram_cancelling_the_token_box_skips_telegram_and_continues() {
+  _hm_setup
+  echo "$_HM_OR_KEY" > "$DIALOG_PASSWORDBOX_QUEUE"      # la clave de OpenRouter sí; el token queda sin respuesta
+  echo "deepseek/deepseek-v4.1-flash" > "$DIALOG_INPUTBOX_QUEUE"
+  printf 'yes\nyes\n' > "$DIALOG_YESNO_QUEUE"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_contains "$(_hm_dialog_text)" "Se omite Telegram" || return 1
+  assert_file_not_contains "$STUB_HTTP_BODIES_LOG" "TELEGRAM" || return 1
+  assert_file_contains "$STATE_FILE" "hermes" || return 1
+}
+
+test_hermes_telegram_rerun_keep_change_and_remove() {
+  _hm_setup
+  # Conservar: rotar no, reemplazar no, cambiar modelo no, Telegram "cambiar o quitar" no.
+  _hm_tg_seed_existing
+  printf 'no\nno\nno\nno\n' > "$DIALOG_YESNO_QUEUE"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_contains "$(_hm_dialog_text)" "Telegram ya está configurado (usuario autorizado: ${_HM_TG_USER})" || return 1
+  assert_file_contains "$STUB_HTTP_BODIES_LOG" "TELEGRAM_BOT_TOKEN='${_HM_TG_TOKEN}'" "sigue configurado" || return 1
+  assert_file_contains "$STUB_HTTP_BODIES_LOG" '- TELEGRAM_HOME_CHANNEL=${TELEGRAM_ALLOWED_USERS}' || return 1
+  if grep -F $'dialog\t' "$STUB_CALL_LOG" | grep -qF -- '--passwordbox'; then fail "pidió datos al conservar"; return 1; fi
+  # Cambiar: Telegram "cambiar" sí, "quitar" no -> pide token e ID nuevos.
+  local new_token="987654321:ZZZ$(printf 'q_-%.0s' {1..12})" new_user="55555"
+  : > "$STUB_CALL_LOG"; : > "$STUB_HTTP_BODIES_LOG"; sed -i '/^hermes$/d' "$STATE_FILE"
+  printf 'no\nno\nno\nyes\nno\n' > "$DIALOG_YESNO_QUEUE"
+  echo "$new_token" > "$DIALOG_PASSWORDBOX_QUEUE"; echo "$new_user" > "$DIALOG_INPUTBOX_QUEUE"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_file_contains "$STUB_HTTP_BODIES_LOG" "TELEGRAM_BOT_TOKEN='${new_token}'" || return 1
+  assert_file_contains "$STUB_HTTP_BODIES_LOG" "TELEGRAM_ALLOWED_USERS='${new_user}'" || return 1
+  _hm_tg_env_has "^TELEGRAM_BOT_TOKEN=${new_token}\$" || { fail "token nuevo sin guardar"; return 1; }
+  _hm_tg_env_has "$_HM_TG_TOKEN" && { fail "el token viejo sigue guardado"; return 1; }
+  assert_file_not_contains "$STUB_CALL_LOG" "$new_token" "token nuevo fuera de argv" || return 1
+  assert_eq "$_HM_OR_KEY" "$(_hm_secret OPENROUTER_API_KEY)" "las demás claves se conservan" || return 1
+  # Quitar: "cambiar" sí, "quitar" sí.
+  : > "$STUB_CALL_LOG"; : > "$STUB_HTTP_BODIES_LOG"; sed -i '/^hermes$/d' "$STATE_FILE"
+  printf 'no\nno\nno\nyes\nyes\n' > "$DIALOG_YESNO_QUEUE"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  _hm_tg_env_has TELEGRAM && { fail "quedaron claves TELEGRAM_* tras quitar"; return 1; }
+  assert_file_not_contains "$STUB_HTTP_BODIES_LOG" "TELEGRAM" "el compose se renderiza sin Telegram" || return 1
+  assert_eq "$_HM_OR_KEY" "$(_hm_secret OPENROUTER_API_KEY)" || return 1
+}
+
+test_hermes_telegram_malformed_stored_values_abort() {
+  _hm_setup
+  _hm_tg_seed_existing
+  chmod u+rwx "$SECRETS_DIR"; sed -i 's/^TELEGRAM_BOT_TOKEN=.*/TELEGRAM_BOT_TOKEN=roto/' "$SECRETS_DIR/hermes.env"; chmod 000 "$SECRETS_DIR"
+  : > "$DIALOG_YESNO_QUEUE"
+  if bash "$REPO_ROOT/modules/hermes.sh"; then fail "debió abortar"; return 1; fi
+  assert_contains "$(_hm_dialog_text)" "datos de Telegram guardados" || return 1
+}
+
+test_hermes_compose_telegram_flag_renders_only_references() {
+  _hm_setup
+  local on off
+  on="$( ( source "$REPO_ROOT/lib/core.sh"; compose_render_hermes --telegram "$_HM_SUBNET" "1.1.1.1" America/Santiago "$_HM_LAN" ) )" || return 1
+  off="$( ( source "$REPO_ROOT/lib/core.sh"; compose_render_hermes "$_HM_SUBNET" "1.1.1.1" America/Santiago "$_HM_LAN" ) )" || return 1
+  assert_contains "$on" '- TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}' || return 1
+  assert_not_contains "$off" "TELEGRAM" "sin la opción no hay variables de Telegram" || return 1
+  assert_not_contains "$on" "__TELEGRAM_ENV__" || return 1
+  assert_not_contains "$off" "__TELEGRAM_ENV__" || return 1
+  # Las dos variantes son YAML válido (si hay PyYAML) y el compose real las acepta (si hay docker compose real).
+  if python3 -I -c 'import yaml' 2>/dev/null; then
+    printf '%s\n' "$on" | python3 -I -c 'import sys,yaml; yaml.safe_load(sys.stdin)' || { fail "YAML inválido con Telegram"; return 1; }
+    printf '%s\n' "$off" | python3 -I -c 'import sys,yaml; yaml.safe_load(sys.stdin)' || { fail "YAML inválido sin Telegram"; return 1; }
+  fi
 }

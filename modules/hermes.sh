@@ -40,6 +40,27 @@
 #   https://hermes-agent.nousresearch.com/docs/user-guide/features/fallback-providers
 #   https://openrouter.ai/docs/cookbook/coding-agents/hermes-integration
 #
+# TELEGRAM (v2.6e, opcional; fuentes del código v0.22.2, ver _hermes_telegram_setup):
+# - Variables: TELEGRAM_BOT_TOKEN (gateway/config_env.py línea 512: la plataforma
+#   solo se activa si el token no está vacío, así que sin token no hay nada que
+#   activar; igual el compose omite las variables) y TELEGRAM_ALLOWED_USERS (IDs
+#   numéricos separados por comas; gateway/pairing.py línea 68).
+# - Conexión: long polling, es decir conexión saliente a api.telegram.org; el
+#   modo webhook solo se usa si existe TELEGRAM_WEBHOOK_URL
+#   (plugins/platforms/telegram/adapter.py línea 3155-3161), que este módulo no
+#   define. El aislamiento de salida ya deja pasar Internet público (solo se
+#   bloquean rangos privados), así que no hace falta ninguna regla nueva.
+# - Mensajes de no autorizados: con TELEGRAM_ALLOWED_USERS definido el valor por
+#   defecto de unauthorized_dm_behavior es "ignore" (gateway/authz_mixin.py líneas
+#   698-748; sin lista sería "pair", que responde con códigos de emparejamiento).
+#   En config.yaml nuevos se siembra además `unauthorized_dm_behavior: ignore`
+#   (gateway/config_loader.py línea 102).
+# - Destino por defecto de recordatorios/cron (`deliver: telegram`):
+#   TELEGRAM_HOME_CHANNEL (gateway/config_env.py línea 515; cron/scheduler_delivery.py
+#   líneas 44 y 479-487). En un chat privado el chat_id es el ID del usuario.
+# - Estado: GET /health/detailed (api_server.py línea 2430, con la clave de la API)
+#   devuelve platforms.<plataforma>.state (gateway/status.py línea 1160 "connected").
+#
 # TAREAS AUXILIARES (diseño corregido el 2026-10-19; reemplaza al de fijarlas a
 # un modelo barato de OpenRouter y al de fijarlas a gemma4:e2b local). Todas
 # quedan en 'provider: auto' y 'model: ""', que es el valor por defecto de
@@ -209,14 +230,26 @@ _hermes_rand_pass() {
 
 # Variables del módulo (se llenan en _hermes_ensure_secrets).
 H_OR_KEY="" H_API_KEY="" H_DASH_PASS="" H_DASH_SECRET="" H_PENDING="1"
+# Telegram (opcional): ambos vacíos = no configurado; las claves no se escriben.
+H_TG_TOKEN="" H_TG_USER=""
 
 _hermes_write_secrets() {
-  secret_file_write hermes "OPENROUTER_API_KEY=${H_OR_KEY}
+  local content="OPENROUTER_API_KEY=${H_OR_KEY}
 API_SERVER_KEY=${H_API_KEY}
 HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${H_DASH_PASS}
 HERMES_DASHBOARD_BASIC_AUTH_SECRET=${H_DASH_SECRET}
 HLI_CREDENTIALS_PENDING=${H_PENDING}"
+  if [[ -n "$H_TG_TOKEN" && -n "$H_TG_USER" ]]; then
+    content+="
+TELEGRAM_BOT_TOKEN=${H_TG_TOKEN}
+TELEGRAM_ALLOWED_USERS=${H_TG_USER}"
+  fi
+  secret_file_write hermes "$content"
 }
+
+# Forma del token de @BotFather (<id>:<secreto>) y del ID numérico de usuario.
+_hermes_valid_telegram_token() { [[ "$1" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,}$ ]]; }
+_hermes_valid_telegram_user() { [[ "$1" =~ ^[0-9]{5,15}$ ]]; }
 
 # Valor de CLAVE en el contenido ($1) de un archivo CLAVE=valor ('' si no
 # está). Parseo explícito, nunca 'source' (mismo criterio que secret_get).
@@ -271,7 +304,13 @@ _hermes_ensure_secrets() {
     H_DASH_SECRET="$(_hermes_env_value "$content" HERMES_DASHBOARD_BASIC_AUTH_SECRET)"
     H_PENDING="$(_hermes_env_value "$content" HLI_CREDENTIALS_PENDING)"
     [[ "$H_PENDING" == "0" ]] || H_PENDING="1"
+    H_TG_TOKEN="$(_hermes_env_value "$content" TELEGRAM_BOT_TOKEN)"
+    H_TG_USER="$(_hermes_env_value "$content" TELEGRAM_ALLOWED_USERS)"
     content=""
+    if [[ -n "$H_TG_TOKEN$H_TG_USER" ]] && { ! _hermes_valid_telegram_token "$H_TG_TOKEN" || ! _hermes_valid_telegram_user "$H_TG_USER"; }; then
+      msg "Los datos de Telegram guardados en /etc/hli2/hermes.env (token o ID de usuario) tienen una forma inesperada. Corríjalos a mano (o borre las dos líneas TELEGRAM_* para quitar Telegram) y vuelva a correr el módulo."
+      return 1
+    fi
     # Valores presentes pero con forma inesperada: no se reemplazan solos.
     if [[ -n "$H_OR_KEY" ]] && ! _hermes_valid_openrouter_key "$H_OR_KEY"; then
       msg "La clave de OpenRouter guardada en /etc/hli2/hermes.env tiene una forma inesperada. Corríjala a mano (o bórrela del archivo para que se vuelva a pedir) y vuelva a correr el módulo."
@@ -360,6 +399,10 @@ fallback_providers:
 # OpenRouter: excluir proveedores que puedan guardar o entrenar con los datos.
 provider_routing:
   data_collection: deny
+
+# Mensajes de personas no autorizadas (Telegram): se ignoran, sin códigos de
+# emparejamiento (el valor por defecto de Hermes es "pair").
+unauthorized_dm_behavior: ignore
 
 # Tareas auxiliares: "auto" con modelo vacío = el modelo del chat actual
 # (un chat local usa el modelo local, uno de OpenRouter usa ese mismo modelo).
@@ -1322,6 +1365,83 @@ _hermes_aux_migrate() {
   return 0
 }
 
+# --- Telegram (opcional) ---------------------------------------------------------------------
+
+# Pide el token y el ID de usuario y los deja en H_TG_*. Retorna 2 si el usuario
+# cancela un cuadro (Telegram se omite sin abortar el despliegue) y 1 si un
+# valor no tiene la forma esperada (se cancela el despliegue, como la clave de
+# OpenRouter). Los valores no se muestran ni se registran.
+_hermes_telegram_ask() {
+  local token user
+  msg "Para conectar Telegram necesita dos datos:\n\n1. El TOKEN del bot: en Telegram abra @BotFather, envíe /newbot, elija un nombre y un usuario que termine en 'bot'; BotFather le entrega un token con la forma 123456789:AAE... (tratelo como una contraseña).\n\n2. Su ID NUMÉRICO de usuario: abra @userinfobot y envíele /start; responde con su 'Id' (solo dígitos).\n\nSolo ese usuario podrá hablar con el bot: los mensajes de cualquier otra cuenta se ignoran. Hermes se conecta hacia afuera (api.telegram.org, sin puertos entrantes), pero las conversaciones por Telegram pasan por los servidores de Telegram: úselo para avisos, recordatorios y consultas que no sean privadas.\n\nEn los siguientes pasos se le pedirán; el token no se muestra en pantalla ni se registra en logs."
+  token=$(password_box "Hermes — token del bot de Telegram" "Pegue el token que le dio @BotFather.") \
+    || { msg "Se omite Telegram: no se ingresó ningún token."; return 2; }
+  token="${token#"${token%%[![:space:]]*}"}"
+  token="${token%"${token##*[![:space:]]}"}"
+  if ! _hermes_valid_telegram_token "$token"; then
+    token=""
+    msg "El valor ingresado no tiene la forma de un token de bot de Telegram (<número>:<texto de 30 o más letras, números, '-' o '_'>). Se cancela el despliegue: copie de nuevo el token desde @BotFather y vuelva a correr este módulo."
+    return 1
+  fi
+  user=$(input_box "Hermes — usuario de Telegram" "Su ID numérico de usuario de Telegram (el que le muestra @userinfobot). Solo este usuario podrá usar el bot." "") \
+    || { token=""; msg "Se omite Telegram: no se ingresó ningún ID de usuario."; return 2; }
+  user="${user#"${user%%[![:space:]]*}"}"
+  user="${user%"${user##*[![:space:]]}"}"
+  if ! _hermes_valid_telegram_user "$user"; then
+    token=""
+    msg "El ID de usuario debe ser numérico (5 a 15 dígitos). Se cancela el despliegue: vuelva a correr este módulo."
+    return 1
+  fi
+  H_TG_TOKEN="$token"; H_TG_USER="$user"
+  token=""
+}
+
+# Paso opcional de Telegram: configurar (por defecto No), o, si ya está, cambiar
+# o quitar. Guarda en /etc/hli2/hermes.env solo si hubo un cambio.
+_hermes_telegram_setup() {
+  local rc=0 old_token="$H_TG_TOKEN" old_user="$H_TG_USER"
+  if [[ -n "$H_TG_TOKEN" ]]; then
+    confirm "Telegram ya está configurado (usuario autorizado: ${H_TG_USER}).\n\n¿Cambiarlo o quitarlo?" "no" || return 0
+    if confirm "¿Quitar Telegram por completo? (Si elige 'No' se le pedirá un token y un usuario nuevos.)" "no"; then
+      H_TG_TOKEN="" H_TG_USER=""
+    else
+      _hermes_telegram_ask || rc=$?
+    fi
+  else
+    confirm "¿Configurar Telegram como canal de Hermes (avisos y recordatorios al teléfono)?" "no" || return 0
+    _hermes_telegram_ask || rc=$?
+  fi
+  if [[ "$rc" -eq 2 ]]; then
+    H_TG_TOKEN="$old_token"; H_TG_USER="$old_user"
+    return 0
+  elif [[ "$rc" -ne 0 ]]; then
+    H_TG_TOKEN="$old_token"; H_TG_USER="$old_user"
+    return 1
+  fi
+  if [[ "$H_TG_TOKEN" != "$old_token" || "$H_TG_USER" != "$old_user" ]]; then
+    _hermes_write_secrets || { msg "No se pudieron guardar los datos de Telegram en /etc/hli2/hermes.env. Se cancela el despliegue de Hermes."; return 1; }
+    log "Configuración de Telegram de Hermes actualizada en /etc/hli2/hermes.env (no se loguean los valores)."
+  fi
+  return 0
+}
+
+# Estado de Telegram según GET /health/detailed (clave de la API por stdin,
+# '-K -'): imprime el estado (p. ej. connected) o nada. Espera como máximo lo
+# mismo que _hermes_wait_health (HLI2_HERMES_HEALTH_*).
+_hermes_telegram_state() {
+  local url="$1" key="$2" timeout="${HLI2_HERMES_HEALTH_TIMEOUT:-120}" step="${HLI2_HERMES_HEALTH_STEP:-5}" waited=0 body st=""
+  while true; do
+    body="$(curl -sS --connect-timeout 5 --max-time 10 -w $'\n%{http_code}' -K - "$url" <<<"header = \"Authorization: Bearer ${key}\"" 2>/dev/null)" || body=""
+    body="${body%$'\n'*}"
+    st="$(jq -r '.platforms.telegram.state // empty' <<<"$body" 2>/dev/null)" || st=""
+    [[ "$st" == "connected" ]] && break
+    (( waited >= timeout )) && break
+    sleep "$step"
+    waited=$(( waited + step ))
+  done
+  printf '%s' "$st"
+}
+
 # --- Publicación en la IP de Tailscale tras un reinicio ---------------------------------
 
 # Sin esperas: ni 'network-online.target' ni un bucle sobre 'tailscale ip'
@@ -1487,6 +1607,7 @@ _hermes_main() {
     _hermes_ask_models || return 1
   fi
   _hermes_resolve_timezone || return 1
+  _hermes_telegram_setup || return 1
   _hermes_seed_config "$H_MODEL" "$H_TZ" || { msg "No se pudo escribir config.yaml de Hermes. Se cancela el despliegue."; return 1; }
 
   # DNS del contenedor: el de la LAN (AdGuard en este servidor) solo si
@@ -1510,7 +1631,9 @@ _hermes_main() {
   environment_id="$(dokploy_environment_default_id "$project_json")" || { msg "No se pudo resolver el ambiente por defecto del proyecto 'homelab' en Dokploy."; return 1; }
 
   compose_file="$(mktemp)"
-  if ! compose_render_hermes "$HERMES_SUBNET" "$dns_csv" "$H_TZ" "${ips[@]}" > "$compose_file"; then
+  local -a tg_flag=()
+  [[ -z "$H_TG_TOKEN" ]] || tg_flag=(--telegram)
+  if ! compose_render_hermes "${tg_flag[@]}" "$HERMES_SUBNET" "$dns_csv" "$H_TZ" "${ips[@]}" > "$compose_file"; then
     msg "No se pudo renderizar el compose de Hermes."
     rm -f "$compose_file"
     return 1
@@ -1527,6 +1650,16 @@ _hermes_main() {
   fi
   env_content="${l1}"$'\n'"${l2}"$'\n'"${l3}"$'\n'"${l4}"
   l1=""; l2=""; l3=""; l4=""
+  if [[ -n "$H_TG_TOKEN" ]]; then
+    local t1 t2
+    if ! t1="$(dotenv_single_quoted TELEGRAM_BOT_TOKEN "$H_TG_TOKEN")" || ! t2="$(dotenv_single_quoted TELEGRAM_ALLOWED_USERS "$H_TG_USER")"; then
+      rm -f "$compose_file"
+      msg "Un dato de Telegram guardado tiene un formato inesperado. Vuelva a configurarlo."
+      return 1
+    fi
+    env_content+=$'\n'"${t1}"$'\n'"${t2}"
+    t1=""; t2=""
+  fi
 
   if ! composeId="$(dokploy_compose_deploy_full "$environment_id" "hermes" "$compose_file" "$env_content")"; then
     env_content=""; rm -f "$compose_file"
@@ -1574,6 +1707,15 @@ _hermes_main() {
     return 1
   fi
 
+  local tg_note=""
+  if [[ -n "$H_TG_TOKEN" ]]; then
+    if [[ "$(_hermes_telegram_state "http://${lan_ip}:8642/health/detailed" "$H_API_KEY")" == "connected" ]]; then
+      tg_note="Telegram: conectado. Envíele /start (o cualquier mensaje) a su bot desde su cuenta (ID ${H_TG_USER}); las demás cuentas se ignoran. Para probar los avisos pídale: \"recuérdame en 2 minutos probar Telegram\" y que lo envíe a Telegram."
+    else
+      tg_note="Telegram: NO figura como conectado todavía (GET /health/detailed). Revise el token y los logs (sudo docker logs --tail 50 hermes | grep -i telegram) y vuelva a correr este módulo. Hermes se conecta hacia api.telegram.org (HTTPS saliente, ya permitido por el aislamiento de salida)."
+    fi
+  fi
+
   if [[ "$H_PENDING" == "1" ]]; then
     _hermes_show_credentials "$lan_ip" "$ts_ip" || return 1
   fi
@@ -1584,7 +1726,7 @@ _hermes_main() {
   else
     ts_note="Tailscale no está activo en el servidor: por ahora Hermes solo responde en la LAN. Instale/inicie sesión con el módulo 'tailscale' y vuelva a correr este módulo para publicarlo también en la IP de Tailscale."
   fi
-  msg "Hermes desplegado (composeId=$composeId) y respondiendo en http://${lan_ip}:8642.\n\n${ts_note}\n\nApp Android: descargue el APK desde GitHub (https://github.com/rusty4444/hermes-android/releases; el de arm64-v8a sirve para teléfonos modernos). Permita instalar de orígenes desconocidos, agregue una conexión con servidor, puerto 8642 y la clave de API.\n\nDashboard: http://${ts_ip:-$lan_ip}:9119 (usuario admin).\n\nLos puertos 8642 y 9119 solo se publican en la IP de la LAN y en la de Tailscale: no hay acceso desde Internet. El agente, por su parte, no puede iniciar conexiones hacia la LAN, Tailscale ni el propio servidor (reglas de iptables 'HLI2-HERMES-*', servicio hli2-hermes-egress); sí tiene Internet.\n\nZona horaria: ${H_TZ} (los recordatorios y tareas programadas salen a esa hora). Las tareas auxiliares (títulos, compresión de contexto, visión, etc.) siguen al modelo de cada chat.${AUX_PREV_NOTE:+\n\n${AUX_PREV_NOTE}}${AUX_CUSTOM_NOTE:+\n\n${AUX_CUSTOM_NOTE}}\n\nRecomendación: reserve en el router (DHCP) la IP ${lan_ip} para este servidor; si cambia la IP de la LAN o de Tailscale, vuelva a correr este módulo para volver a publicar los puertos."
+  msg "Hermes desplegado (composeId=$composeId) y respondiendo en http://${lan_ip}:8642.\n\n${ts_note}\n\nApp Android: descargue el APK desde GitHub (https://github.com/rusty4444/hermes-android/releases; el de arm64-v8a sirve para teléfonos modernos). Permita instalar de orígenes desconocidos, agregue una conexión con servidor, puerto 8642 y la clave de API.\n\nDashboard: http://${ts_ip:-$lan_ip}:9119 (usuario admin).\n\nLos puertos 8642 y 9119 solo se publican en la IP de la LAN y en la de Tailscale: no hay acceso desde Internet. El agente, por su parte, no puede iniciar conexiones hacia la LAN, Tailscale ni el propio servidor (reglas de iptables 'HLI2-HERMES-*', servicio hli2-hermes-egress); sí tiene Internet.\n\nZona horaria: ${H_TZ} (los recordatorios y tareas programadas salen a esa hora). Las tareas auxiliares (títulos, compresión de contexto, visión, etc.) siguen al modelo de cada chat.${tg_note:+\n\n${tg_note}}${AUX_PREV_NOTE:+\n\n${AUX_PREV_NOTE}}${AUX_CUSTOM_NOTE:+\n\n${AUX_CUSTOM_NOTE}}\n\nRecomendación: reserve en el router (DHCP) la IP ${lan_ip} para este servidor; si cambia la IP de la LAN o de Tailscale, vuelva a correr este módulo para volver a publicar los puertos."
 
   mark_done hermes
   return 0
