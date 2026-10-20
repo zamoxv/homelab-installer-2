@@ -1000,16 +1000,18 @@ test_ollama_final_message_states_privacy_exceptions_and_no_overclaim() {
   echo "no" > "$DIALOG_YESNO_QUEUE"      # se conserva el respaldo
   bash "$REPO_ROOT/modules/ollama.sh" || return 1
   local texts; texts="$(_ol_dialog_text)"
-  assert_contains "$texts" "Privacidad (alcance real, no es total)" || return 1
+  assert_contains "$texts" "Privacidad (de mejor esfuerzo, no es total; vale mientras Ollama está sano)" || return 1
   assert_contains "$texts" "Chats locales interactivos con gemma4:e4b" "alcance acotado a chats interactivos" || return 1
   assert_contains "$texts" "están en 'auto', o sea usan el modelo del chat" || return 1
-  assert_contains "$texts" "Fijadas al modelo local, en TODOS los chats: la visión (gemma4:e4b" "visión fijada" || return 1
+  assert_contains "$texts" "Fijadas al modelo local en todos los chats: la visión (gemma4:e4b" "visión fijada" || return 1
   assert_contains "$texts" "curator kanban_decomposer mcp monitor profile_describer triage_specifier" "lista exacta de las tareas sin chat en vivo" || return 1
-  assert_contains "$texts" "respaldo local con el otro modelo" || return 1
-  assert_contains "$texts" "las tareas 'auto' NO saltan solas a OpenRouter" "qué pasa si Ollama falla" || return 1
+  assert_contains "$texts" "cubre el fallo de UN modelo" "alcance real del respaldo local" || return 1
+  assert_contains "$texts" "Si Ollama se cae por completo, las tareas fijadas (visión y de fondo) pueden pasar al modelo principal de OpenRouter" "el caveat de la caída total" || return 1
+  assert_contains "$texts" "no se probó en vivo" || return 1
+  assert_contains "$texts" "las tareas 'auto' no saltan solas a OpenRouter" "qué pasa si Ollama falla" || return 1
   assert_contains "$texts" "approval, goal_judge, memory_query_rewrite" "excepción no verificada" || return 1
-  assert_contains "$texts" "no debería mandarse a otro proveedor" || return 1
-  assert_contains "$texts" "solo puede usar el respaldo automático ('fallback_providers') si está configurado" "con el matiz exacto" || return 1
+  assert_not_contains "$texts" "no debería mandarse a otro proveedor" "sin promesas absolutas" || return 1
+  assert_not_contains "$texts" "en TODOS los chats" || return 1
   assert_contains "$texts" "los chats con el modelo por defecto van a OpenRouter, y también sus tareas auxiliares" "excepción 1" || return 1
   assert_contains "$texts" "herramientas web" "excepción 2: búsqueda web" || return 1
   assert_contains "$texts" "puede reenviarse a OpenRouter y filtrarse" "excepción 3: respaldo conservado" || return 1

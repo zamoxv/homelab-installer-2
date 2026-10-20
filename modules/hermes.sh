@@ -1106,13 +1106,17 @@ HERMES_OLLAMA_PORT=11434
 #   tiempo agotado, 429 agotado, 402) una tarea con proveedor explícito prueba su
 #   'fallback_chain' y, si no hay, el modelo principal DE config.yaml
 #   (_ladder_provider_fallback líneas 7840-7845 y _try_main_agent_model_fallback
-#   líneas 4304-4345: lee _read_main_provider(), no el chat). Para que no vaya
-#   a OpenRouter se agrega a cada tarea fijada una 'fallback_chain' con el OTRO
-#   modelo local (si esa cadena entrega un cliente, la rama del modelo principal
-#   no se ejecuta; si también falla, _try_payment_fallback, líneas 4245-4256,
-#   queda bloqueada por _discovery_chain_allowed, línea 4637, porque ya hay un
-#   proveedor principal elegido). Basado en la lectura del código; no probado en
-#   vivo.
+#   líneas 4304-4345: lee _read_main_provider(), no el chat). Para reducir ese
+#   riesgo se agrega a cada tarea fijada una 'fallback_chain' con el OTRO modelo
+#   local: cubre el fallo de UN modelo (si la cadena entrega un cliente, la rama
+#   del modelo principal no se ejecuta). NO cubre una caída TOTAL de Ollama: al
+#   fallar también el carril de la cadena se lo marca no saludable
+#   (_quarantine_fallback_candidate, líneas 4093-4103; clave etiqueta+base_url,
+#   líneas 3171-3191) y la tarea puede llegar a _try_main_agent_model_fallback
+#   (líneas 7898-7901) y, por tanto, al modelo principal de OpenRouter (visión
+#   incluida si ese modelo la admite). Decisión del usuario (2026-10-20): una sola
+#   instancia; la privacidad es de mejor esfuerzo y vale mientras Ollama está
+#   sano. Verificado solo leyendo el código.
 declare -A HERMES_AUX_LOCAL_PIN=(
   [vision]="gemma4:e4b"
   [monitor]="gemma4:e2b" [curator]="gemma4:e2b" [kanban_decomposer]="gemma4:e2b"
@@ -1137,12 +1141,29 @@ _hermes_aux_parse() {
   awk '
     function clean(v) { gsub(/["\047]/, "", v); return v }
     /^auxiliary:/ { on = 1; next }
-    on && /^[^[:space:]#]/ { on = 0 }
-    on && /^  [A-Za-z_]+:[[:space:]]*$/ { task = $1; sub(/:$/, "", task); next }
-    on && task != "" && /^    fallback_chain:/ { printf "%s\tfallback_chain\tyes\n", task }
+    # fallback_chain: firma "<modelo>@<base_url>#<entradas>" ("empty#0" si es []).
+    function flush() { if (inchain) { printf "%s\tfallback_chain\t%s@%s#%d\n", task, cm, cb, cn; inchain = 0 } }
+    on && /^[^[:space:]#]/ { flush(); on = 0 }
+    on && /^  [A-Za-z_]+:[[:space:]]*$/ { flush(); task = $1; sub(/:$/, "", task); next }
+    on && task != "" && /^    fallback_chain:/ {
+      flush(); cm = ""; cb = ""; cn = 0
+      if ($2 == "[]" || $2 == "") { inchain = 1; if ($2 == "[]") { inchain = 0; printf "%s\tfallback_chain\tempty#0\n", task } }
+      else { inchain = 0; printf "%s\tfallback_chain\tinline#1\n", task }
+      next
+    }
+    on && inchain && /^    -/ { cn++; line = $0; sub(/^    -[[:space:]]*/, "", line) }
+    on && inchain && /^    (-|  )/ {
+      if (!/^    -/) line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (line ~ /^model:/) { sub(/^model:[[:space:]]*/, "", line); gsub(/["\047]/, "", line); cm = line }
+      if (line ~ /^base_url:/) { sub(/^base_url:[[:space:]]*/, "", line); gsub(/["\047]/, "", line); cb = line }
+      next
+    }
+    on && task != "" && inchain && /^    [A-Za-z_]+:/ { flush() }
     on && task != "" && /^    (provider|model|base_url|api_key|timeout|reasoning_effort|no_progress_timeout):/ {
       key = $1; sub(/:$/, "", key); printf "%s\t%s\t%s\n", task, key, clean($2)
     }
+    END { flush() }
   ' <<<"$1"
 }
 
@@ -1202,7 +1223,7 @@ _hermes_aux_plan() {
   for t in "${HERMES_AUX_TASKS[@]}"; do
     p="${cfg[$t.provider]:-}" m="${cfg[$t.model]:-}" b="${cfg[$t.base_url]:-}" k="${cfg[$t.api_key]:-}"
     to="${cfg[$t.timeout]:-}" re="${cfg[$t.reasoning_effort]:-}" np="${cfg[$t.no_progress_timeout]:-}"
-    ch="${cfg[$t.fallback_chain]:-}"
+    ch="${cfg[$t.fallback_chain]:-}"   # firma: <modelo>@<base_url>#<entradas>
     state=custom
     if [[ ( -z "$p" || "$p" == "auto" ) && -z "$m" && -z "$b" && -z "$k" ]]; then
       state=clean
@@ -1231,7 +1252,9 @@ _hermes_aux_plan() {
       other_m="gemma4:e2b"; [[ "$pin_m" != "gemma4:e2b" ]] || other_m="gemma4:e4b"
       chain_json="$(printf '[{"provider":"custom","model":"%s","base_url":"%s","api_key":"%s"}]' "$other_m" "$url" "$HERMES_AUX_LOCAL_KEY")"
       local -a pin_ops=()
-      [[ "$ch" == "yes" && "$b" == "$url" ]] || pin_ops+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.fallback_chain"$'\t'"${chain_json}")
+      # El respaldo vale solo si es EXACTAMENTE el esperado (el otro modelo local en la URL
+      # actual, una sola entrada); vacío, otro o con otra URL se reemplaza.
+      [[ "$ch" == "${other_m}@${url}#1" ]] || pin_ops+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.fallback_chain"$'\t'"${chain_json}")
       [[ "$k" == "$HERMES_AUX_LOCAL_KEY" ]] || pin_ops+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.api_key"$'\t'"${HERMES_AUX_LOCAL_KEY}")
       [[ "$b" == "$url" ]] || pin_ops+=("${unit}"$'\t'"set"$'\t'"auxiliary.${t}.base_url"$'\t'"${url}")
       if ! [[ "$to" =~ ^[0-9]+$ && "$to" -ge "$HERMES_AUX_LOCAL_TIMEOUT" ]]; then
@@ -1283,7 +1306,7 @@ _hermes_aux_plan() {
     fi
     if [[ "$state" == local ]]; then
       [[ -n "$want_re" || "$re" != "none" ]] || H_AUX_OPS+=("${unit}"$'\t'"unset"$'\t'"auxiliary.${t}.reasoning_effort"$'\t')
-      [[ "$ch" != "yes" ]] || H_AUX_OPS+=("${unit}"$'\t'"unset"$'\t'"auxiliary.${t}.fallback_chain"$'\t')
+      [[ -z "$ch" ]] || H_AUX_OPS+=("${unit}"$'\t'"unset"$'\t'"auxiliary.${t}.fallback_chain"$'\t')
       [[ -z "$k" ]] || H_AUX_OPS+=("${unit}"$'\t'"unset"$'\t'"auxiliary.${t}.api_key"$'\t')
       [[ -z "$b" ]] || H_AUX_OPS+=("${unit}"$'\t'"unset"$'\t'"auxiliary.${t}.base_url"$'\t')
       # Para (L) primero el modelo y al final el proveedor; para (O) al revés.

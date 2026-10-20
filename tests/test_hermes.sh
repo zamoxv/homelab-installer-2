@@ -1512,7 +1512,7 @@ test_hermes_aux_plan_pinned_tasks_are_idempotent_and_user_pins_are_kept() {
   yaml="$(printf 'auxiliary:\n'
     for t in "${_HM_PIN_TASKS[@]}"; do
       m=gemma4:e2b; o=gemma4:e4b; [[ "$t" != vision ]] || { m=gemma4:e4b; o=gemma4:e2b; }
-      printf '  %s:\n    provider: custom\n    model: %s\n    base_url: %s\n    api_key: no-key-required\n    timeout: 3600\n    reasoning_effort: none\n    fallback_chain:\n    - provider: custom\n' "$t" "$m" "$_HM_URL"
+      printf '  %s:\n    provider: custom\n    model: %s\n    base_url: %s\n    api_key: no-key-required\n    timeout: 3600\n    reasoning_effort: none\n    fallback_chain:\n    - provider: custom\n      model: %s\n      base_url: %s\n      api_key: no-key-required\n' "$t" "$m" "$_HM_URL" "$o" "$_HM_URL"
     done)"
   out="$(_hm_aux_plan_with "$yaml" "H_AUX_MODE=full H_AUX_LOCAL_URL='$_HM_URL'")"
   for t in "${_HM_PIN_TASKS[@]}"; do assert_not_contains "$out" "aux:${t}"$'\t' "$t ya está fijada: nada que hacer" || return 1; done
@@ -1622,4 +1622,27 @@ test_hermes_timezone_note_when_detected_zone_overrides_a_different_config_timezo
   bash "$REPO_ROOT/modules/hermes.sh" || return 1
   assert_file_contains "$STUB_HTTP_BODIES_LOG" "HERMES_TIMEZONE=Europe/Madrid" || return 1
   assert_contains "$(_hm_dialog_text)" "config.yaml tiene 'timezone: America/Bogota'" "avisa que la zona detectada manda" || return 1
+}
+
+test_hermes_aux_plan_replaces_a_wrong_or_empty_fallback_chain_on_owned_pinned_tasks() {
+  _hm_setup
+  local base out
+  base='    provider: custom\n    model: gemma4:e2b\n    base_url: '"$_HM_URL"'\n    api_key: no-key-required\n    timeout: 3600\n    reasoning_effort: none\n'
+  # Cadena vacía.
+  out="$(_hm_aux_plan_with "$(printf "auxiliary:\n  monitor:\n${base}    fallback_chain: []\n")" "H_AUX_MODE=full H_AUX_LOCAL_URL='$_HM_URL'")"
+  assert_contains "$out" "aux:monitor"$'\tset\tauxiliary.monitor.fallback_chain\t[{"provider":"custom","model":"gemma4:e4b"' "cadena vacía -> se reemplaza" || return 1
+  assert_not_contains "$out" "auxiliary.monitor.provider" "lo demás no cambia" || return 1
+  # Cadena que apunta a OpenRouter / otro modelo / otra URL.
+  out="$(_hm_aux_plan_with "$(printf "auxiliary:\n  monitor:\n${base}    fallback_chain:\n    - provider: openrouter\n      model: qwen/qwen3.7-flash\n")" "H_AUX_MODE=full H_AUX_LOCAL_URL='$_HM_URL'")"
+  assert_contains "$out" $'auxiliary.monitor.fallback_chain\t[{"provider":"custom"' "cadena ajena -> se reemplaza" || return 1
+  out="$(_hm_aux_plan_with "$(printf "auxiliary:\n  monitor:\n${base}    fallback_chain:\n    - provider: custom\n      model: gemma4:e4b\n      base_url: http://10.0.0.9:11434/v1\n")" "H_AUX_MODE=full H_AUX_LOCAL_URL='$_HM_URL'")"
+  assert_contains "$out" $'auxiliary.monitor.fallback_chain\t' "cadena con otra URL -> se reemplaza" || return 1
+  # La esperada exacta: no se toca. Dos entradas: tampoco coincide.
+  out="$(_hm_aux_plan_with "$(printf "auxiliary:\n  monitor:\n${base}    fallback_chain:\n    - provider: custom\n      model: gemma4:e4b\n      base_url: ${_HM_URL}\n      api_key: no-key-required\n")" "H_AUX_MODE=full H_AUX_LOCAL_URL='$_HM_URL'")"
+  assert_not_contains "$out" "aux:monitor"$'\t' "cadena esperada: nada que hacer" || return 1
+  out="$(_hm_aux_plan_with "$(printf "auxiliary:\n  monitor:\n${base}    fallback_chain:\n    - provider: custom\n      model: gemma4:e4b\n      base_url: ${_HM_URL}\n    - provider: openrouter\n      model: x/y\n")" "H_AUX_MODE=full H_AUX_LOCAL_URL='$_HM_URL'")"
+  assert_contains "$out" $'auxiliary.monitor.fallback_chain\t' "con una entrada de más -> se reemplaza" || return 1
+  # Una tarea del usuario (otro servidor) con su propia cadena no se toca.
+  out="$(_hm_aux_plan_with "$(printf "auxiliary:\n  monitor:\n    provider: custom\n    model: mio\n    base_url: http://192.168.1.5:8080/v1\n    api_key: k\n    fallback_chain:\n    - provider: openrouter\n      model: a/b\n")" "H_AUX_MODE=full H_AUX_LOCAL_URL='$_HM_URL'")"
+  assert_not_contains "$out" "auxiliary.monitor." || return 1
 }

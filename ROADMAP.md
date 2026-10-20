@@ -1163,12 +1163,26 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
     agotado, 402) `_ladder_provider_fallback` (líneas 7840-7845) prueba su
     `fallback_chain` y, si no hay, `_try_main_agent_model_fallback` (líneas
     4304-4345), que lee el modelo principal **de `config.yaml`** (OpenRouter), no el
-    del chat: sin más, el contenido saldría. Por eso cada tarea fijada lleva una
-    `fallback_chain` con **el otro modelo local**; si esa cadena entrega un
-    cliente, la rama del modelo principal no se ejecuta, y si también falla,
-    `_try_payment_fallback` (líneas 4245-4256) queda bloqueada por
-    `_discovery_chain_allowed` (línea 4637) mientras haya un proveedor principal
-    elegido. **Basado en la lectura del código; no probado en vivo** (prueba 154).
+    del chat. Cada tarea fijada lleva una `fallback_chain` con **el otro modelo
+    local**: cubre el fallo de UN modelo (si la cadena entrega un cliente, la rama
+    del modelo principal no se ejecuta). **No cubre una caída total de Ollama:** al
+    fallar también el carril de la cadena se lo marca no saludable
+    (`_quarantine_fallback_candidate`, líneas 4093-4103; clave etiqueta+`base_url`,
+    líneas 3171-3191) y la tarea puede llegar a `_try_main_agent_model_fallback`
+    (líneas 7898-7901) y, por tanto, al modelo principal de OpenRouter (visión
+    incluida si ese modelo la admite). `_try_payment_fallback` (líneas 4245-4256)
+    sí queda bloqueada por `_discovery_chain_allowed` (línea 4637). Verificado solo
+    leyendo el código (prueba 154). **Decisión del usuario (2026-10-20): una sola
+    instancia; la privacidad es de mejor esfuerzo y vale mientras Ollama está
+    sano.** Alternativa evaluada y descartada: dos instancias (una sin clave de
+    OpenRouter). **Condición:** antes de actualizar la imagen de Hermes, reverificar
+    en el código las rutas de respaldo de las tareas auxiliares (visión, tareas de
+    fondo, `_try_main_agent_model_fallback`) y la herencia del runtime.
+  - **Respaldo propio:** el módulo solo da por válida la `fallback_chain` de una
+    tarea suya si es exactamente la esperada (una entrada: el otro modelo local en
+    la URL actual); vacía, de otro modelo o con otra URL se reemplaza (el valor
+    anterior queda en el bloque con fecha del registro previo). Las tareas del
+    usuario no se tocan.
   - **Migración:** compartida con `hermes` (modos `none`/`keep`/`full`/`refresh`
     en `modules/hermes.sh`). Estas fijaciones locales se tratan como propias (no
     como del usuario) y se conservan en las re-ejecuciones: `hermes` solo (con
@@ -1179,11 +1193,12 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
     (`hermes-aux-previous.conf`) anota el modelo auxiliar de OpenRouter detectado
     (`# or-model:`) y recibe un bloque con fecha en cada revisión que cambia
     fijaciones.
-  - **Privacidad, con precisión (mensaje final):** chats locales **interactivos**:
-    cerebro y tareas 'auto' en casa; visión y las seis tareas de fondo, locales
-    en todos los chats; si Ollama falla, las 'auto' no saltan solas a OpenRouter
-    (solo `fallback_providers`, `_try_main_fallback_chain` línea 4486); las fijadas
-    tienen su respaldo local. Excepciones: los chats con el modelo por defecto
+  - **Privacidad, con precisión (mensaje final; de mejor esfuerzo):** chats locales
+    **interactivos**: cerebro y tareas 'auto' en casa; visión y las seis tareas de
+    fondo, locales mientras Ollama está sano; si Ollama falla, las 'auto' no saltan
+    solas a OpenRouter (solo `fallback_providers`, `_try_main_fallback_chain` línea
+    4486); las fijadas tienen respaldo local para el fallo de un modelo, pero en
+    una caída total pueden pasar al modelo principal de OpenRouter. Excepciones: los chats con el modelo por defecto
     van a OpenRouter (también sus auxiliares), las herramientas web, el estado del
     respaldo automático y la herencia no verificada de las tareas del punto
     anterior. No hay afirmaciones absolutas.
