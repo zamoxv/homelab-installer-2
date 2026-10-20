@@ -1253,6 +1253,30 @@ test_hermes_aux_migration_failure_is_incomplete_and_rerun_resumes() {
   assert_file_contains "$STATE_FILE" "hermes" || return 1
 }
 
+test_hermes_config_op_transient_failure_is_retried_and_completes() {
+  _hm_setup
+  _hm_seed_existing_with_aux "$(printf 'auxiliary:\n'; _hm_aux_block_or qwen/qwen3.7-flash "${_HM_TASKS[@]}")"
+  export HLI2_HERMES_CFG_RETRY_SLEEP=0 STUB_HERMES_CONFIG_SET_FAIL_ONCE_N="2" STUB_HERMES_CONFIG_SET_STDERR="config.yaml busy"
+  bash "$REPO_ROOT/modules/hermes.sh" || { unset STUB_HERMES_CONFIG_SET_FAIL_ONCE_N STUB_HERMES_CONFIG_SET_STDERR; return 1; }
+  unset STUB_HERMES_CONFIG_SET_FAIL_ONCE_N STUB_HERMES_CONFIG_SET_STDERR
+  assert_not_contains "$(_hm_dialog_text)" "migración incompleta" "un fallo transitorio no deja la migración incompleta" || return 1
+  assert_file_contains "$STATE_FILE" "hermes" || return 1
+  chmod u+rwx "$SECRETS_DIR"; [[ -f "$SECRETS_DIR/hermes-aux-auto" ]] || { chmod 000 "$SECRETS_DIR"; fail "falta el marcador"; return 1; }; chmod 000 "$SECRETS_DIR"
+}
+
+test_hermes_config_op_persistent_failure_logs_key_and_stderr_without_secrets() {
+  _hm_setup
+  _hm_seed_existing_with_aux "$(printf 'auxiliary:\n'; _hm_aux_block_or qwen/qwen3.7-flash "${_HM_TASKS[@]}")"
+  local leak="sk-or-v1-abcdef0123456789"
+  export HLI2_HERMES_CFG_RETRY_SLEEP=0 STUB_HERMES_CONFIG_SET_FAIL_N="2" STUB_HERMES_CONFIG_SET_STDERR="locked by writer token=$leak"
+  if bash "$REPO_ROOT/modules/hermes.sh"; then unset STUB_HERMES_CONFIG_SET_FAIL_N STUB_HERMES_CONFIG_SET_STDERR; fail "debió terminar con error"; return 1; fi
+  unset STUB_HERMES_CONFIG_SET_FAIL_N STUB_HERMES_CONFIG_SET_STDERR
+  assert_contains "$(_hm_dialog_text)" "Claves que fallaron: auxiliary.vision.model" "el aviso lista la clave" || return 1
+  assert_file_contains "$LOG_DIR/install.log" "clave auxiliary.vision.model" || return 1
+  assert_file_contains "$LOG_DIR/install.log" "locked by writer" "el log lleva el stderr de la CLI" || return 1
+  if grep -rqF -- "$leak" "$LOG_DIR" 2>/dev/null; then fail "un valor con forma de secreto llegó al log"; return 1; fi
+}
+
 test_hermes_aux_migration_aborts_if_previous_values_cannot_be_saved() {
   _hm_setup
   _hm_seed_existing_with_aux "$(printf 'auxiliary:\n'; _hm_aux_block_or qwen/qwen3.7-flash "${_HM_TASKS[@]}")"

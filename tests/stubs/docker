@@ -107,16 +107,28 @@ fi
 # ('config unset' comparte el contador: es una escritura de configuración más.)
 if [[ "${1:-}" == "exec" && ( "$*" == *"config set"* || "$*" == *"config unset"* ) ]]; then
   _cnt_file="${STUB_CALL_LOG:-/dev/null}.cfgset"
-  _n=$(( $(cat "$_cnt_file" 2>/dev/null || echo 0) + 1 ))
-  echo "$_n" > "$_cnt_file"
-  if [[ " ${STUB_HERMES_CONFIG_SET_FAIL_N:-} " == *" $_n "* ]]; then exit 1; fi
+  # Un reintento (mismos argumentos que la llamada anterior) NO avanza el
+  # contador: el número N identifica la operación lógica, no el intento.
+  # FAIL_N falla todos los intentos de esa operación; FAIL_ONCE_N solo el
+  # primero. STUB_HERMES_CONFIG_SET_STDERR es el mensaje que imprime al fallar.
+  _args_file="${_cnt_file}.args"
+  _n="$(cat "$_cnt_file" 2>/dev/null || echo 0)"
+  if [[ "$(cat "$_args_file" 2>/dev/null)" == "$*" ]]; then _retry=1; else _retry=0; _n=$(( _n + 1 )); fi
+  echo "$_n" > "$_cnt_file"; printf '%s' "$*" > "$_args_file"
+  if [[ " ${STUB_HERMES_CONFIG_SET_FAIL_N:-} " == *" $_n "* ]] \
+     || { [[ "$_retry" -eq 0 ]] && [[ " ${STUB_HERMES_CONFIG_SET_FAIL_ONCE_N:-} " == *" $_n "* ]]; }; then
+    [[ -z "${STUB_HERMES_CONFIG_SET_STDERR:-}" ]] || printf '%s\n' "$STUB_HERMES_CONFIG_SET_STDERR" >&2
+    exit 1
+  fi
   if [[ -n "${STUB_HERMES_CONFIG_SET_INT_N:-}" && "$_n" == "$STUB_HERMES_CONFIG_SET_INT_N" ]]; then
     _p="$PPID"
     while [[ "$_p" -gt 1 ]]; do
-      if tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null | grep -q 'modules/ollama.sh'; then kill -"${STUB_HERMES_CONFIG_SET_SIGNAL:-INT}" "$_p"; break; fi
+      if tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null | grep -q 'modules/ollama.sh'; then _target="$_p"; fi
       _p="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')"
       [[ -n "$_p" ]] || break
     done
+    # El más externo que coincida: dentro de $(...) el subshell hereda el mismo cmdline.
+    [[ -z "${_target:-}" ]] || kill -"${STUB_HERMES_CONFIG_SET_SIGNAL:-INT}" "$_target"
   fi
   exit 0
 fi

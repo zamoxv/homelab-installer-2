@@ -1411,20 +1411,59 @@ _hermes_unit_close() {
   H_CUR_UNIT="" H_CUR_FAILED=0
 }
 
+# Oculta lo que parezca un secreto antes de escribirlo en el log: claves de
+# OpenRouter (sk-or-...), tokens de Telegram (id:token) y hex largo (>= 32).
+_hermes_redact() {
+  sed -E -e 's/sk-or-[A-Za-z0-9_-]+/[oculto]/g' \
+    -e 's/[0-9]{6,}:[A-Za-z0-9_-]{30,}/[oculto]/g' \
+    -e 's/[0-9A-Fa-f]{32,}/[oculto]/g'
+}
+
+# Registra en el log del módulo la operación que falló: unidad, operación,
+# clave y la salida de la CLI (recortada y sin secretos). Nunca el valor.
+_hermes_log_op_failure() {
+  local unit="$1" op="$2" key="$3" val="$4" out="$5"
+  if [[ "$key" =~ [Kk][Ee][Yy]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd] && -n "$val" ]]; then
+    out="${out//"$val"/[oculto]}"
+  fi
+  out="$(printf '%s' "$out" | tr '\n' ' ' | _hermes_redact)"
+  hli_module_log "hermes config ${op} falló (unidad ${unit}, clave ${key}): ${out:0:500}"
+}
+
+# Ejecuta una operación de 'hermes config' con hasta 3 intentos (espera 1 s y
+# 2 s; HLI2_HERMES_CFG_RETRY_SLEEP la fija, p. ej. 0 en los tests): Hermes puede
+# estar reescribiendo config.yaml justo en ese momento. Deja la salida del
+# último intento en H_OP_OUT.
+H_OP_OUT=""
+_hermes_exec_op() {
+  local uid="$1" gid="$2" op="$3" key="$4" val="$5" attempt=1 max=3 delay
+  while :; do
+    if [[ "$op" == "unset" ]]; then
+      H_OP_OUT="$(hli_docker exec -u "${uid}:${gid}" hermes "$HERMES_BIN" config unset "$key" 2>&1)" && return 0
+    else
+      H_OP_OUT="$(hli_docker exec -u "${uid}:${gid}" hermes "$HERMES_BIN" config set "$key" "$val" 2>&1)" && return 0
+    fi
+    [[ "$attempt" -lt "$max" ]] || return 1
+    delay="${HLI2_HERMES_CFG_RETRY_SLEEP:-$attempt}"
+    sleep "$delay"
+    attempt=$(( attempt + 1 ))
+  done
+}
+
+declare -a H_FAILED_KEYS=()
+
 _hermes_run_ops() {
   local uid="$1" gid="$2" entry unit rest op key val
-  H_OPS_FAILED=0 H_UNIT_OK=() H_CUR_UNIT="" H_CUR_FAILED=0
+  H_OPS_FAILED=0 H_UNIT_OK=() H_CUR_UNIT="" H_CUR_FAILED=0 H_FAILED_KEYS=()
   for entry in "${H_RUN[@]}"; do
     unit="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"
     op="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
     key="${rest%%$'\t'*}"; val="${rest#*$'\t'}"
     if [[ "$unit" != "$H_CUR_UNIT" ]]; then _hermes_unit_close; H_CUR_UNIT="$unit"; fi
-    if [[ "$op" == "unset" ]]; then
-      hli_docker exec -u "${uid}:${gid}" hermes "$HERMES_BIN" config unset "$key" >/dev/null 2>&1 \
-        || { H_CUR_FAILED=1; H_OPS_FAILED=1; }
-    else
-      hli_docker exec -u "${uid}:${gid}" hermes "$HERMES_BIN" config set "$key" "$val" >/dev/null 2>&1 \
-        || { H_CUR_FAILED=1; H_OPS_FAILED=1; }
+    if ! _hermes_exec_op "$uid" "$gid" "$op" "$key" "$val"; then
+      H_CUR_FAILED=1; H_OPS_FAILED=1
+      H_FAILED_KEYS+=("$key")
+      _hermes_log_op_failure "$unit" "$op" "$key" "$val" "$H_OP_OUT"
     fi
   done
   _hermes_unit_close
@@ -1432,17 +1471,20 @@ _hermes_run_ops() {
 
 # "migración incompleta: X de N tareas ..." con las que faltan y su valor previo.
 _hermes_incomplete_note() {
-  local t pending="" n=0
+  local t pending="" n=0 failed=""
+  if [[ "${#H_FAILED_KEYS[@]}" -gt 0 ]]; then
+    failed=" Claves que fallaron: $(printf '%s, ' "${H_FAILED_KEYS[@]}" | sed 's/, $//')."
+  fi
   for t in "${H_AUX_PLANNED[@]}"; do
     [[ -n "${H_UNIT_OK[aux:$t]:-}" ]] && continue
     n=$(( n + 1 ))
     pending+="${t}: ${H_AUX_PREV_PROV[$t]:-auto/(modelo principal)}; "
   done
   if [[ "$n" -gt 0 ]]; then
-    printf "migración incompleta: %s de %s tareas auxiliares quedaron sin pasar a 'auto' o a medias (%s); vuelva a correr el módulo para completarla." \
-      "$n" "${#H_AUX_PLANNED[@]}" "${pending%; }"
+    printf "migración incompleta: %s de %s tareas auxiliares quedaron sin pasar a 'auto' o a medias (%s); vuelva a correr el módulo para completarla.%s" \
+      "$n" "${#H_AUX_PLANNED[@]}" "${pending%; }" "$failed"
   else
-    printf 'configuración de Hermes incompleta: alguna clave no se pudo escribir con la CLI; vuelva a correr el módulo.'
+    printf 'configuración de Hermes incompleta: alguna clave no se pudo escribir con la CLI; vuelva a correr el módulo.%s' "$failed"
   fi
 }
 
