@@ -1510,6 +1510,11 @@ Por definir antes de diseñar el módulo:
       "Throttle Transcodes", bajó a ~10–20 % (también con HDR). Evaluar que
       el importador o el módulo `jellyfin` avisen (o ajusten) los códecs de
       decodificación según la GPU detectada.
+      Mismo origen (configuración importada): el plugin TMDb tenía vacías las
+      opciones de "Image Scaling" y las fotos de actores solo bajaban al abrir
+      cada ficha (2026-10-21). Fijarlas (p. ej. poster w780, backdrop w1280,
+      profile h632, still w300; no "original", que infla appdata y el backup a
+      R2) + tarea "Refresh People" lo resolvió.
 
 - [ ] **Montar un disco de media con los contenedores ya corriendo los deja
       ciegos.** Docker fija los bind mounts al arrancar el contenedor: si
