@@ -83,10 +83,11 @@ __PORT_LINES__
 __TELEGRAM_ENV__
     volumes:
       - __APPDATA__/hermes:/opt/data
-      # Informe de diagnóstico del servidor (v2.6d): lo escribe root cada 5
+      # Informe de diagnóstico del servidor (v2.6d): carpeta de root fuera del
+      # árbol del usuario (REPORT_DIR, lib/report.sh); lo escribe root cada 5
       # minutos (hli2-report.timer), filtrado y sin secretos. SOLO LECTURA: el
       # agente nunca recibe escritura sobre él ni acceso a nada más del host.
-      - __APPDATA__/hermes-report:/opt/host-report:ro
+      - __REPORT_DIR__:/opt/host-report:ro
     deploy:
       resources:
         limits:

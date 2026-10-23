@@ -264,6 +264,7 @@ compose_render_hermes() {
 
   cat "$template" \
     | _compose_subst "__APPDATA__" "$APPDATA_ROOT" \
+    | _compose_subst "__REPORT_DIR__" "$REPORT_DIR" \
     | _compose_subst "__UID__" "$uid" \
     | _compose_subst "__GID__" "$gid" \
     | _compose_subst "__SUBNET__" "$subnet" \
