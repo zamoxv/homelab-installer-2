@@ -426,5 +426,6 @@ source "$SCRIPT_DIR/lib/importer.sh"
 source "$SCRIPT_DIR/lib/canary.sh"
 source "$SCRIPT_DIR/lib/backup.sh"
 source "$SCRIPT_DIR/lib/restore.sh"
+source "$SCRIPT_DIR/lib/report.sh"
 
 hli_require_sudo

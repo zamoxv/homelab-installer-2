@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Entrada NO interactiva del informe de diagnóstico del servidor (v2.6d). La usa
+# el servicio systemd hli2-report.service (cada 5 minutos) y sudo manual, siempre
+# como root y SIEMPRE desde la copia root-owned en /usr/local/lib/hli2 (la deja
+# backup_refresh_install): root nunca ejecuta código de un checkout del usuario.
+#
+#   hli2-report          Arma el informe filtrado y lo escribe, de forma atómica,
+#                        en <appdata>/hermes-report/report.md (ver lib/report.sh).
+#
+# Solo lee estado del equipo; no modifica nada salvo el propio informe.
+set -euo pipefail
+
+# Bajo systemd no hay $USER y lib/core.sh lo exige.
+export USER="${USER:-root}"
+export LC_ALL=C
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$HERE/.." && pwd)"
+
+# Guardia: todo lo que se va a sourcear debe ser de root y no escribible por
+# otros (mismo criterio y mismo motivo que bin/hli2-backup). 'HLI2_BACKUP_EXPECT_UID'
+# existe solo para los tests (corren como usuario normal).
+_expect_uid="${HLI2_BACKUP_EXPECT_UID:-0}"
+_bad=""
+for _f in "$ROOT_DIR" "$HERE" "$ROOT_DIR/lib" "$ROOT_DIR/services" "$ROOT_DIR/config" \
+          "$HERE"/* "$ROOT_DIR"/lib/* "$ROOT_DIR"/services/* "$ROOT_DIR"/config/*; do
+  [[ -e "$_f" ]] || continue
+  read -r _uid _mode < <(stat -c '%u %a' -- "$_f")
+  if [[ "$_uid" != "$_expect_uid" ]]; then _bad="$_f"; break; fi
+  if [[ "$_expect_uid" == "0" ]] && (( 8#$_mode & 8#022 )); then _bad="$_f"; break; fi
+done
+if [[ -n "$_bad" ]]; then
+  echo "ERROR: $_bad no es de root o es escribible por otros: hli2-report solo corre desde la copia root-owned (ejecute el módulo hermes o backup-setup)." >&2
+  exit 1
+fi
+
+source "$ROOT_DIR/lib/core.sh"
+
+if [[ "$(id -u)" -ne 0 && -z "${HLI2_BACKUP_ALLOW_NONROOT:-}" ]]; then
+  echo "ERROR: hli2-report debe correr como root (use sudo)." >&2
+  exit 1
+fi
+
+[[ $# -eq 0 ]] || { echo "Uso: hli2-report (sin argumentos)" >&2; exit 2; }
+
+umask 022
+report_main

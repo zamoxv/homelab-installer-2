@@ -89,6 +89,16 @@ case "$sub" in
     tailscale "${args[@]}"
     exit $?
     ;;
+  journalctl)
+    # 'sudo journalctl ...' (informe del servidor, v2.6d): delega al
+    # 'journalctl' del PATH si el test puso uno; si no, no hay journal.
+    unset -v 'args[0]'
+    if command -v journalctl >/dev/null 2>&1 && [[ -n "${STUB_JOURNAL_FILE:-}" ]]; then
+      journalctl "${args[@]}"
+      exit $?
+    fi
+    exit 0
+    ;;
   env)
     # hli_apt = 'sudo env VAR=.. apt-get ...'. STUB_APT_FAIL=1 hace fallar
     # cualquier apt-get; con STUB_APT_INSTALL_BIN_DIR, 'apt-get install

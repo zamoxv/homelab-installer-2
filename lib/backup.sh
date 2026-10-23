@@ -115,7 +115,7 @@ _backup_state_dir_ensure() {
   fi
 }
 
-# Copia ROOT-OWNED del código (bin/, lib/, services/, config/) en
+# Copia ROOT-OWNED del código (bin/hli2-backup, bin/hli2-report, lib/, services/, config/) en
 # $BACKUP_INSTALL_DIR. La corre el USUARIO (con sudo en cada operación: nunca
 # ejecuta nada del checkout como root) desde backup-setup y backup-now, y deja
 # todo root:root, directorios 0755 y archivos 0644 (el entrypoint 0755). Solo
@@ -128,7 +128,7 @@ backup_refresh_install() {
   stage="$dst.new"
   sudo rm -rf "$stage"
   sudo install -d -m 0755 -o root -g root "$stage" "$stage/bin" "$stage/lib" "$stage/services" "$stage/config" || return 1
-  for f in "$src/bin/hli2-backup" "$src"/lib/*.sh "$src"/services/*.conf "$src/config/default.conf"; do
+  for f in "$src/bin/hli2-backup" "$src/bin/hli2-report" "$src"/lib/*.sh "$src"/services/*.conf "$src/config/default.conf"; do
     [[ -f "$f" && ! -L "$f" ]] || continue
     sub="${f#"$src"/}"
     mode=0644
