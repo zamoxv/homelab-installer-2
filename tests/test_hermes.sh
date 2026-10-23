@@ -354,7 +354,7 @@ test_hermes_compose_template_hardening() {
   # Solo dos montajes: los datos de Hermes y el informe del servidor, este último de solo lectura.
   assert_eq "2" "$(grep -c '^[[:space:]]*- .*:/' <<<"$(sed -n '/volumes:/,/deploy:/p' <<<"$code")")" "dos montajes" || return 1
   assert_contains "$code" "__APPDATA__/hermes:/opt/data" || return 1
-  assert_contains "$code" "__APPDATA__/hermes-report:/opt/host-report:ro" "el informe se monta en solo lectura" || return 1
+  assert_contains "$code" "__REPORT_DIR__:/opt/host-report:ro" "el informe se monta en solo lectura" || return 1
   # Los secretos son solo referencias ${VAR}; ningún valor literal.
   local v
   for v in OPENROUTER_API_KEY API_SERVER_KEY HERMES_DASHBOARD_BASIC_AUTH_PASSWORD HERMES_DASHBOARD_BASIC_AUTH_SECRET; do
@@ -1695,7 +1695,7 @@ test_hermes_report_units_installed_idempotently_by_the_module() {
   assert_file_contains "$tmr" "OnBootSec=2min" || return 1
   assert_file_contains "$tmr" "OnUnitActiveSec=5min" || return 1
   assert_file_contains "$STUB_CALL_LOG" $'systemctl\tenable\t--now\thli2-report.timer' || return 1
-  assert_eq "755" "$(stat -c %a "$APPDATA_ROOT/hermes-report")" || return 1
+  assert_eq "755" "$(stat -c %a "$BACKUP_STATE_DIR/hermes-report")" || return 1
   local n1; n1="$(grep -P '^sudo\tinstall\t' "$STUB_CALL_LOG" | grep -cF "$svc")"
   assert_eq "1" "$n1" "la unidad se escribe una vez" || return 1
   : > "$DIALOG_PASSWORDBOX_QUEUE"; : > "$DIALOG_YESNO_QUEUE"; : > "$DIALOG_INPUTBOX_QUEUE"
@@ -1712,3 +1712,17 @@ test_hermes_report_module_applies_soul_block_end_to_end() {
   assert_file_contains "$APPDATA_ROOT/hermes/SOUL.md" "HLI2:END" || return 1
   assert_contains "$(_hm_dialog_text)" "/opt/host-report/report.md" "el mensaje final menciona el informe" || return 1
 }
+
+test_hermes_report_unit_is_hardened_and_old_appdata_dir_is_migrated() {
+  _hm_setup
+  _hm_first_run_queues
+  mkdir -p "$APPDATA_ROOT/hermes-report"; echo viejo > "$APPDATA_ROOT/hermes-report/report.md"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  local svc="$HLI2_SYSTEMD_DIR/hli2-report.service" l
+  for l in "PrivateTmp=yes" "NoNewPrivileges=yes" "ProtectSystem=strict" "ReadWritePaths=$BACKUP_STATE_DIR/hermes-report" "ProtectHome=yes" "PrivateDevices=yes"; do
+    assert_file_contains "$svc" "$l" || return 1
+  done
+  [[ ! -e "$APPDATA_ROOT/hermes-report" ]] || { fail "no migró (borró) la carpeta vieja de appdata"; return 1; }
+  assert_file_contains "$STUB_HTTP_BODIES_LOG" "$BACKUP_STATE_DIR/hermes-report:/opt/host-report:ro" "el compose monta la carpeta nueva" || return 1
+}
+

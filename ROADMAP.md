@@ -1305,39 +1305,66 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
       para no dejar un par incoherente.
 
 #### v2.6d — Diagnóstico del servidor (solo lectura)
-- [x] Implementado (pendiente de validar en el M70q, pruebas 169-176 de
+- [x] Implementado (pendiente de validar en el M70q, pruebas 169-182 de
       `docs/VALIDACION.md`). `hli2-report.timer` (`OnBootSec=2min`,
       `OnUnitActiveSec=5min`) lanza `hli2-report.service`, que corre
       `bin/hli2-report` como root **desde la copia root-owned**
       (`/usr/local/lib/hli2`, la misma que usa el backup; la refresca el módulo
       `hermes`) y con la misma guardia que `hli2-backup` (se niega si el código
-      no es de root). Escribe `/srv/appdata/hermes-report/report.md` (carpeta
-      `root:root` 0755, informe 0644, escritura atómica: temporal + `mv`).
+      no es de root). Escribe `/var/lib/hli2-root/hermes-report/report.md` (carpeta
+      `root:root` 0755 fuera del árbol del usuario, informe 0644, escritura
+      atómica: temporal + `mv`; la versión inicial usaba `/srv/appdata/hermes-report`
+      y el módulo la migra). La unidad va endurecida (`ProtectSystem=strict`,
+      `ReadWritePaths` solo la carpeta del informe, `ProtectHome`, `PrivateDevices`,
+      `PrivateTmp`, `NoNewPrivileges`).
 - [x] Contenido: fecha y zona horaria, uptime/carga/memoria/swap, disco de `/`,
       appdata, raíces de media y repositorio de backups, **cada servicio del
       registro** (incluidos los locales) con estado (running/stopped/unhealthy),
       salud, reinicios, tiempo activo e imagen (sin digest), unidades de systemd
       fallidas, último backup, Tailscale (conectado/no, sin IP) y las últimas 20
-      líneas con `error|warn|fail` de las últimas 2 h de cada contenedor y del
-      journal de `docker` y `hli2-*`.
+      líneas con `error|warn|fail` de las últimas 2 h del journal (`docker`,
+      `hli2-*`, `smbd`) y **solo de los contenedores de infraestructura**
+      (`adguard`, `cloudflared`). Los logs de `hermes`, `ollama`, `vaultwarden`,
+      `homeassistant`, `opencloud`, `qbittorrent`, `jellyfin` y de cualquier
+      servicio local NO se incluyen (privacidad: pueden llevar conversaciones o
+      datos personales); el administrador puede agregar ids en
+      `/etc/hli2.d/report-log-services` (un id por línea, de root y sin
+      escritura para otros). Las líneas de log se rotulan como datos no
+      confiables (y `SOUL.md` lo repite).
+- [x] El informe revela el nombre del equipo, los servicios instalados y los
+      nombres de sus imágenes, y un modelo en la nube que lo lea puede recibirlo
+      (queda dicho en su encabezado). Cada consulta externa lleva `timeout -k`;
+      hay un plazo global de 90 s tras el cual el informe sale marcado como
+      "Parcial: tiempo agotado".
 - [x] **Sin secretos:** de `docker inspect` solo una lista blanca
       (`State.Status`, `State.Health.Status`, `RestartCount`, `State.StartedAt`,
       `Config.Image`; nunca entorno, etiquetas, montajes ni argumentos).
-      Redacción (`report_redact`, probada): `sk-or-…`, tokens de Telegram, JWT,
-      `Authorization`/`Bearer`, `password|token|secret|api_key|key=…`, hex largo
+      Redacción (`report_redact`, probada, se aplica antes de recortar
+      renglones): `sk-or-…`, tokens de Telegram, JWT, `Authorization`/`Bearer`,
+      variables `nombre=valor`, `nombre: valor`, `"nombre" : "valor"` y
+      `nombre%3Dvalor` (nombres como `password`, `pass`, `token`, `secret`,
+      `cookie`, `session`, `sid`, `totp`, `otp`, `seed`, `salt`, `key`, `auth`;
+      valores con espacios), banderas `--password x`, hex largo
       (≥32), base64 largo (≥40), claves privadas, URL con `usuario:clave@`,
       correos (se oculta la parte local), IP (`<IP>`) y los **valores literales**
-      de `/etc/hli2/*.env` y de la contraseña de restic (≥6 caracteres). Tope de
+      de **todos los archivos de `/etc/hli2`** (con sus formas URL y base64; ≥6
+      caracteres). El IPv4 se oculta salvo versiones con puntos en etiquetas de
+      imágenes (`app:1.25.3.4`). Los IDs de contenedor de 64 hex también se
+      ocultan (no se distinguen de un secreto en hex). Tope de
       64 KB (24 KB para los logs de contenedores).
-- [x] Montaje en Hermes **solo lectura**: `${APPDATA}/hermes-report:/opt/host-report:ro`
+- [x] Montaje en Hermes **solo lectura**: `/var/lib/hli2-root/hermes-report:/opt/host-report:ro`
       (única fuente: `compose/hermes/docker-compose.yml`). La carpeta no es un
       `SERVICE_DATA`: no entra en los backups (se regenera).
 - [x] Hermes diagnostica y recomienda; el usuario aplica (ver `SOUL.md` en v2.6c).
 - Limitación conocida: la redacción de patrones es de mejor esfuerzo; la defensa
   real es la lista blanca (no se leen archivos de configuración ni el entorno
-  de los contenedores) y que los logs pasan por la redacción de valores
-  literales de `/etc/hli2`. Los logs de `hermes` pueden contener texto de las
-  conversaciones: revise el informe (prueba 171) antes de confiar en él.
+  de los contenedores), la lista cerrada de logs y la redacción de los valores
+  literales de `/etc/hli2`. Revise el informe (prueba 171) antes de confiar en él.
+- `SOUL.md`: la escritura usa un temporal en appdata (fuera de la carpeta que el
+  agente controla) y `mv -T`, y la lectura verifica dispositivo:inodo del
+  descriptor abierto frente a la ruta: un agente que cambie `SOUL.md` por un
+  enlace simbólico a mitad de la operación no consigue que el usuario escriba ni
+  lea otro archivo.
 - Quitarlo: `sudo systemctl disable --now hli2-report.timer`, borrar las
   unidades `hli2-report.*` de `/etc/systemd/system` y la carpeta
   `hermes-report`.
