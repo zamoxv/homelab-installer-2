@@ -1270,9 +1270,17 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
       `cronjob create` correctamente. **Conclusión:** el local queda como
       cerebro opcional para conversación privada, preguntas y búsquedas; las
       tareas que encadenan herramientas, con el modelo por defecto.
-- [ ] Mejoras para el local: instrucciones fijas en `SOUL.md` (responder
-      siempre en español; usar la herramienta de tareas programadas para
-      recordatorios).
+- [x] Mejoras para el local: instrucciones fijas en `SOUL.md`. El módulo
+      `hermes` mantiene un bloque entre `<!-- HLI2:BEGIN -->` y
+      `<!-- HLI2:END -->` en `/srv/appdata/hermes/SOUL.md` (responder siempre en
+      español; recordatorios con la herramienta `cronjob` y entrega por Telegram;
+      el informe en `/opt/host-report/report.md`; no modificar el servidor,
+      recomendar comandos; nunca pedir secretos). Se inserta o actualiza sin
+      tocar el resto del archivo; con marcadores incompletos o un enlace
+      simbólico no hace nada. Hermes lee `SOUL.md` de `HERMES_HOME`
+      (`load_soul_md`, v0.22.2) pero arma el prompt del sistema una vez por
+      conversación: **rige en las conversaciones nuevas**. Pendiente de validar
+      (prueba 177).
 - [x] Compresión del contexto: con las auxiliares en `auto` ya no hay
       compactación temprana en chats con DeepSeek (usa DeepSeek y su ventana de
       1M); en un chat local comprime con el modelo local (lenta en CPU, de ahí
@@ -1297,10 +1305,42 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
       para no dejar un par incoherente.
 
 #### v2.6d — Diagnóstico del servidor (solo lectura)
-- [ ] Timer del HLI (cada 5 min) que genera un **informe filtrado**: estado de
-      servicios, disco, último backup, errores recientes de logs, recursos;
-      **sin secretos** (redacción antes de escribir). Montado en Hermes en solo
-      lectura. Hermes diagnostica y recomienda; el usuario aplica.
+- [x] Implementado (pendiente de validar en el M70q, pruebas 169-176 de
+      `docs/VALIDACION.md`). `hli2-report.timer` (`OnBootSec=2min`,
+      `OnUnitActiveSec=5min`) lanza `hli2-report.service`, que corre
+      `bin/hli2-report` como root **desde la copia root-owned**
+      (`/usr/local/lib/hli2`, la misma que usa el backup; la refresca el módulo
+      `hermes`) y con la misma guardia que `hli2-backup` (se niega si el código
+      no es de root). Escribe `/srv/appdata/hermes-report/report.md` (carpeta
+      `root:root` 0755, informe 0644, escritura atómica: temporal + `mv`).
+- [x] Contenido: fecha y zona horaria, uptime/carga/memoria/swap, disco de `/`,
+      appdata, raíces de media y repositorio de backups, **cada servicio del
+      registro** (incluidos los locales) con estado (running/stopped/unhealthy),
+      salud, reinicios, tiempo activo e imagen (sin digest), unidades de systemd
+      fallidas, último backup, Tailscale (conectado/no, sin IP) y las últimas 20
+      líneas con `error|warn|fail` de las últimas 2 h de cada contenedor y del
+      journal de `docker` y `hli2-*`.
+- [x] **Sin secretos:** de `docker inspect` solo una lista blanca
+      (`State.Status`, `State.Health.Status`, `RestartCount`, `State.StartedAt`,
+      `Config.Image`; nunca entorno, etiquetas, montajes ni argumentos).
+      Redacción (`report_redact`, probada): `sk-or-…`, tokens de Telegram, JWT,
+      `Authorization`/`Bearer`, `password|token|secret|api_key|key=…`, hex largo
+      (≥32), base64 largo (≥40), claves privadas, URL con `usuario:clave@`,
+      correos (se oculta la parte local), IP (`<IP>`) y los **valores literales**
+      de `/etc/hli2/*.env` y de la contraseña de restic (≥6 caracteres). Tope de
+      64 KB (24 KB para los logs de contenedores).
+- [x] Montaje en Hermes **solo lectura**: `${APPDATA}/hermes-report:/opt/host-report:ro`
+      (única fuente: `compose/hermes/docker-compose.yml`). La carpeta no es un
+      `SERVICE_DATA`: no entra en los backups (se regenera).
+- [x] Hermes diagnostica y recomienda; el usuario aplica (ver `SOUL.md` en v2.6c).
+- Limitación conocida: la redacción de patrones es de mejor esfuerzo; la defensa
+  real es la lista blanca (no se leen archivos de configuración ni el entorno
+  de los contenedores) y que los logs pasan por la redacción de valores
+  literales de `/etc/hli2`. Los logs de `hermes` pueden contener texto de las
+  conversaciones: revise el informe (prueba 171) antes de confiar en él.
+- Quitarlo: `sudo systemctl disable --now hli2-report.timer`, borrar las
+  unidades `hli2-report.*` de `/etc/systemd/system` y la carpeta
+  `hermes-report`.
 - [ ] Descartados: socket de Docker (aun con `:ro` da root en el host) y proxy
       del socket solo-lectura (`inspect` y logs exponen secretos que un agente
       manipulado por una página web podría enviar afuera).
