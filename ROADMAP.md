@@ -1286,6 +1286,15 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
       2026-10-19 con `HERMES_TIMEZONE` en el compose y `timezone:` en
       `config.yaml` (el módulo detecta la zona del servidor o la pregunta si es
       UTC); no hace falta cambiar la zona del servidor. Validar con la prueba 161.
+- [x] **Decisión del usuario (2026-10-22): modelo por defecto local**
+      (`model.provider: ollama-local`, `model.default: gemma4:e4b`; quedó así
+      al elegirlo desde el dashboard, que persiste el cambio). Todo es gratis
+      salvo cuando se pide más potencia con `/model` en una conversación
+      (solo esa sesión; `--global` lo vuelve permanente). Efecto lateral a
+      favor de la privacidad: las tareas sin chat en vivo, que usan el modelo
+      por defecto, ahora también son locales. El cambio de modelo del módulo
+      `hermes` fija `model.provider: openrouter` junto con `model.default`
+      para no dejar un par incoherente.
 
 #### v2.6d — Diagnóstico del servidor (solo lectura)
 - [ ] Timer del HLI (cada 5 min) que genera un **informe filtrado**: estado de

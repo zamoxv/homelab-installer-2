@@ -501,9 +501,15 @@ _hermes_ask_models() {
 # desplegado (no se edita YAML a mano: el archivo puede haber sido reescrito
 # por el agente). Se ejecuta con el uid/gid del agente ('-u'): 'docker exec'
 # como root dejaría archivos de root dentro de /opt/data.
+#
+# El modelo pedido es de OpenRouter, así que también se fija model.provider:
+# el usuario puede haber dejado otro proveedor por defecto (p. ej.
+# 'ollama-local' elegido con /model --global o desde el dashboard), y cambiar
+# solo model.default dejaría un par proveedor/modelo incoherente.
 _hermes_apply_model_change() {
-  if ! hli_docker exec -u "${H_UID}:${H_GID}" hermes "$HERMES_BIN" config set model.default "$H_MODEL" >/dev/null 2>&1; then
-    msg "No se pudo cambiar el modelo con la CLI de Hermes. Edite a mano ${APPDATA_ROOT}/hermes/config.yaml (clave model.default) y reinicie el contenedor 'hermes'."
+  if ! hli_docker exec -u "${H_UID}:${H_GID}" hermes "$HERMES_BIN" config set model.provider openrouter >/dev/null 2>&1 \
+    || ! hli_docker exec -u "${H_UID}:${H_GID}" hermes "$HERMES_BIN" config set model.default "$H_MODEL" >/dev/null 2>&1; then
+    msg "No se pudo cambiar el modelo con la CLI de Hermes. Edite a mano ${APPDATA_ROOT}/hermes/config.yaml (claves model.provider y model.default) y reinicie el contenedor 'hermes'."
     return 1
   fi
   hli_docker restart hermes >/dev/null 2>&1 || true

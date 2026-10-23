@@ -240,6 +240,9 @@ test_hermes_rerun_can_rotate_api_key_and_change_main_model() {
   # El archivo del usuario no se toca; los modelos se cambian con la CLI de Hermes.
   assert_eq $'# mio\nmodel:\n  default: x/y' "$(< "$APPDATA_ROOT/hermes/config.yaml")" || return 1
   assert_file_contains "$STUB_CALL_LOG" $'exec\t-u\t'"$(id -u):$(id -g)"$'\thermes\t/opt/hermes/.venv/bin/hermes\tconfig\tset\tmodel.default\tfoo/bar-model' "docker exec con el uid/gid del agente" || return 1
+  # El modelo es de OpenRouter: el proveedor también se fija (el usuario pudo
+  # dejar otro por defecto, p. ej. ollama-local).
+  assert_file_contains "$STUB_CALL_LOG" $'config\tset\tmodel.provider\topenrouter' "model.provider fijado a openrouter" || return 1
   if grep -F $'docker\texec\t' "$STUB_CALL_LOG" | grep -vF $'exec\t-u\t' | grep -q .; then fail "un docker exec corrió sin -u"; return 1; fi
   # Ya no hay modelo auxiliar aparte: ninguna tarea se fija a un modelo.
   assert_file_not_contains "$STUB_CALL_LOG" $'config\tset\tauxiliary.vision.model\tfoo' || return 1
