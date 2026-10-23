@@ -105,6 +105,22 @@
 # terminal: sin esto alcanzaría el panel de Dokploy, AdGuard, Home Assistant,
 # el router). Ver _hermes_render_egress_script.
 #
+# INFORME DEL SERVIDOR (v2.6d): el módulo instala hli2-report.timer (cada 5
+# minutos; servicio root que corre bin/hli2-report desde la copia root-owned en
+# /usr/local/lib/hli2) que escribe un informe FILTRADO (sin secretos, ver
+# lib/report.sh) en <appdata>/hermes-report/report.md (root:root 0755, informe
+# 0644), y lo monta en el contenedor en SOLO LECTURA (/opt/host-report). Hermes
+# lo lee para diagnosticar; no tiene socket de Docker ni escritura en el host.
+# Para quitarlo: systemctl disable --now hli2-report.timer; borrar
+# hli2-report.service y hli2-report.timer de /etc/systemd/system y la carpeta
+# hermes-report (y la línea del montaje en el compose si se vuelve a desplegar).
+# SOUL.md (v2.6c): el módulo mantiene un bloque entre marcadores HLI2:BEGIN/END
+# en <appdata>/hermes/SOUL.md (Hermes lo lee como su identidad:
+# agent/prompt_builder.py load_soul_md, línea 1648, v0.22.2; lo siembra
+# docker/stage2-hook.sh línea 446 si falta). El prompt del sistema se arma una
+# vez por conversación (agent/conversation_loop.py, línea 742): el bloque rige
+# en las conversaciones NUEVAS.
+#
 # Secretos (OPENROUTER_API_KEY, API_SERVER_KEY, clave y secreto del
 # dashboard): root-only en /etc/hli2/hermes.env (lib/secrets.sh), al compose
 # solo por el canal "env" de Dokploy entre comillas simples; nunca por argv
@@ -139,6 +155,13 @@ HERMES_ZONEINFO_DIR="${HLI2_ZONEINFO_DIR:-/usr/share/zoneinfo}"
 HERMES_TZ_FILE="${HLI2_TZ_FILE:-/etc/timezone}"
 # Binario de Hermes dentro de la imagen.
 HERMES_BIN="/opt/hermes/.venv/bin/hermes"
+# Informe del servidor (v2.6d): ruta DENTRO del contenedor (el montaje :ro vive
+# en compose/hermes/docker-compose.yml; un test comprueba que coinciden) y
+# marcadores del bloque que el HLI mantiene en SOUL.md.
+HERMES_REPORT_CONTAINER_DIR="/opt/host-report"
+HERMES_REPORT_UNIT="hli2-report"
+HERMES_SOUL_BEGIN="<!-- HLI2:BEGIN -->"
+HERMES_SOUL_END="<!-- HLI2:END -->"
 # Lista de excepciones del aislamiento de salida (v2.6c): líneas 'ip:puerto/proto'
 # (root-only, junto a los secretos). La lee hli2-hermes-egress en cada 'apply'
 # y las incorpora a la construcción atómica de las cadenas. Solo se aceptan
@@ -1781,6 +1804,191 @@ _hermes_show_credentials() {
   _hermes_write_secrets
 }
 
+# --- Informe del servidor (v2.6d) -----------------------------------------------------
+
+# Servicio root que genera el informe. Corre bin/hli2-report desde la copia
+# root-owned ($BACKUP_INSTALL_DIR), nunca desde el checkout. Sin sudo (ya es
+# root), así que admite NoNewPrivileges.
+_hermes_render_report_service() {
+  cat <<EOF
+[Unit]
+Description=HLI 2: informe de diagnostico del servidor para Hermes (solo lectura)
+After=docker.service local-fs.target
+
+[Service]
+Type=oneshot
+Environment=USER=root HOME=/root
+ExecStart=${BACKUP_INSTALL_DIR}/bin/hli2-report
+PrivateTmp=yes
+NoNewPrivileges=yes
+TimeoutStartSec=120
+Nice=10
+IOSchedulingClass=idle
+EOF
+}
+
+_hermes_render_report_timer() {
+  cat <<EOF
+[Unit]
+Description=HLI 2: informe de diagnostico del servidor cada 5 minutos
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# Carpeta del informe (root:root 0755) ANTES del despliegue: si no existiera,
+# Docker la crearía al montarla.
+_hermes_report_dir_create() {
+  sudo install -d -m 0755 -o root -g root "$REPORT_DIR"
+}
+
+# Copia root-owned del código + unidades + timer, de forma idempotente (las
+# unidades solo se reescriben si cambian). Un fallo NO cancela el despliegue de
+# Hermes (el informe es un extra): deja H_REPORT_NOTE para el mensaje final.
+H_REPORT_NOTE=""
+_hermes_install_report() {
+  local v changed=0 unit timer
+  H_REPORT_NOTE=""
+  for v in "$BACKUP_INSTALL_DIR" "$REPORT_DIR"; do
+    case "$v" in
+      *[[:space:]%\"\']*)
+        H_REPORT_NOTE="El informe del servidor NO se instaló: la ruta '$v' tiene espacios, '%' o comillas que systemd no admite en una unidad."
+        return 1
+        ;;
+    esac
+  done
+  if ! backup_refresh_install; then
+    H_REPORT_NOTE="El informe del servidor NO se instaló: no se pudo copiar el código a ${BACKUP_INSTALL_DIR} (revise sudo y el espacio en disco)."
+    return 1
+  fi
+  unit="${HERMES_SYSTEMD_DIR}/${HERMES_REPORT_UNIT}.service"
+  timer="${HERMES_SYSTEMD_DIR}/${HERMES_REPORT_UNIT}.timer"
+  _hermes_install_root_file "$unit" "$(_hermes_render_report_service)" 0644 || { H_REPORT_NOTE="El informe del servidor NO se instaló: no se pudo escribir $unit."; return 1; }
+  [[ "$H_FILE_CHANGED" -eq 0 ]] || changed=1
+  _hermes_install_root_file "$timer" "$(_hermes_render_report_timer)" 0644 || { H_REPORT_NOTE="El informe del servidor NO se instaló: no se pudo escribir $timer."; return 1; }
+  [[ "$H_FILE_CHANGED" -eq 0 ]] || changed=1
+  [[ "$changed" -eq 0 ]] || sudo systemctl daemon-reload || true
+  if ! sudo systemctl enable --now "${HERMES_REPORT_UNIT}.timer" >/dev/null 2>&1; then
+    H_REPORT_NOTE="El informe del servidor se instaló, pero no se pudo habilitar ${HERMES_REPORT_UNIT}.timer (sudo systemctl enable --now ${HERMES_REPORT_UNIT}.timer)."
+    return 1
+  fi
+  log "Informe del servidor para Hermes instalado (${HERMES_REPORT_UNIT}.timer, ${REPORT_FILE})."
+}
+
+# Primer informe (o refresco) sin esperar al temporizador ni bloquear el módulo.
+_hermes_report_run_now() {
+  sudo systemctl start --no-block "${HERMES_REPORT_UNIT}.service" >/dev/null 2>&1 || true
+}
+
+# --- SOUL.md: bloque gestionado por el HLI (v2.6c) -------------------------------------------
+
+_hermes_soul_path() {
+  printf '%s/hermes/SOUL.md' "$APPDATA_ROOT"
+}
+
+# Texto del bloque, con sus marcadores. Instrucciones para el agente (español
+# neutro). Sin lenguaje de "ignorar instrucciones": el escáner de contexto de
+# Hermes lo marcaría.
+_hermes_soul_block() {
+  cat <<EOF
+${HERMES_SOUL_BEGIN}
+## Instrucciones del servidor (gestionadas por el HLI 2; este bloque se reescribe al volver a correr el módulo)
+
+- Responda siempre en español.
+- Para recordatorios y tareas programadas use la herramienta de tareas programadas (cronjob), con la zona horaria del servidor. Cuando el usuario pida un aviso o una notificación, entréguela por Telegram (deliver: telegram).
+- El estado del servidor está en ${HERMES_REPORT_CONTAINER_DIR}/report.md (solo lectura, filtrado y sin secretos, se actualiza cada 5 minutos). Léalo cuando el usuario pregunte por el servidor o cuando algo falle, e indique la fecha del informe.
+- No puede ni debe intentar modificar el servidor: recomiende los comandos exactos y deje que el usuario los aplique.
+- Nunca pida, guarde ni repita contraseñas, claves de API, tokens ni otros secretos.
+${HERMES_SOUL_END}
+EOF
+}
+
+# Fusiona el bloque en el contenido actual de SOUL.md ($1) y lo imprime:
+#   - con marcadores BEGIN/END: reemplaza lo que hay entre ellos (y quita
+#     bloques repetidos);
+#   - sin marcadores: agrega el bloque al final;
+#   - marcadores incompletos o desordenados: devuelve 1 sin imprimir nada (no se
+#     adivina qué borrar del contenido del usuario o del agente).
+# Todo lo que está fuera de los marcadores se conserva tal cual.
+_hermes_soul_merge() {
+  local cur="$1" line state=out emitted=0 nb=0 ne=0 block out=""
+  block="$(_hermes_soul_block)"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == "$HERMES_SOUL_BEGIN" ]] && nb=$(( nb + 1 ))
+    [[ "$line" == "$HERMES_SOUL_END" ]] && ne=$(( ne + 1 ))
+  done <<<"$cur"
+  if [[ "$nb" -eq 0 && "$ne" -eq 0 ]]; then
+    if [[ -n "$cur" ]]; then
+      printf '%s\n\n%s\n' "${cur%"${cur##*[![:space:]]}"}" "$block"
+    else
+      printf '%s\n' "$block"
+    fi
+    return 0
+  fi
+  [[ "$nb" -eq "$ne" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$state" == "out" ]]; then
+      if [[ "$line" == "$HERMES_SOUL_BEGIN" ]]; then
+        state=in
+        if [[ "$emitted" -eq 0 ]]; then out+="${block}"$'\n'; emitted=1; fi
+      elif [[ "$line" == "$HERMES_SOUL_END" ]]; then
+        return 1
+      else
+        out+="${line}"$'\n'
+      fi
+    else
+      if [[ "$line" == "$HERMES_SOUL_END" ]]; then
+        state=out
+      elif [[ "$line" == "$HERMES_SOUL_BEGIN" ]]; then
+        return 1
+      fi
+    fi
+  done <<<"$cur"
+  [[ "$state" == "out" ]] || return 1
+  printf '%s' "$out"
+}
+
+# Aplica el bloque a SOUL.md de forma atómica y sin cambiar dueño ni modo:
+# archivo temporal en la MISMA carpeta (creado por este proceso, que tiene el
+# mismo uid que HERMES_UID) y mv. No toca un enlace simbólico. Códigos: 0 hecho
+# (o ya estaba igual), 1 no se pudo, 2 SOUL.md todavía no existe (Hermes lo
+# siembra al arrancar; no se crea acá para no pisar su personalidad por defecto).
+H_SOUL_NOTE=""
+_hermes_soul_apply() {
+  local f cur new tmp mode
+  H_SOUL_NOTE=""
+  f="$(_hermes_soul_path)"
+  if [[ -L "$f" ]]; then
+    H_SOUL_NOTE="SOUL.md es un enlace simbólico: no se modifica."
+    return 1
+  fi
+  if [[ ! -f "$f" ]]; then
+    H_SOUL_NOTE="SOUL.md todavía no existe (Hermes lo crea al arrancar): vuelva a correr este módulo para agregar las instrucciones."
+    return 2
+  fi
+  cur="$(cat -- "$f")" || { H_SOUL_NOTE="No se pudo leer SOUL.md."; return 1; }
+  if ! new="$(_hermes_soul_merge "$cur"; printf x)" || [[ "$new" == "x" ]]; then
+    H_SOUL_NOTE="SOUL.md tiene marcadores ${HERMES_SOUL_BEGIN} / ${HERMES_SOUL_END} incompletos o desordenados: no se modifica (corríjalos a mano y vuelva a correr este módulo)."
+    return 1
+  fi
+  new="${new%x}"
+  if [[ "$new" == "$cur"$'\n' || "$new" == "$cur" ]]; then return 0; fi
+  mode="$(stat -c %a -- "$f" 2>/dev/null || echo 640)"
+  tmp="$(mktemp "${f}.tmp.XXXXXX")" || { H_SOUL_NOTE="No se pudo escribir junto a SOUL.md."; return 1; }
+  if ! printf '%s' "$new" > "$tmp" || ! chmod "$mode" "$tmp" || ! mv -f -- "$tmp" "$f"; then
+    rm -f -- "$tmp"
+    H_SOUL_NOTE="No se pudo actualizar SOUL.md."
+    return 1
+  fi
+  log "Bloque de instrucciones del HLI actualizado en $f"
+}
+
 # --- Principal -----------------------------------------------------------------
 
 _hermes_main() {
@@ -1823,6 +2031,12 @@ _hermes_main() {
   else
     dns_csv="1.1.1.1,9.9.9.9"
   fi
+
+  # Informe del servidor (v2.6d): la carpeta tiene que existir antes del
+  # despliegue (el compose la monta en solo lectura); las unidades son un extra
+  # que no cancela el despliegue si fallan.
+  _hermes_report_dir_create || { msg "No se pudo crear $REPORT_DIR (carpeta del informe del servidor que Hermes monta en solo lectura). Se cancela el despliegue."; return 1; }
+  _hermes_install_report || { hli_module_log "$H_REPORT_NOTE"; }
 
   # Aislamiento de salida ANTES de crear el contenedor.
   _hermes_install_egress "$HERMES_SUBNET" "${dns_csv//,/ }" || return 1
@@ -1911,6 +2125,14 @@ _hermes_main() {
     return 1
   fi
 
+  # Instrucciones de Hermes (SOUL.md) y primer informe ya con Hermes arriba.
+  local soul_rc=0 soul_note=""
+  _hermes_soul_apply || soul_rc=$?
+  [[ "$soul_rc" -eq 0 ]] || soul_note="$H_SOUL_NOTE"
+  [[ -n "$H_REPORT_NOTE" ]] || _hermes_report_run_now
+  local report_note="$H_REPORT_NOTE" report_line=""
+  [[ -n "$report_note" ]] || report_line="Informe del servidor: ${REPORT_FILE} (se actualiza cada 5 minutos, sin secretos); Hermes lo ve en ${HERMES_REPORT_CONTAINER_DIR}/report.md, solo lectura. "
+
   local tg_note=""
   if [[ -n "$H_TG_TOKEN" ]]; then
     if [[ "$(_hermes_telegram_state "http://${lan_ip}:8642/health/detailed" "$H_API_KEY")" == "connected" ]]; then
@@ -1930,7 +2152,7 @@ _hermes_main() {
   else
     ts_note="Tailscale no está activo en el servidor: por ahora Hermes solo responde en la LAN. Instale/inicie sesión con el módulo 'tailscale' y vuelva a correr este módulo para publicarlo también en la IP de Tailscale."
   fi
-  msg "Hermes desplegado (composeId=$composeId) y respondiendo en http://${lan_ip}:8642.\n\n${ts_note}\n\nApp Android: descargue el APK desde GitHub (https://github.com/rusty4444/hermes-android/releases; el de arm64-v8a sirve para teléfonos modernos). Permita instalar de orígenes desconocidos, agregue una conexión con servidor, puerto 8642 y la clave de API.\n\nDashboard: http://${ts_ip:-$lan_ip}:9119 (usuario admin).\n\nLos puertos 8642 y 9119 solo se publican en la IP de la LAN y en la de Tailscale: no hay acceso desde Internet. El agente, por su parte, no puede iniciar conexiones hacia la LAN, Tailscale ni el propio servidor (reglas de iptables 'HLI2-HERMES-*', servicio hli2-hermes-egress); sí tiene Internet.\n\nZona horaria: ${H_TZ} (los recordatorios y tareas programadas salen a esa hora).${H_TZ_NOTE:+ ${H_TZ_NOTE}} Las tareas auxiliares (títulos, compresión de contexto, visión, etc.) siguen al modelo de cada chat.${tg_note:+\n\n${tg_note}}${AUX_PREV_NOTE:+\n\n${AUX_PREV_NOTE}}${AUX_CUSTOM_NOTE:+\n\n${AUX_CUSTOM_NOTE}}\n\nRecomendación: reserve en el router (DHCP) la IP ${lan_ip} para este servidor; si cambia la IP de la LAN o de Tailscale, vuelva a correr este módulo para volver a publicar los puertos."
+  msg "Hermes desplegado (composeId=$composeId) y respondiendo en http://${lan_ip}:8642.\n\n${ts_note}\n\nApp Android: descargue el APK desde GitHub (https://github.com/rusty4444/hermes-android/releases; el de arm64-v8a sirve para teléfonos modernos). Permita instalar de orígenes desconocidos, agregue una conexión con servidor, puerto 8642 y la clave de API.\n\nDashboard: http://${ts_ip:-$lan_ip}:9119 (usuario admin).\n\n${report_line}Las instrucciones de SOUL.md rigen en las conversaciones nuevas.\n\nLos puertos 8642 y 9119 solo se publican en la IP de la LAN y en la de Tailscale: no hay acceso desde Internet. El agente, por su parte, no puede iniciar conexiones hacia la LAN, Tailscale ni el propio servidor (reglas de iptables 'HLI2-HERMES-*', servicio hli2-hermes-egress); sí tiene Internet.\n\nZona horaria: ${H_TZ} (los recordatorios y tareas programadas salen a esa hora).${H_TZ_NOTE:+ ${H_TZ_NOTE}} Las tareas auxiliares (títulos, compresión de contexto, visión, etc.) siguen al modelo de cada chat.${tg_note:+\n\n${tg_note}}${AUX_PREV_NOTE:+\n\n${AUX_PREV_NOTE}}${AUX_CUSTOM_NOTE:+\n\n${AUX_CUSTOM_NOTE}}${report_note:+\n\nATENCIÓN: ${report_note}}${soul_note:+\n\nATENCIÓN: ${soul_note}}\n\nRecomendación: reserve en el router (DHCP) la IP ${lan_ip} para este servidor; si cambia la IP de la LAN o de Tailscale, vuelva a correr este módulo para volver a publicar los puertos."
 
   mark_done hermes
   return 0

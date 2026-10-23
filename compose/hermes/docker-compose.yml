@@ -19,7 +19,8 @@
 #
 # Aislamiento (decisión de v2.6a): sin docker.sock (el backend de terminal
 # 'docker' equivale a root en el host), sin montar /srv ni el home (solo
-# el directorio de datos), sin red del host. La imagen arranca con s6-overlay
+# el directorio de datos y, desde v2.6d, el informe del servidor en solo
+# lectura), sin red del host. La imagen arranca con s6-overlay
 # como root y baja a HERMES_UID/HERMES_GID para el agente y todos sus
 # servicios (la guía: 'gateway run' como root se rechaza por defecto);
 # no se fuerza 'user:' porque el entrypoint necesita ese arranque para
@@ -82,6 +83,10 @@ __PORT_LINES__
 __TELEGRAM_ENV__
     volumes:
       - __APPDATA__/hermes:/opt/data
+      # Informe de diagnóstico del servidor (v2.6d): lo escribe root cada 5
+      # minutos (hli2-report.timer), filtrado y sin secretos. SOLO LECTURA: el
+      # agente nunca recibe escritura sobre él ni acceso a nada más del host.
+      - __APPDATA__/hermes-report:/opt/host-report:ro
     deploy:
       resources:
         limits:

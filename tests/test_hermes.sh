@@ -64,9 +64,17 @@ _hm_tailscale_up() {
 
 _hm_dialog_text() { grep -F $'dialog\t' "$STUB_CALL_LOG" || true; }
 
+# Hermes siembra SOUL.md al arrancar (docker/stage2-hook.sh); el contenedor es un
+# stub, así que los tests lo dejan listo.
+_hm_seed_soul() {
+  mkdir -p "$APPDATA_ROOT/hermes"
+  [[ -f "$APPDATA_ROOT/hermes/SOUL.md" ]] || printf 'You are Hermes Agent, built by Nous Research.\n' > "$APPDATA_ROOT/hermes/SOUL.md"
+}
+
 # Primera ejecución: clave de OpenRouter, el modelo principal, y "sí" a "guardé las
 # credenciales".
 _hm_first_run_queues() {
+  _hm_seed_soul
   echo "$_HM_OR_KEY" > "$DIALOG_PASSWORDBOX_QUEUE"
   echo "deepseek/deepseek-v4.1-flash" > "$DIALOG_INPUTBOX_QUEUE"
   printf 'no\nyes\n' > "$DIALOG_YESNO_QUEUE"     # Telegram: no; credenciales guardadas: sí
@@ -343,9 +351,10 @@ test_hermes_compose_template_hardening() {
   assert_contains "$code" "memory: 4G" || return 1
   assert_contains "$code" 'cpus: "2.0"' || return 1
   assert_contains "$code" "container_name: hermes" || return 1
-  # Solo el directorio de datos está montado.
-  assert_eq "1" "$(grep -c '^[[:space:]]*- .*:/' <<<"$(sed -n '/volumes:/,/deploy:/p' <<<"$code")")" "un único montaje" || return 1
+  # Solo dos montajes: los datos de Hermes y el informe del servidor, este último de solo lectura.
+  assert_eq "2" "$(grep -c '^[[:space:]]*- .*:/' <<<"$(sed -n '/volumes:/,/deploy:/p' <<<"$code")")" "dos montajes" || return 1
   assert_contains "$code" "__APPDATA__/hermes:/opt/data" || return 1
+  assert_contains "$code" "__APPDATA__/hermes-report:/opt/host-report:ro" "el informe se monta en solo lectura" || return 1
   # Los secretos son solo referencias ${VAR}; ningún valor literal.
   local v
   for v in OPENROUTER_API_KEY API_SERVER_KEY HERMES_DASHBOARD_BASIC_AUTH_PASSWORD HERMES_DASHBOARD_BASIC_AUTH_SECRET; do
@@ -1672,4 +1681,34 @@ test_hermes_aux_plan_replaces_a_wrong_or_empty_fallback_chain_on_owned_pinned_ta
   # Una tarea del usuario (otro servidor) con su propia cadena no se toca.
   out="$(_hm_aux_plan_with "$(printf "auxiliary:\n  monitor:\n    provider: custom\n    model: mio\n    base_url: http://192.168.1.5:8080/v1\n    api_key: k\n    fallback_chain:\n    - provider: openrouter\n      model: a/b\n")" "H_AUX_MODE=full H_AUX_LOCAL_URL='$_HM_URL'")"
   assert_not_contains "$out" "auxiliary.monitor." || return 1
+}
+
+# --- Informe del servidor y SOUL.md (v2.6d / v2.6c) ---
+
+test_hermes_report_units_installed_idempotently_by_the_module() {
+  _hm_setup
+  _hm_first_run_queues
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  local svc="$HLI2_SYSTEMD_DIR/hli2-report.service" tmr="$HLI2_SYSTEMD_DIR/hli2-report.timer"
+  assert_file_contains "$svc" "ExecStart=$BACKUP_INSTALL_DIR/bin/hli2-report" || return 1
+  assert_file_contains "$svc" "Type=oneshot" || return 1
+  assert_file_contains "$tmr" "OnBootSec=2min" || return 1
+  assert_file_contains "$tmr" "OnUnitActiveSec=5min" || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'systemctl\tenable\t--now\thli2-report.timer' || return 1
+  assert_eq "755" "$(stat -c %a "$APPDATA_ROOT/hermes-report")" || return 1
+  local n1; n1="$(grep -P '^sudo\tinstall\t' "$STUB_CALL_LOG" | grep -cF "$svc")"
+  assert_eq "1" "$n1" "la unidad se escribe una vez" || return 1
+  : > "$DIALOG_PASSWORDBOX_QUEUE"; : > "$DIALOG_YESNO_QUEUE"; : > "$DIALOG_INPUTBOX_QUEUE"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_eq "$n1" "$(grep -P '^sudo\tinstall\t' "$STUB_CALL_LOG" | grep -cF "$svc")" "la segunda ejecución no reescribe la unidad" || return 1
+}
+
+test_hermes_report_module_applies_soul_block_end_to_end() {
+  _hm_setup
+  _hm_first_run_queues
+  printf 'Personalidad de Hermes.\n' > "$APPDATA_ROOT/hermes/SOUL.md"
+  bash "$REPO_ROOT/modules/hermes.sh" || return 1
+  assert_file_contains "$APPDATA_ROOT/hermes/SOUL.md" "Personalidad de Hermes." || return 1
+  assert_file_contains "$APPDATA_ROOT/hermes/SOUL.md" "HLI2:END" || return 1
+  assert_contains "$(_hm_dialog_text)" "/opt/host-report/report.md" "el mensaje final menciona el informe" || return 1
 }
