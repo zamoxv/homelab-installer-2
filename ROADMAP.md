@@ -993,7 +993,7 @@ Dokploy `dokploy.com/templates/hermes`, Docker Hub, código v0.22.2 de
       módulo ahora avisa).
 
 #### v2.6b — Modelos y costo
-- [ ] OpenRouter: clave propia **con límite de gasto mensual en la clave**
+- [x] OpenRouter: clave propia **con límite de gasto mensual en la clave**
       (monto pendiente de decidir por el usuario) y `data_collection: deny`.
 - [ ] Niveles: modelo abierto barato por defecto; `openrouter/auto` con nivel
       de costo bajo/medio donde convenga; Claude (vía OpenRouter, por token)
@@ -1050,8 +1050,8 @@ de cada conversación (a medir).
       que lee `hli2-hermes-egress`.
 - [x] Modelos: `gemma4:e4b` como cerebro local (mejor calidad para
       herramientas) y `gemma4:e2b` para tareas de fondo rápidas.
-- [ ] **Validar en el M70q** (pruebas 130-156 de `docs/VALIDACION.md`).
-- [ ] **Prueba que decide:** tareas reales con herramientas desde un chat
+- [x] **Validar en el M70q** (pruebas 130-156 de `docs/VALIDACION.md`).
+- [x] **Prueba que decide:** tareas reales con herramientas desde un chat
       local (buscar en la web, crear un recordatorio, leer el informe del
       servidor de v2.6d). Si las hace bien, queda como cerebro opcional; si
       no, solo trabajador de fondo. BitNet sigue descartado (sin evidencia de
@@ -1306,7 +1306,7 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
       manipulado por una página web podría enviar afuera).
 
 #### v2.6e — Canal alternativo: Telegram
-- [ ] Polling (sin puertos entrantes), `TELEGRAM_ALLOWED_USERS` con el ID del
+- [x] Polling (sin puertos entrantes), `TELEGRAM_ALLOWED_USERS` con el ID del
       usuario (sin lista, todos rechazados). Las conversaciones pasan por los
       servidores de Telegram.
 - Implementado en `modules/hermes.sh` (2026-10-19; **sin validar en el servidor**,
@@ -1361,6 +1361,9 @@ código v0.40.6 de Ollama y v0.22.2 de Hermes, y la documentación de Hermes —
   Telegram (el mensaje del módulo lo dice); con un modelo local, la respuesta
   llega aunque el teléfono tenga la pantalla bloqueada porque la conexión la
   mantiene el servidor (a confirmar en la prueba 167).
+- [x] **Validado en el M70q (2026-10-21)**: el bot responde solo al usuario;
+      un cron con entrega a Telegram llegó al teléfono (hay que abrirle la
+      conversación al bot una vez: los bots no pueden escribir primero).
 
 #### v2.6f — Claude Code como segundo agente
 - [ ] Documentar el uso desde el teléfono (Remote Control, sesiones en la nube,
