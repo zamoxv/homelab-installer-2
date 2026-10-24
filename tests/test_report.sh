@@ -17,6 +17,7 @@ _rp_setup() {
 source "$STUB_RP_LIB"
 log_call docker "$@"
 [[ -z "${STUB_RP_HANG:-}" ]] || sleep 30
+printf '%s\n' "${DOCKER_CONFIG:-unset}" >> "$STUB_RP_DIR/dockerenv"
 case "${1:-}" in
   info) exit 0 ;;
   inspect)
@@ -28,7 +29,9 @@ case "${1:-}" in
     [[ -f "$STUB_RP_DIR/c/$name" ]] || { echo "Error: No such object: $name" >&2; exit 1; }
     if [[ "$3" == '{{.State.Status}}' ]]; then cut -d'|' -f1 "$STUB_RP_DIR/c/$name"; exit 0; fi
     cat "$STUB_RP_DIR/c/$name"; exit 0 ;;
-  logs) cat "$STUB_RP_DIR/logs/${*: -1}" 2>/dev/null; exit 0 ;;
+  logs)
+    [[ -z "${STUB_RP_WARN:-}" ]] || echo "WARNING: Error loading config file: /root/.docker/config.json: permission denied" >&2
+    cat "$STUB_RP_DIR/logs/${*: -1}" 2>/dev/null; exit 0 ;;
   service) echo "1/1"; exit 0 ;;
 esac
 exit 0
@@ -369,7 +372,7 @@ test_report_soul_symlink_swapped_before_rename_is_replaced_not_followed() {
   assert_eq "HOST SECRET" "$(< "$victim")" "no siguió el enlace" || return 1
   [[ ! -L "$f" && -f "$f" ]] || { fail "SOUL.md debe quedar como archivo regular"; return 1; }
   assert_file_contains "$f" "HLI2:BEGIN" || return 1
-  assert_eq "" "$(ls -A "$APPDATA_ROOT" | grep '^\.hli2-soul' || true)" "sin temporales" || return 1
+  assert_eq "" "$(ls -A "$APPDATA_ROOT/.hli2-staging")" "sin temporales" || return 1
 }
 
 test_report_soul_block_marks_logs_as_untrusted() {
@@ -566,4 +569,100 @@ test_report_header_discloses_hostname_services_and_cloud_model() {
   _rp_run || return 1
   assert_contains "$(_rp_report)" "revela el nombre del equipo, los servicios instalados y los nombres de sus imágenes" || return 1
   assert_contains "$(_rp_report)" "modelo en la nube" || return 1
+}
+
+# --- Segunda revisión ------------------------------------------------------------------------------------
+
+test_report_soul_fifo_never_hangs() {
+  local f="$APPDATA_ROOT/hermes/SOUL.md" rc=0 t0
+  mkdir -p "$APPDATA_ROOT/hermes"
+  # (a) Una tubería ya puesta: se rechaza antes de abrir.
+  mkfifo "$f"
+  t0="$(date +%s)"
+  timeout 20 bash -c 'source "$1"; _hermes_soul_apply' _ "$REPO_ROOT/modules/hermes.sh" || rc=$?
+  assert_eq "1" "$rc" "FIFO preexistente: debe rechazar sin colgarse" || return 1
+  (( $(date +%s) - t0 < 10 )) || { fail "tardó demasiado"; return 1; }
+  # (b) Cambiada por una tubería justo antes de abrir.
+  rm -f "$f"; printf 'Persona.\n' > "$f"; rc=0
+  timeout 20 bash -c 'source "$1"; f="$2"; _hook() { [[ "$1" == before-open ]] && { rm -f "$f"; mkfifo "$f"; }; return 0; }; HLI2_SOUL_TEST_HOOK=_hook; _hermes_soul_apply' _ "$REPO_ROOT/modules/hermes.sh" "$f" || rc=$?
+  assert_eq "1" "$rc" "FIFO puesta entre la comprobación y la apertura: debe rechazar sin colgarse" || return 1
+}
+
+test_report_soul_works_when_appdata_root_is_root_owned() {
+  local f="$APPDATA_ROOT/hermes/SOUL.md"
+  mkdir -p "$APPDATA_ROOT/hermes"; printf 'Persona.\n' > "$f"
+  # $APPDATA_ROOT sin escritura para el usuario (en el servidor es root:root); la carpeta
+  # de paso ya existe (el módulo la crea con sudo install -d -o usuario -m 0700).
+  mkdir -m 0700 "$APPDATA_ROOT/.hli2-staging"
+  chmod 0555 "$APPDATA_ROOT"
+  ( source "$REPO_ROOT/modules/hermes.sh"; _hermes_soul_apply ) || { chmod 0755 "$APPDATA_ROOT"; fail "no actualizó SOUL.md"; return 1; }
+  chmod 0755 "$APPDATA_ROOT"
+  assert_file_contains "$f" "HLI2:BEGIN" || return 1
+  assert_file_contains "$f" "Persona." || return 1
+}
+
+test_report_soul_staging_dir_is_created_with_sudo_private_and_symlink_refused() {
+  local f="$APPDATA_ROOT/hermes/SOUL.md"
+  mkdir -p "$APPDATA_ROOT/hermes"; printf 'Persona.\n' > "$f"
+  ( source "$REPO_ROOT/modules/hermes.sh"; _hermes_soul_apply ) || return 1
+  assert_file_contains "$STUB_CALL_LOG" $'sudo\tinstall\t-d\t-o\t'"$(id -u)"$'\t-g\t'"$(id -g)"$'\t-m\t0700\t'"$APPDATA_ROOT/.hli2-staging" || return 1
+  assert_eq "700" "$(stat -c %a "$APPDATA_ROOT/.hli2-staging")" || return 1
+  rm -rf "$APPDATA_ROOT/.hli2-staging"; mkdir "$HLI2_TEST_SCRATCH/elsewhere"; ln -s "$HLI2_TEST_SCRATCH/elsewhere" "$APPDATA_ROOT/.hli2-staging"
+  printf 'Persona.\n' > "$f"
+  if ( source "$REPO_ROOT/modules/hermes.sh"; _hermes_soul_apply ); then fail "debió rechazar la carpeta de paso simbólica"; return 1; fi
+  assert_eq "" "$(ls -A "$HLI2_TEST_SCRATCH/elsewhere")" || return 1
+}
+
+test_report_docker_cli_config_warning_is_not_reported() {
+  _rp_setup
+  _rp_container adguard
+  echo "ERROR real-problem" > "$STUB_RP_DIR/logs/adguard"
+  export STUB_RP_WARN=1
+  _rp_run || return 1
+  assert_not_contains "$(_rp_report)" "Error loading config file" || return 1
+  assert_contains "$(_rp_report)" "real-problem" || return 1
+}
+
+test_report_log_optin_file_parent_dir_must_be_safe() {
+  _rp_setup
+  mkdir -p "$HLI2_LOCAL_SERVICES_DIR"; chmod 0755 "$HLI2_LOCAL_SERVICES_DIR" "$(dirname "$HLI2_LOCAL_SERVICES_DIR")"
+  printf 'SERVICE_NAME="Mi App"\nSERVICE_KIND="container"\nSERVICE_CONTAINER="miapp"\nSERVICE_PORT=""\nSERVICE_URL_SCHEME=""\nSERVICE_DATA=()\nSERVICE_BACKUP_KIND="none"\n' > "$HLI2_LOCAL_SERVICES_DIR/miapp.conf"
+  chmod 0644 "$HLI2_LOCAL_SERVICES_DIR/miapp.conf"
+  _rp_container miapp; echo "ERROR from-miapp" > "$STUB_RP_DIR/logs/miapp"
+  local d="$HLI2_TEST_SCRATCH/optin"; mkdir -p "$d"; chmod 0755 "$d"
+  printf 'miapp\n' > "$d/f"; chmod 0644 "$d/f"
+  export HLI2_REPORT_LOG_SERVICES_FILE="$d/f"
+  _rp_run || return 1
+  assert_contains "$(_rp_report)" "from-miapp" "carpeta segura: se acepta" || return 1
+  chmod 0777 "$d"
+  _rp_run || return 1
+  assert_not_contains "$(_rp_report)" "from-miapp" "carpeta escribible por otros: se ignora" || return 1
+  chmod 0755 "$d"
+}
+
+# El servicio real: se toma el ExecStart y el Environment de la unidad generada y se
+# ejecutan con los stubs (no es systemd: no prueba el sandbox, solo que la unidad
+# arranca el informe con el entorno que declara).
+test_report_generated_unit_execstart_and_environment_run_the_report() {
+  _rp_setup
+  _rp_container adguard
+  local fake="$HLI2_TEST_SCRATCH/co"
+  mkdir -p "$fake"/{bin,lib,services,config}
+  cp "$REPO_ROOT/bin/hli2-backup" "$REPO_ROOT/bin/hli2-report" "$fake/bin/"
+  cp "$REPO_ROOT"/lib/*.sh "$fake/lib/"; cp "$REPO_ROOT"/services/*.conf "$fake/services/"; cp "$REPO_ROOT/config/default.conf" "$fake/config/"
+  ( cd / && source "$fake/lib/core.sh" && backup_refresh_install ) || return 1
+  local unit exe line
+  local -a envs=()
+  unit="$( ( source "$REPO_ROOT/modules/hermes.sh"; _hermes_render_report_service ) )"
+  while IFS= read -r line; do
+    case "$line" in
+      ExecStart=*) exe="${line#ExecStart=}" ;;
+      Environment=*) read -r -a more <<<"${line#Environment=}"; envs+=("${more[@]}") ;;
+    esac
+  done <<<"$unit"
+  [[ "$exe" == "$BACKUP_INSTALL_DIR/bin/hli2-report" ]] || { fail "ExecStart inesperado: $exe"; return 1; }
+  assert_contains "$unit" "Environment=DOCKER_CONFIG=/tmp/.docker-report" || return 1
+  env -u USER "${envs[@]}" bash "$exe" || { fail "la unidad no arrancó el informe"; return 1; }
+  assert_contains "$(_rp_report)" "# Informe del servidor" || return 1
+  assert_contains "$(< "$STUB_RP_DIR/dockerenv")" "/tmp/.docker-report" "docker recibió DOCKER_CONFIG de la unidad" || return 1
 }

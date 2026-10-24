@@ -424,6 +424,7 @@ _report_log_extra_ids() {
   local f="$REPORT_LOG_SERVICES_FILE" line
   [[ -f "$f" && ! -L "$f" ]] || return 0
   _service_local_owner_ok "$f" || return 0
+  [[ ! -L "$(dirname -- "$f")" ]] && _service_local_owner_ok "$(dirname -- "$f")" || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" =~ ^[a-z0-9][a-z0-9-]*$ ]] && printf '%s\n' "$line"
   done < "$f"
@@ -443,6 +444,7 @@ _report_log_allowed() {
 _report_container_log_errors() {
   local name="$1"
   _report_docker logs --since "$REPORT_LOG_SINCE_DOCKER" --tail "$REPORT_LOG_TAIL" "$name" 2>&1 \
+    | { grep -v '^WARNING: Error loading config file' || true; } \
     | report_redact \
     | { grep -iE "$REPORT_LOG_FILTER" || true; } \
     | tail -n "$REPORT_LOG_LINES" \

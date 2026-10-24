@@ -1819,6 +1819,7 @@ After=docker.service local-fs.target
 Type=oneshot
 Environment=USER=root HOME=/root
 ExecStart=${BACKUP_INSTALL_DIR}/bin/hli2-report
+Environment=DOCKER_CONFIG=/tmp/.docker-report
 PrivateTmp=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -1979,15 +1980,37 @@ _hermes_soul_hook() {
 #   - se LEE por un descriptor abierto una sola vez y se comprueba que el
 #     descriptor y la ruta (sin seguir enlaces) son el mismo archivo regular
 #     (dispositivo:inodo); un enlace puesto antes de abrir no coincide;
-#   - se ESCRIBE en un temporal dentro de $APPDATA_ROOT (fuera de la carpeta del
-#     agente, que no está montada en el contenedor) y se mueve con 'mv -T': el
+#   - se ESCRIBE en un temporal dentro de $APPDATA_ROOT/.hli2-staging (0700 del
+#     usuario, fuera de la carpeta del agente y sin montar en ningún contenedor) y se mueve con 'mv -T': el
 #     rename reemplaza un enlace simbólico en el destino, no lo sigue.
 # Códigos: 0 hecho (o ya estaba igual), 1 no se pudo, 2 SOUL.md todavía no
 # existe (Hermes lo siembra al arrancar; no se crea acá para no pisar su
 # personalidad por defecto).
 H_SOUL_NOTE=""
+
+# Carpeta de paso privada (0700, del usuario del servidor) en el mismo sistema de
+# archivos que los datos de Hermes y NO montada en ningún contenedor. $APPDATA_ROOT
+# suele ser root:root (modules/dokploy.sh), así que se crea con sudo. Idempotente;
+# se niega si es un enlace simbólico o no es del usuario / no es 0700.
+H_STAGE_DIR=""
+_hermes_staging_ensure() {
+  local d="$APPDATA_ROOT/.hli2-staging" uid gid
+  uid="${H_UID:-$(id -u "$SERVER_USER" 2>/dev/null || id -u)}"
+  gid="${H_GID:-$(id -g "$SERVER_USER" 2>/dev/null || id -g)}"
+  if [[ -L "$d" ]]; then
+    H_SOUL_NOTE="$d es un enlace simbólico: no se usa."
+    return 1
+  fi
+  [[ -d "$d" ]] || sudo install -d -o "$uid" -g "$gid" -m 0700 "$d" 2>/dev/null || true
+  if [[ -L "$d" || ! -d "$d" || "$(stat -c %u -- "$d" 2>/dev/null)" != "$uid" || "$(stat -c %a -- "$d" 2>/dev/null)" != "700" ]]; then
+    H_SOUL_NOTE="No se pudo preparar la carpeta de paso $d (debe ser del usuario del servidor, modo 0700, y no un enlace simbólico)."
+    return 1
+  fi
+  H_STAGE_DIR="$d"
+}
+
 _hermes_soul_apply() {
-  local f dir cur new tmp mode fd id_fd id_path
+  local f dir cur new tmp mode fd id_fd id_path stage
   H_SOUL_NOTE=""
   f="$(_hermes_soul_path)"
   dir="$(dirname -- "$f")"
@@ -1999,8 +2022,16 @@ _hermes_soul_apply() {
     H_SOUL_NOTE="SOUL.md todavía no existe (Hermes lo crea al arrancar): vuelva a correr este módulo para agregar las instrucciones."
     return 2
   fi
+  if [[ ! -f "$f" ]]; then
+    H_SOUL_NOTE="SOUL.md no es un archivo regular (¿una tubería o un dispositivo?): no se modifica."
+    return 1
+  fi
+  _hermes_staging_ensure || return 1
+  stage="$H_STAGE_DIR"
   _hermes_soul_hook before-open
-  if ! exec {fd}< "$f"; then
+  # Lectura-escritura ('<>'): abrir una tubería (FIFO) así NO se bloquea esperando
+  # a un escritor, y enseguida se comprueba que es el archivo regular esperado.
+  if ! exec {fd}<> "$f"; then
     H_SOUL_NOTE="No se pudo abrir SOUL.md."
     return 1
   fi
@@ -2020,7 +2051,7 @@ _hermes_soul_apply() {
   fi
   new="${new%x}"
   if [[ "$new" == "$cur"$'\n' || "$new" == "$cur" ]]; then return 0; fi
-  tmp="$(mktemp "$APPDATA_ROOT/.hli2-soul.XXXXXX")" || { H_SOUL_NOTE="No se pudo crear un temporal en $APPDATA_ROOT."; return 1; }
+  tmp="$(mktemp "$stage/soul.XXXXXX")" || { H_SOUL_NOTE="No se pudo crear un temporal en $stage."; return 1; }
   if [[ "$(stat -c %d -- "$tmp" 2>/dev/null)" != "$(stat -c %d -- "$dir" 2>/dev/null)" ]]; then
     rm -f -- "$tmp"
     H_SOUL_NOTE="$APPDATA_ROOT y la carpeta de Hermes están en discos distintos: no se puede reemplazar SOUL.md de forma atómica."
