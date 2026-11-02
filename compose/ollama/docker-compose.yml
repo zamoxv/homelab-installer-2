@@ -50,7 +50,7 @@ services:
     container_name: ollama
     restart: unless-stopped
     security_opt:
-      - no-new-privileges:true
+      - no-new-privileges=true
 __DNS_BLOCK__
 __SERVICE_NETWORKS__
     environment:

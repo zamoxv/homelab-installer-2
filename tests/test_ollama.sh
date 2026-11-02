@@ -128,7 +128,7 @@ test_ollama_compose_template_hardening() {
   assert_not_contains "$code" "dokploy-network" || return 1
   grep -Eq '^[[:space:]]*image: ollama/ollama:[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}$' <<<"$code" \
     || { fail "la imagen debe estar fijada a una versión X.Y.Z y a un digest sha256"; return 1; }
-  assert_contains "$code" "no-new-privileges:true" || return 1
+  assert_contains "$code" "no-new-privileges=true" || return 1
   assert_contains "$code" "restart: unless-stopped" || return 1
   assert_contains "$code" "container_name: ollama" || return 1
   # Límites: cada uno en UN solo lugar (Compose v2 rechaza duplicados con pids_limit).

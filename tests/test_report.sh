@@ -562,6 +562,12 @@ test_report_ipv4_masking_keeps_dotted_versions_in_image_tags() {
   assert_not_contains "$out" "192.168.1.9" || return 1
   assert_not_contains "$out" "10.0.0.5" || return 1
   assert_not_contains "$out" "172.16.0.2" || return 1
+  # Formato real del journal de dockerd en el M70q: IP precedida de "udp:" y
+  # seguida de un puerto. Antes se colaba por la excepción de las etiquetas.
+  out="$(_rp_redact <<<'client-addr="udp:192.168.7.125:53898" dns-server="udp:192.168.7.1:53" tcp:10.1.2.3')"
+  assert_not_contains "$out" "192.168.7.125" || return 1
+  assert_not_contains "$out" "192.168.7.1" || return 1
+  assert_not_contains "$out" "10.1.2.3" || return 1
 }
 
 test_report_header_discloses_hostname_services_and_cloud_model() {

@@ -56,7 +56,7 @@ services:
     command: gateway run
     shm_size: 1g
     security_opt:
-      - no-new-privileges:true
+      - no-new-privileges=true
     networks:
       - hermes-net
     dns:

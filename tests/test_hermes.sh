@@ -340,7 +340,7 @@ test_hermes_compose_template_hardening() {
   assert_not_contains "$code" "traefik" || return 1
   grep -Eq '^[[:space:]]*image: nousresearch/hermes-agent:v[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}$' <<<"$code" \
     || { fail "la imagen debe estar fijada a una versión vX.Y.Z y a un digest sha256"; return 1; }
-  assert_contains "$code" "no-new-privileges:true" || return 1
+  assert_contains "$code" "no-new-privileges=true" || return 1
   assert_contains "$code" "pids: 512" || return 1
   if [[ "$code" == *"pids_limit"* ]]; then fail "pids_limit choca con deploy.resources.limits en Compose v2"; return 1; fi
   assert_contains "$code" "subnet: __SUBNET__" "red propia con subred fija" || return 1
@@ -631,7 +631,7 @@ test_hermes_compose_uses_own_network_dns_and_no_wide_binds() {
   assert_file_contains "$STUB_HTTP_BODIES_LOG" "subnet: ${_HM_SUBNET}" || return 1
   assert_file_contains "$STUB_HTTP_BODIES_LOG" "hermes-net" || return 1
   assert_file_contains "$STUB_HTTP_BODIES_LOG" "- 1.1.1.1" "DNS público sin AdGuard" || return 1
-  assert_file_contains "$STUB_HTTP_BODIES_LOG" "no-new-privileges:true" || return 1
+  assert_file_contains "$STUB_HTTP_BODIES_LOG" "no-new-privileges=true" || return 1
   # Subred configurable; una que choca con la LAN se rechaza.
   rm -f "$SECRETS_DIR/hermes.env" 2>/dev/null || { chmod u+rwx "$SECRETS_DIR"; rm -f "$SECRETS_DIR/hermes.env"; chmod 000 "$SECRETS_DIR"; }
   rm -f "$APPDATA_ROOT/hermes/config.yaml"
